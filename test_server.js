@@ -61,6 +61,67 @@ async function main() {
     }, cookie);
     assert.strictEqual(assistedRepeat.res.status, 429);
 
+    const legacyTextFallback = await request(baseUrl, '/api/fallback/challenge', {
+      method: 'POST',
+      body: JSON.stringify({ mode: 'text' }),
+    }, cookie);
+    assert.strictEqual(legacyTextFallback.res.status, 400);
+
+    const emergencyTextFallback = await request(baseUrl, '/api/fallback/challenge', {
+      method: 'POST',
+      body: JSON.stringify({ mode: 'emergency_text' }),
+    }, cookie);
+    assert.strictEqual(emergencyTextFallback.res.status, 201);
+    const emergencyTextAnswer = emergencyTextFallback.body.prompt.match(/"([^"]+)"/)[1];
+    const emergencyTextVerified = await request(baseUrl, '/api/fallback/verify', {
+      method: 'POST',
+      body: JSON.stringify({ challengeId: emergencyTextFallback.body.challengeId, answer: emergencyTextAnswer }),
+    }, cookie);
+    assert.strictEqual(emergencyTextVerified.res.status, 200);
+    assert.ok(emergencyTextVerified.body.verificationToken);
+
+    const emergencyTextAccepted = await request(baseUrl, '/api/protected-action', {
+      method: 'POST',
+      body: JSON.stringify({ verificationToken: emergencyTextVerified.body.verificationToken }),
+    }, cookie);
+    assert.strictEqual(emergencyTextAccepted.res.status, 200);
+
+    const emergencyRepeat = await request(baseUrl, '/api/fallback/challenge', {
+      method: 'POST',
+      body: JSON.stringify({ mode: 'emergency_audio' }),
+    }, cookie);
+    assert.strictEqual(emergencyRepeat.res.status, 429);
+
+    const emergencyAudioFallback = await request(baseUrl, '/api/fallback/challenge', {
+      method: 'POST',
+      body: JSON.stringify({ mode: 'emergency_audio' }),
+    });
+    assert.strictEqual(emergencyAudioFallback.res.status, 201);
+    assert.ok(emergencyAudioFallback.body.speakText);
+    const emergencyAudioVerified = await request(baseUrl, '/api/fallback/verify', {
+      method: 'POST',
+      body: JSON.stringify({
+        challengeId: emergencyAudioFallback.body.challengeId,
+        answer: emergencyAudioFallback.body.speakText.replace(/\s+/g, ''),
+      }),
+    }, emergencyAudioFallback.cookie);
+    assert.strictEqual(emergencyAudioVerified.res.status, 200);
+    assert.ok(emergencyAudioVerified.body.verificationToken);
+
+    const livenessVerified = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify({ durationMs: 1200, faceFrames: 10, motionScore: 0.12 }),
+    }, cookie);
+    assert.strictEqual(livenessVerified.res.status, 200);
+    assert.ok(livenessVerified.body.verificationToken);
+
+    const noPasskey = await request(baseUrl, '/api/passkey/auth/options', { method: 'POST' }, cookie);
+    assert.strictEqual(noPasskey.res.status, 409);
+
+    const passkeyReset = await request(baseUrl, '/api/passkey/reset', { method: 'POST' }, cookie);
+    assert.strictEqual(passkeyReset.res.status, 200);
+    assert.strictEqual(passkeyReset.body.ok, true);
+
     const challengeResponse = await request(baseUrl, '/api/challenge', { method: 'POST' }, cookie);
     assert.strictEqual(challengeResponse.res.status, 201);
     assert.ok(challengeResponse.cookie);

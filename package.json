@@ -1,8 +1,8 @@
 {
-  "name": "realhands",
+  "name": "zoe",
   "version": "1.0.0",
   "private": true,
-  "description": "Gesture-based human verification demo with server-owned challenge state.",
+  "description": "Zoe human verification demo with server-owned challenge state.",
   "scripts": {
     "start": "node server.js",
     "test": "node test_server.js"

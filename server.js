@@ -12,8 +12,11 @@ const MAX_STEP_DURATION_MS = 12 * 1000;
 const MIN_HOLD_FRAMES = 8;
 const MAX_BODY_BYTES = 32 * 1024;
 const ACCESSIBILITY_REQUEST_COOLDOWN_MS = 60 * 1000;
-const COOKIE_NAME = 'rh_sid';
-const SECRET = process.env.REALHANDS_SECRET || crypto.randomBytes(32).toString('hex');
+const FALLBACK_TTL_MS = 2 * 60 * 1000;
+const FALLBACK_MAX_ATTEMPTS = 5;
+const APP_NAME = 'Zoe';
+const COOKIE_NAME = 'zoe_sid';
+const SECRET = process.env.ZOE_SECRET || process.env.REALHANDS_SECRET || crypto.randomBytes(32).toString('hex');
 
 const GESTURES = [
   { id: 'wave', name: 'Wave', emoji: '👋', hint: 'Open hand, move it side to side.' },
@@ -21,8 +24,8 @@ const GESTURES = [
   { id: 'open_palm', name: 'Open Palm', emoji: '🖐️', hint: 'Hold your open palm toward the camera.' },
   { id: 'peace', name: 'Peace Sign', emoji: '✌️', hint: 'Index and middle fingers up, others folded.' },
   { id: 'point', name: 'Pointing', emoji: '☝️', hint: 'Index finger up, others folded.' },
-  { id: 'three', name: 'Three', emoji: '🤟', hint: 'Thumb, index, and middle fingers up, ring and pinky folded.' },
-  { id: 'ily', name: 'Hand Hearts', emoji: '💖', hint: 'Touch your thumb tips and index tips together to form a heart shape.' },
+  { id: 'three', name: 'Three Fingers', emoji: '3️⃣', hint: 'Hold up index, middle, and ring fingers. Keep thumb and pinky folded.' },
+  { id: 'ily', name: 'Hand Hearts', emoji: '💖', hint: 'Use both hands: touch your thumbs together and your index fingertips together.' },
   { id: 'rock', name: 'Rock', emoji: '🤘', hint: 'Index and pinky up, middle and ring folded (horns).' },
   { id: 'call_me', name: 'Call Me', emoji: '🤙', hint: 'Thumb and pinky out, other fingers folded (shaka).' },
   { id: 'ok', name: 'OK Sign', emoji: '👌', hint: 'Touch thumb and index into a ring, other fingers up.' },
@@ -31,7 +34,13 @@ const GESTURES = [
 const sessions = new Map();
 const challenges = new Map();
 const assistedRequests = new Map();
+const fallbackChallenges = new Map();
 const usedTokenDigests = new Set();
+
+const WORDS = [
+  'ember', 'signal', 'orbit', 'bright', 'steady', 'river',
+  'hand', 'proof', 'window', 'silver', 'kind', 'north',
+];
 
 function now() {
   return Date.now();
@@ -39,6 +48,10 @@ function now() {
 
 function randomId(bytes = 24) {
   return crypto.randomBytes(bytes).toString('base64url');
+}
+
+function normalizeAnswer(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
 function hmac(value) {
@@ -89,6 +102,10 @@ function getSession(req, res) {
       lastSeenAt: now(),
       issuedTokens: new Map(),
       lastAccessibilityRequestAt: 0,
+      emergencyVerifiedAt: 0,
+      credentials: new Map(),
+      passkeyRegisterChallenge: null,
+      passkeyAuthChallenge: null,
     });
     res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`);
   } else {
@@ -208,13 +225,15 @@ function validateEvidence(challenge, body) {
   return null;
 }
 
-function issueVerificationToken(session, challenge) {
+function issueVerificationToken(session, source, method = 'gesture', assurance = 'standard') {
   const iat = now();
   const payload = {
-    type: 'realhands.verification',
+    type: 'zoe.verification',
     sid: session.id,
-    challengeId: challenge.id,
+    challengeId: source.id,
     action: 'demo.protected-action',
+    method,
+    assurance,
     nonce: randomId(16),
     iat,
     exp: iat + TOKEN_TTL_MS,
@@ -222,6 +241,107 @@ function issueVerificationToken(session, challenge) {
   const token = signPayload(payload);
   session.issuedTokens.set(crypto.createHash('sha256').update(token).digest('base64url'), payload);
   return token;
+}
+
+function originAllowed(origin) {
+  try {
+    const url = new URL(origin);
+    return url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost');
+  } catch {
+    return false;
+  }
+}
+
+function decodeCredentialPart(value) {
+  if (typeof value !== 'string') return null;
+  try {
+    return Buffer.from(value, 'base64url');
+  } catch {
+    return null;
+  }
+}
+
+function parseClientData(value, expectedType, expectedChallenge) {
+  const bytes = decodeCredentialPart(value);
+  if (!bytes) return null;
+  try {
+    const parsed = JSON.parse(bytes.toString('utf8'));
+    if (parsed.type !== expectedType) return null;
+    if (parsed.challenge !== expectedChallenge) return null;
+    if (!originAllowed(parsed.origin)) return null;
+    return { parsed, bytes };
+  } catch {
+    return null;
+  }
+}
+
+function createFallbackChallenge(session, mode) {
+  const createdAt = now();
+  let prompt;
+  let speakText = null;
+  let answer;
+
+  if (mode === 'text') {
+    const words = Array.from({ length: 3 }, () => WORDS[crypto.randomInt(WORDS.length)]);
+    answer = words.join(' ');
+    prompt = `Type these words: ${answer}`;
+  } else if (mode === 'audio') {
+    const code = Array.from({ length: 6 }, () => String(crypto.randomInt(10))).join('');
+    answer = code;
+    prompt = 'Type the six digits you hear.';
+    speakText = code.split('').join(' ');
+  } else if (mode === 'emergency_text') {
+    const code = Array.from({ length: 4 }, () => String(crypto.randomInt(10))).join('');
+    answer = `emergency ${code}`;
+    prompt = `Emergency check: type "emergency ${code}" to continue once.`;
+  } else if (mode === 'emergency_audio') {
+    const code = Array.from({ length: 6 }, () => String(crypto.randomInt(10))).join('');
+    answer = code;
+    prompt = 'Emergency audio: type the six digits you hear.';
+    speakText = code.split('').join(' ');
+  } else {
+    return null;
+  }
+
+  const challenge = {
+    id: randomId(),
+    sessionId: session.id,
+    mode,
+    prompt,
+    speakText,
+    answerHash: hmac(normalizeAnswer(answer)),
+    attempts: 0,
+    createdAt,
+    expiresAt: createdAt + FALLBACK_TTL_MS,
+    consumedAt: null,
+  };
+  fallbackChallenges.set(challenge.id, challenge);
+  return challenge;
+}
+
+function verifyFallbackAnswer(challenge, answer) {
+  if (challenge.consumedAt) return 'Challenge was already used.';
+  if (now() > challenge.expiresAt) return 'Challenge expired.';
+  if (challenge.attempts >= FALLBACK_MAX_ATTEMPTS) return 'Too many attempts.';
+  challenge.attempts++;
+  return timingSafeEqual(challenge.answerHash, hmac(normalizeAnswer(answer))) ? null : 'That answer did not match.';
+}
+
+function parseSignCount(authenticatorData) {
+  if (!Buffer.isBuffer(authenticatorData) || authenticatorData.length < 37) return 0;
+  return authenticatorData.readUInt32BE(33);
+}
+
+function verifyPasskeySignature(credential, authenticatorData, clientDataJSON, signature) {
+  const clientHash = crypto.createHash('sha256').update(clientDataJSON).digest();
+  const signedData = Buffer.concat([authenticatorData, clientHash]);
+  const key = crypto.createPublicKey({
+    key: Buffer.from(credential.publicKey, 'base64url'),
+    format: 'der',
+    type: 'spki',
+  });
+  const algorithm = credential.alg === -257 ? 'RSA-SHA256' : 'SHA256';
+  return crypto.verify(algorithm, signedData, key, signature);
 }
 
 async function handleApi(req, res, pathname) {
@@ -258,7 +378,7 @@ async function handleApi(req, res, pathname) {
       challenge.consumedAt = now();
       return sendJson(res, 200, {
         verified: true,
-        verificationToken: issueVerificationToken(session, challenge),
+        verificationToken: issueVerificationToken(session, challenge, 'gesture', 'standard'),
         tokenExpiresAt: now() + TOKEN_TTL_MS,
       });
     }
@@ -270,6 +390,186 @@ async function handleApi(req, res, pathname) {
       totalSteps: challenge.steps.length,
       expiresAt: challenge.expiresAt,
       step: publicStep(challenge),
+    });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/passkey/register/options') {
+    const challenge = randomId(32);
+    session.passkeyRegisterChallenge = { challenge, createdAt: now() };
+    return sendJson(res, 200, {
+      challenge,
+      rp: { name: APP_NAME },
+      user: {
+        id: session.id,
+        name: `zoe-${session.id.slice(0, 8)}`,
+        displayName: 'Zoe user',
+      },
+      pubKeyCredParams: [
+        { type: 'public-key', alg: -7 },
+        { type: 'public-key', alg: -257 },
+      ],
+      timeout: 60000,
+      attestation: 'none',
+      authenticatorSelection: {
+        residentKey: 'preferred',
+        userVerification: 'preferred',
+      },
+      excludeCredentials: Array.from(session.credentials.keys()).map((id) => ({ type: 'public-key', id })),
+    });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/passkey/reset') {
+    session.credentials.clear();
+    session.passkeyRegisterChallenge = null;
+    session.passkeyAuthChallenge = null;
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/passkey/register/verify') {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    const pending = session.passkeyRegisterChallenge;
+    if (!pending || now() - pending.createdAt > FALLBACK_TTL_MS) return sendJson(res, 410, { error: 'Passkey registration expired.' });
+    const client = parseClientData(body.clientDataJSON, 'webauthn.create', pending.challenge);
+    if (!client) return sendJson(res, 400, { error: 'Passkey registration challenge did not verify.' });
+
+    const rawId = typeof body.rawId === 'string' ? body.rawId : null;
+    const publicKey = typeof body.publicKey === 'string' ? body.publicKey : null;
+    const alg = Number(body.alg);
+    if (!rawId || !publicKey || ![-7, -257].includes(alg)) {
+      return sendJson(res, 400, { error: 'Browser did not provide a usable passkey public key.' });
+    }
+
+    session.credentials.set(rawId, {
+      id: rawId,
+      publicKey,
+      alg,
+      signCount: 0,
+      createdAt: now(),
+    });
+    session.passkeyRegisterChallenge = null;
+    return sendJson(res, 201, { ok: true, credentialId: rawId });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/passkey/auth/options') {
+    if (!session.credentials.size) return sendJson(res, 409, { error: 'No passkey is registered in this session yet.' });
+    const challenge = randomId(32);
+    session.passkeyAuthChallenge = { challenge, createdAt: now() };
+    return sendJson(res, 200, {
+      challenge,
+      timeout: 60000,
+      userVerification: 'preferred',
+      allowCredentials: Array.from(session.credentials.keys()).map((id) => ({ type: 'public-key', id })),
+    });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/passkey/auth/verify') {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    const pending = session.passkeyAuthChallenge;
+    if (!pending || now() - pending.createdAt > FALLBACK_TTL_MS) return sendJson(res, 410, { error: 'Passkey challenge expired.' });
+    const credential = session.credentials.get(body.rawId);
+    if (!credential) return sendJson(res, 404, { error: 'Unknown passkey credential.' });
+
+    const client = parseClientData(body.clientDataJSON, 'webauthn.get', pending.challenge);
+    const authenticatorData = decodeCredentialPart(body.authenticatorData);
+    const signature = decodeCredentialPart(body.signature);
+    if (!client || !authenticatorData || !signature) return sendJson(res, 400, { error: 'Passkey response was incomplete.' });
+    if (!verifyPasskeySignature(credential, authenticatorData, client.bytes, signature)) {
+      return sendJson(res, 401, { error: 'Passkey signature did not verify.' });
+    }
+
+    const signCount = parseSignCount(authenticatorData);
+    if (credential.signCount && signCount && signCount <= credential.signCount) {
+      return sendJson(res, 401, { error: 'Passkey replay was detected.' });
+    }
+    credential.signCount = signCount || credential.signCount;
+    session.passkeyAuthChallenge = null;
+    const token = issueVerificationToken(session, { id: `passkey:${credential.id}` }, 'passkey', 'strong');
+    return sendJson(res, 200, { verified: true, verificationToken: token, tokenExpiresAt: now() + TOKEN_TTL_MS });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/fallback/challenge') {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    const mode = ['emergency_text', 'emergency_audio'].includes(body.mode) ? body.mode : null;
+    if (mode && mode.startsWith('emergency_') && session.emergencyVerifiedAt) {
+      return sendJson(res, 429, { error: 'Emergency verification was already used in this session.' });
+    }
+    const challenge = mode ? createFallbackChallenge(session, mode) : null;
+    if (!challenge) return sendJson(res, 400, { error: 'Unknown fallback mode.' });
+    return sendJson(res, 201, {
+      challengeId: challenge.id,
+      mode: challenge.mode,
+      prompt: challenge.prompt,
+      speakText: challenge.speakText,
+      expiresAt: challenge.expiresAt,
+    });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/fallback/verify') {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    const challenge = fallbackChallenges.get(body.challengeId);
+    if (!challenge || challenge.sessionId !== session.id) return sendJson(res, 404, { error: 'Unknown fallback challenge.' });
+    const answerError = verifyFallbackAnswer(challenge, body.answer);
+    if (answerError) return sendJson(res, 400, { error: answerError });
+    if (challenge.mode.startsWith('emergency_') && session.emergencyVerifiedAt) {
+      return sendJson(res, 429, { error: 'Emergency verification was already used in this session.' });
+    }
+    challenge.consumedAt = now();
+    if (challenge.mode.startsWith('emergency_')) session.emergencyVerifiedAt = now();
+    const assurance = challenge.mode.startsWith('emergency_') ? 'emergency' : 'fallback';
+    const token = issueVerificationToken(session, challenge, challenge.mode, assurance);
+    return sendJson(res, 200, {
+      verified: true,
+      verificationToken: token,
+      tokenExpiresAt: now() + TOKEN_TTL_MS,
+    });
+  }
+
+  if (req.method === 'POST' && pathname === '/api/liveness/verify') {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    const durationMs = Number(body.durationMs);
+    const faceFrames = Number(body.faceFrames);
+    const motionScore = Number(body.motionScore);
+    if (!Number.isFinite(durationMs) || durationMs < 900 || durationMs > 15000) {
+      return sendJson(res, 400, { error: 'Face check timing is outside the allowed range.' });
+    }
+    if (!Number.isFinite(faceFrames) || faceFrames < 8) return sendJson(res, 400, { error: 'Face was not visible for long enough.' });
+    if (!Number.isFinite(motionScore) || motionScore < 0.08) return sendJson(res, 400, { error: 'Face motion was too small to count as liveness.' });
+
+    const token = issueVerificationToken(session, { id: `face:${randomId(12)}` }, 'face-motion', 'fallback');
+    return sendJson(res, 200, {
+      verified: true,
+      verificationToken: token,
+      tokenExpiresAt: now() + TOKEN_TTL_MS,
     });
   }
 
@@ -313,7 +613,7 @@ async function handleApi(req, res, pathname) {
     }
 
     const payload = verifySignedPayload(body.verificationToken);
-    if (!payload || payload.type !== 'realhands.verification') return sendJson(res, 401, { error: 'Invalid verification token.' });
+    if (!payload || payload.type !== 'zoe.verification') return sendJson(res, 401, { error: 'Invalid verification token.' });
     if (payload.sid !== session.id) return sendJson(res, 403, { error: 'Token is not bound to this session.' });
     if (payload.action !== 'demo.protected-action') return sendJson(res, 403, { error: 'Token is not valid for this action.' });
     if (now() > payload.exp) return sendJson(res, 401, { error: 'Verification token expired.' });
@@ -354,8 +654,7 @@ function serveStatic(req, res, pathname) {
       res.writeHead(404);
       return res.end('Not found');
     }
-    const cacheControl = path.basename(filePath) === 'index.html' ? 'no-store' : 'public, max-age=300';
-    res.writeHead(200, { 'Content-Type': contentType(filePath), 'Cache-Control': cacheControl });
+    res.writeHead(200, { 'Content-Type': contentType(filePath), 'Cache-Control': 'no-store' });
     res.end(data);
   });
 }
@@ -376,7 +675,7 @@ function createServer() {
 
 if (require.main === module) {
   createServer().listen(PORT, HOST, () => {
-    console.log(`RealHands server listening on http://${HOST}:${PORT}`);
+    console.log(`Zoe server listening on http://${HOST}:${PORT}`);
   });
 }
 

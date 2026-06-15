@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>RealHands — Prove You're Human</title>
+  <title>Zoe — Prove You're Human</title>
   <link rel="stylesheet" href="styles.css" />
   <!-- MediaPipe Hands (client-side hand landmark detection) -->
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
@@ -11,27 +11,119 @@
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js" crossorigin="anonymous"></script>
 </head>
 <body>
-  <main class="captcha-card">
-    <header>
-      <h1>RealHands<span class="dot">.</span></h1>
-      <p class="tagline">A tiny hand check, with a safer backup path when cameras are being rude.</p>
+  <main id="captcha-card" class="captcha-card" aria-label="Zoe verification">
+    <header id="zoe-intro" class="zoe-hero intro-card">
+      <div class="zoe-icon" aria-hidden="true">
+        <span>Z</span>
+      </div>
+
+      <h1>Confirm that you're a real person with Zoe.</h1>
+      <p class="tagline">The website will only receive the following information to check if you meet its requirements:</p>
+
+      <div class="claim-row">
+        <span class="claim-icon" aria-hidden="true">✓</span>
+        <span>Is human</span>
+      </div>
+
+      <div class="privacy-panel">
+        <div>
+          <span class="privacy-icon" aria-hidden="true">◌</span>
+          <p>Zoe isolates verification from website activity, so they can't be linked.</p>
+        </div>
+        <div>
+          <span class="privacy-icon" aria-hidden="true">⌫</span>
+          <p>Video stays on this device. The site receives a one-use verification result.</p>
+        </div>
+        <div class="intro-actions">
+          <button id="zoe-verify-btn" class="primary intro-verify" type="button" aria-controls="dialog">Verify now</button>
+        </div>
+      </div>
     </header>
 
+    <section id="method-choice" class="choice-panel" hidden aria-label="Choose verification method">
+      <div class="choice-head">
+        <span class="verification-eyebrow">Zoe</span>
+        <h2>Choose how to verify</h2>
+      </div>
+
+      <div class="choice-grid">
+        <button id="choice-face-btn" class="choice-card" type="button">
+          <span class="choice-icon">🙂</span>
+          <span>
+            <strong>Face motion</strong>
+            <small>Fastest check. Best for most people.</small>
+          </span>
+        </button>
+        <button id="choice-hand-btn" class="choice-card" type="button">
+          <span class="choice-icon">🖐️</span>
+          <span>
+            <strong>Hand gestures</strong>
+            <small>Use if face motion is not available.</small>
+          </span>
+        </button>
+        <button id="choice-id-btn" class="choice-card" type="button">
+          <span class="choice-icon">⌘</span>
+          <span>
+            <strong>Zoe ID</strong>
+            <small>Use an approved passkey.</small>
+          </span>
+        </button>
+      </div>
+      <div id="choice-result" class="assist-result" aria-live="polite"></div>
+    </section>
+
+    <section id="zoe-id-panel" class="id-panel" hidden aria-label="Zoe ID verification">
+      <div class="choice-head">
+        <span class="verification-eyebrow">Zoe ID</span>
+        <h2>Do you have a Zoe ID?</h2>
+      </div>
+
+      <p class="id-copy">Use an existing Zoe ID passkey, or register one for this browser.</p>
+
+      <div class="id-actions">
+        <button id="id-use-btn" class="primary" type="button">Use existing Zoe ID</button>
+        <button id="id-register-btn" class="secondary" type="button">Register Zoe ID</button>
+        <button id="id-back-btn" class="ghost" type="button">Back</button>
+      </div>
+
+      <div id="id-result" class="assist-result" aria-live="polite"></div>
+    </section>
+
     <!-- Active verification dialog: hidden after success, replaced by .verified panel -->
-    <div id="dialog">
+    <div id="dialog" class="verification-panel" hidden>
+      <section class="verification-head">
+        <div>
+          <span class="verification-eyebrow">Zoe</span>
+          <h2 id="verification-title">Choose how to verify</h2>
+        </div>
+        <button id="mobile-id-btn" class="secondary mobile-id-btn" type="button">Use Zoe ID</button>
+      </section>
+
+      <section class="method-picker" aria-label="Verification method">
+        <button id="method-hand-btn" class="method-card active" type="button" aria-pressed="true">
+          <span class="method-icon">🖐️</span>
+          <span>
+            <strong>Hand gestures</strong>
+            <small>Complete 3 quick poses</small>
+          </span>
+        </button>
+        <button id="method-face-btn" class="method-card" type="button" aria-pressed="false">
+          <span class="method-icon">🙂</span>
+          <span>
+            <strong>Face motion</strong>
+            <small>Move gently left and right</small>
+          </span>
+        </button>
+      </section>
+
       <section class="difficulty">
-        <span class="difficulty-badge">3 gestures</span>
-        <span class="difficulty-hint">Complete all three to verify.</span>
+        <span class="difficulty-badge" id="method-label">Gesture check</span>
+        <span class="difficulty-hint" id="method-hint">3 quick steps</span>
       </section>
 
       <section class="stage">
-        <div class="video-wrap">
-          <video id="video" autoplay playsinline muted></video>
-          <canvas id="overlay"></canvas>
-          <div id="status-pill" class="status idle">Idle</div>
-        </div>
-
         <div class="prompt">
+          <div class="prompt-kicker">Current step</div>
           <div class="prompt-gesture" id="prompt-gesture">—</div>
           <div class="prompt-name" id="prompt-name" aria-live="polite">Click "Start" to begin</div>
           <div class="prompt-hint" id="prompt-hint" aria-live="polite"></div>
@@ -44,10 +136,16 @@
             <div class="check" data-step="2"><span class="num">3</span><span class="label">—</span></div>
           </div>
         </div>
+
+        <div class="video-wrap">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="overlay"></canvas>
+          <div id="status-pill" class="status idle">Idle</div>
+        </div>
       </section>
 
       <section class="controls">
-        <button id="start-btn" class="primary">Start verification</button>
+        <button id="start-btn" class="primary">Start check</button>
         <button id="assist-btn" class="ghost" type="button" aria-expanded="false" aria-controls="assist-panel">Need another way?</button>
       </section>
 
@@ -57,11 +155,24 @@
       </section>
 
       <section id="assist-panel" class="assist-panel" hidden>
-        <div>
-          <strong>No camera, limited mobility, or the gestures just are not happening?</strong>
-          <p>Ask for an assisted check. It keeps the door open without turning accessibility into an automatic bypass.</p>
+        <div class="emergency-block">
+          <div class="emergency-copy">
+            <strong>Emergency verification</strong>
+            <p>For one-time access when camera checks are not usable. Lower assurance; sites should only accept it for low-risk actions.</p>
+          </div>
+          <div class="assist-actions">
+            <button id="text-challenge-btn" class="secondary danger" type="button">Emergency text</button>
+            <button id="audio-challenge-btn" class="secondary danger" type="button">Emergency audio</button>
+          </div>
         </div>
-        <button id="assist-request-btn" class="secondary" type="button">Request assisted check</button>
+        <form id="fallback-form" class="fallback-form" hidden>
+          <label for="fallback-answer" id="fallback-label">Answer</label>
+          <div class="fallback-row">
+            <input id="fallback-answer" autocomplete="one-time-code" />
+            <button id="audio-repeat-btn" class="secondary" type="button" hidden>Repeat audio</button>
+            <button id="fallback-submit-btn" class="secondary" type="submit">Check</button>
+          </div>
+        </form>
         <div id="assist-result" class="assist-result" aria-live="polite"></div>
       </section>
     </div>
@@ -70,14 +181,14 @@
     <section id="verified" class="verified" hidden>
       <div class="verified-icon">✓</div>
       <div class="verified-text">
-        <strong>Nice. Those count as real hands.</strong>
+        <strong>Nice. Real person confirmed.</strong>
         <span>Welcome to the other side.</span>
       </div>
       <button id="reset-btn" class="ghost">Reset</button>
     </section>
 
     <footer>
-      <small>Video stays local; challenge state and replay protection are enforced by the server.</small>
+      <small>Secured by Zoe</small>
     </footer>
   </main>
 
