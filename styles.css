@@ -15,6 +15,7 @@
   --shadow: 0 26px 80px rgba(31, 28, 91, 0.24);
   --screen-ease: cubic-bezier(0.22, 1, 0.36, 1);
   --screen-duration: 420ms;
+  --screen-swipe-distance: 100%;
 }
 
 * { box-sizing: border-box; }
@@ -40,6 +41,8 @@ body {
 }
 
 .captcha-card {
+  --panel-enter-x: var(--screen-swipe-distance);
+  --panel-exit-x: calc(var(--screen-swipe-distance) * -1);
   position: fixed;
   top: 50%;
   left: 50%;
@@ -53,6 +56,11 @@ body {
   padding: 28px;
 }
 
+.captcha-card.swipe-back {
+  --panel-enter-x: calc(var(--screen-swipe-distance) * -1);
+  --panel-exit-x: var(--screen-swipe-distance);
+}
+
 .zoe-hero {
   overflow: hidden;
   background: var(--panel);
@@ -60,28 +68,56 @@ body {
   padding: 32px 32px 0;
 }
 
-.intro-card {
+.panel-shell {
   position: relative;
-  max-height: 900px;
-  opacity: 1;
-  transform: translateY(0) scale(1);
-  transition:
-    max-height var(--screen-duration) var(--screen-ease),
-    opacity 280ms ease,
-    padding var(--screen-duration) var(--screen-ease),
-    transform var(--screen-duration) var(--screen-ease);
+  overflow: hidden;
+  transition: height var(--screen-duration) var(--screen-ease);
 }
 
-.captcha-card.choice-mode .intro-card,
-.captcha-card.id-mode .intro-card,
-.captcha-card.verify-mode .intro-card,
-.captcha-card.success-mode .intro-card {
-  max-height: 0;
-  opacity: 0;
-  padding-top: 0;
-  padding-bottom: 0;
+.intro-card {
+  position: relative;
+}
+
+.panel-screen {
+  width: 100%;
+  transform: translateX(0);
+  transition:
+    opacity 180ms ease,
+    transform var(--screen-duration) var(--screen-ease);
+  will-change: transform;
+}
+
+.panel-screen[hidden] {
+  display: none;
+}
+
+.panel-screen.panel-entering,
+.panel-screen.panel-exiting {
+  display: block;
+  position: absolute;
+  inset: 0 0 auto;
+  z-index: 2;
+}
+
+.panel-screen.panel-entering {
+  transform: translateX(var(--panel-enter-x));
+}
+
+.panel-screen.panel-exiting {
+  transform: translateX(0);
+  z-index: 1;
+}
+
+.panel-shell.is-transitioning .panel-screen {
   pointer-events: none;
-  transform: translateY(-14px) scale(0.985);
+}
+
+.panel-shell.is-animating .panel-screen.panel-entering {
+  transform: translateX(0);
+}
+
+.panel-shell.is-animating .panel-screen.panel-exiting {
+  transform: translateX(var(--panel-exit-x));
 }
 
 .zoe-icon {
@@ -212,37 +248,12 @@ h1 {
 
 .choice-panel,
 .id-panel,
-.verification-panel,
-.verified {
-  position: relative;
+.verification-panel {
   display: block;
-  max-height: 0;
-  opacity: 0;
-  overflow: hidden;
-  padding-top: 0;
-  pointer-events: none;
-  transform: translateY(14px) scale(0.985);
-  transition:
-    max-height var(--screen-duration) var(--screen-ease),
-    opacity 280ms ease,
-    padding-top var(--screen-duration) var(--screen-ease),
-    padding-bottom var(--screen-duration) var(--screen-ease),
-    margin-top var(--screen-duration) var(--screen-ease),
-    transform var(--screen-duration) var(--screen-ease);
+  padding-top: 18px;
 }
 
-.intro-card.panel-exiting,
-.choice-panel.panel-exiting,
-.id-panel.panel-exiting,
-.verification-panel.panel-exiting,
-.verified.panel-exiting {
-  position: absolute;
-  top: 28px;
-  left: 28px;
-  right: 28px;
-  z-index: 3;
-}
-
+.intro-card[hidden],
 .choice-panel[hidden],
 .id-panel[hidden],
 .verification-panel[hidden],
@@ -252,11 +263,7 @@ h1 {
 
 .captcha-card.choice-mode .choice-panel,
 .captcha-card.id-mode .id-panel {
-  max-height: 720px;
-  opacity: 1;
-  padding-top: 18px;
   pointer-events: auto;
-  transform: translateY(0) scale(1);
 }
 
 .choice-head {
@@ -360,21 +367,11 @@ h1 {
 }
 
 .captcha-card.verify-mode .verification-panel {
-  max-height: 1700px;
-  opacity: 1;
-  padding-top: 18px;
   pointer-events: auto;
-  transform: translateY(0) scale(1);
 }
 
 .captcha-card.success-mode .verified {
-  max-height: 180px;
-  opacity: 1;
-  margin-top: 18px;
-  padding-top: 18px;
-  padding-bottom: 18px;
   pointer-events: auto;
-  transform: translateY(0) scale(1);
 }
 
 .verification-head {
@@ -716,11 +713,11 @@ button.secondary.danger {
 }
 
 .verified {
-  margin-top: 0;
+  margin-top: 18px;
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 0 18px;
+  padding: 18px;
   background: #e9f8ef;
   border: 1px solid #bfe6cd;
   border-radius: 24px;
@@ -767,16 +764,6 @@ footer {
     width: 100%;
     border-radius: 28px;
     padding: 14px;
-  }
-
-  .intro-card.panel-exiting,
-  .choice-panel.panel-exiting,
-  .id-panel.panel-exiting,
-  .verification-panel.panel-exiting,
-  .verified.panel-exiting {
-    top: 14px;
-    left: 14px;
-    right: 14px;
   }
 
   .zoe-hero {

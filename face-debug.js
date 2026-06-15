@@ -21,6 +21,16 @@ let lastError = '';
 const FACE_BOX_SHIFT_X = -1.0;
 const FACE_BOX_SHIFT_Y = -0.55;
 const FACE_BOX_HEIGHT_SCALE = 1.02;
+const FACE_TARGET = { cx: 0.5, cy: 0.46, rx: 0.23, ry: 0.33 };
+const FACE_MIN_SCORE = 0.5;
+const FACE_MIN_W = 0.06;
+const FACE_MAX_W = 0.85;
+const FACE_MIN_ASPECT = 0.55;
+const FACE_MAX_ASPECT = 1.7;
+const FACE_OVAL_SCALE_X = 1.25;
+const FACE_OVAL_SCALE_Y = 0.95;
+const FACE_CENTER_GATE_X = 0.45;
+const FACE_CENTER_GATE_Y = 0.45;
 
 function setStatus(message) {
   statusEl.innerHTML = message;
@@ -59,6 +69,40 @@ function calibratedFaceBox(box, vw, vh) {
     w,
     h,
   };
+}
+
+function normalizeBox(box, vw, vh, score) {
+  return {
+    cx: (box.x + box.w / 2) / vw,
+    cy: (box.y + box.h / 2) / vh,
+    w: box.w / vw,
+    h: box.h / vh,
+    score,
+  };
+}
+
+function centerInTargetOval(box) {
+  const nx = (box.cx - FACE_TARGET.cx) / (FACE_TARGET.rx * FACE_OVAL_SCALE_X);
+  const ny = (box.cy - FACE_TARGET.cy) / (FACE_TARGET.ry * FACE_OVAL_SCALE_Y);
+  return nx * nx + ny * ny <= 1;
+}
+
+function appGateState(box, score, vw, vh) {
+  const normalized = normalizeBox(box, vw, vh, score);
+  const aspect = box.w / Math.max(1, box.h);
+  const centerDx = Math.abs(normalized.cx - FACE_TARGET.cx);
+  const centerDy = Math.abs(normalized.cy - FACE_TARGET.cy);
+  const centerOk = centerDx < normalized.w * FACE_CENTER_GATE_X &&
+    centerDy < normalized.h * FACE_CENTER_GATE_Y;
+  const standardSizeOk = normalized.w > 0.12 && normalized.w < 0.7;
+
+  if (score < FACE_MIN_SCORE) return { accepted: false, normalized, reason: 'score' };
+  if (normalized.w < FACE_MIN_W || normalized.w > FACE_MAX_W) return { accepted: false, normalized, reason: 'width' };
+  if (aspect < FACE_MIN_ASPECT || aspect > FACE_MAX_ASPECT) return { accepted: false, normalized, reason: 'aspect' };
+  if (!centerInTargetOval(normalized)) return { accepted: false, normalized, reason: 'oval' };
+  if (!standardSizeOk) return { accepted: false, normalized, reason: 'size' };
+  if (!centerOk) return { accepted: false, normalized, reason: 'center' };
+  return { accepted: true, normalized, reason: 'pass' };
 }
 
 function pointToPixel(point, vw, vh) {
@@ -120,22 +164,48 @@ function drawDetections(detections, vw, vh) {
   ctx.lineWidth = 4;
   ctx.font = '18px system-ui, -apple-system, Segoe UI, sans-serif';
 
+  ctx.save();
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+  ctx.setLineDash([12, 10]);
+  ctx.beginPath();
+  ctx.ellipse(FACE_TARGET.cx * vw, FACE_TARGET.cy * vh, FACE_TARGET.rx * vw, FACE_TARGET.ry * vh, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+
   detections.forEach((detection, index) => {
     const rawBox = detectionBox(detection, vw, vh);
     const box = calibratedFaceBox(rawBox, vw, vh);
     const score = detectionScore(detection);
+    const gate = appGateState(box, score, vw, vh);
     ctx.strokeStyle = '#ff9f1c';
     ctx.fillStyle = '#ff9f1c';
     ctx.setLineDash([10, 8]);
     ctx.strokeRect(rawBox.x, rawBox.y, rawBox.w, rawBox.h);
     ctx.fillText(`raw ${index + 1}`, rawBox.x + 6, Math.max(22, rawBox.y - 30));
 
-    const color = index === 0 ? '#00ff7b' : '#ffd43b';
+    const color = gate.accepted ? '#00ff7b' : '#ffd43b';
     ctx.setLineDash([]);
     ctx.strokeStyle = color;
     ctx.fillStyle = color;
     ctx.strokeRect(box.x, box.y, box.w, box.h);
-    ctx.fillText(`cal ${index + 1}: ${(score * 100).toFixed(1)}%`, box.x + 6, Math.max(22, box.y - 8));
+    ctx.fillText(
+      `cal ${index + 1}: ${(score * 100).toFixed(1)}% app:${gate.reason}`,
+      box.x + 6,
+      Math.max(22, box.y - 8)
+    );
+
+    const gateW = gate.normalized.w * FACE_CENTER_GATE_X * 2 * vw;
+    const gateH = gate.normalized.h * FACE_CENTER_GATE_Y * 2 * vh;
+    ctx.save();
+    ctx.strokeStyle = gate.accepted ? 'rgba(0, 255, 123, 0.45)' : 'rgba(255, 212, 59, 0.45)';
+    ctx.setLineDash([6, 8]);
+    ctx.strokeRect(
+      FACE_TARGET.cx * vw - gateW / 2,
+      FACE_TARGET.cy * vh - gateH / 2,
+      gateW,
+      gateH
+    );
+    ctx.restore();
 
     (detection.keypoints || []).forEach((rawPoint, pointIndex) => {
       const point = pointToPixel(rawPoint, vw, vh);
@@ -177,7 +247,8 @@ function loop() {
     `<strong>image mirrored:</strong> ${mirrorToggle.checked ? 'yes' : 'no'} &nbsp; ` +
     `<strong>overlay mirrored:</strong> ${mirrorOverlayToggle.checked ? 'yes' : 'no'}<br>` +
     `<strong>orange:</strong> raw Blaze box &nbsp; <strong>green:</strong> calibrated app box &nbsp; ` +
-    `<strong>calibration:</strong> x ${FACE_BOX_SHIFT_X}w, y ${FACE_BOX_SHIFT_Y}h` +
+    `<strong>calibration:</strong> x ${FACE_BOX_SHIFT_X}w, y ${FACE_BOX_SHIFT_Y}h &nbsp; ` +
+    `<strong>app gates:</strong> score/size/aspect/oval/center` +
     (lastError ? `<br><strong>error:</strong> ${lastError}` : '')
   );
   requestAnimationFrame(loop);

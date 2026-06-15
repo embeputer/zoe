@@ -12,7 +12,8 @@
 </head>
 <body>
   <main id="captcha-card" class="captcha-card" aria-label="Zoe verification">
-    <header id="zoe-intro" class="zoe-hero intro-card">
+    <div id="panel-shell" class="panel-shell">
+    <header id="zoe-intro" class="zoe-hero intro-card panel-screen">
       <div class="zoe-icon" aria-hidden="true">
         <span>Z</span>
       </div>
@@ -40,7 +41,7 @@
       </div>
     </header>
 
-    <section id="method-choice" class="choice-panel" hidden aria-label="Choose verification method">
+    <section id="method-choice" class="choice-panel panel-screen" hidden aria-label="Choose verification method">
       <div class="choice-head">
         <span class="verification-eyebrow">Zoe</span>
         <h2>Choose how to verify</h2>
@@ -73,7 +74,7 @@
       <div id="choice-result" class="assist-result" aria-live="polite"></div>
     </section>
 
-    <section id="zoe-id-panel" class="id-panel" hidden aria-label="Zoe ID verification">
+    <section id="zoe-id-panel" class="id-panel panel-screen" hidden aria-label="Zoe ID verification">
       <div class="choice-head">
         <span class="verification-eyebrow">Zoe ID</span>
         <h2>Do you have a Zoe ID?</h2>
@@ -92,7 +93,7 @@
     </section>
 
     <!-- Active verification dialog: hidden after success, replaced by .verified panel -->
-    <div id="dialog" class="verification-panel" hidden>
+    <div id="dialog" class="verification-panel panel-screen" hidden>
       <section class="verification-head">
         <div>
           <span class="verification-eyebrow">Zoe</span>
@@ -170,7 +171,7 @@
     </div>
 
     <!-- Compact server-verified panel: replaces #dialog after success -->
-    <section id="verified" class="verified" hidden>
+    <section id="verified" class="verified panel-screen" hidden>
       <div class="verified-icon">✓</div>
       <div class="verified-text">
         <strong>You have been verified as a real person!</strong>
@@ -178,6 +179,7 @@
       </div>
       <button id="reset-btn" class="ghost">Reset</button>
     </section>
+    </div>
 
     <footer>
       <small>Secured by Zoe</small>

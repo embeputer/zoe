@@ -52,6 +52,7 @@ const verificationTitleEl = $('verification-title');
 const startBtn = $('start-btn');
 const resetBtn = $('reset-btn');
 const cardEl = $('captcha-card');
+const panelShellEl = $('panel-shell');
 const zoeIntroEl = $('zoe-intro');
 const zoeVerifyBtn = $('zoe-verify-btn');
 const methodChoiceEl = $('method-choice');
@@ -342,14 +343,21 @@ function setCardMode(mode) {
   cardEl.classList.toggle('success-mode', mode === 'success');
 }
 
-function transitionToPanel(activePanel, mode, focusEl) {
+function transitionToPanel(activePanel, mode, focusEl, direction = 'forward') {
   const panels = [zoeIntroEl, methodChoiceEl, zoeIdPanel, dialogEl, verifiedEl];
   if (panelTransitionTimer) window.clearTimeout(panelTransitionTimer);
+  const outgoingPanel = panels.find((panel) => !panel.hidden && panel !== activePanel);
+  const outgoingHeight = outgoingPanel ? outgoingPanel.offsetHeight : panelShellEl.offsetHeight;
+
+  cardEl.classList.toggle('swipe-back', direction === 'back');
+  panelShellEl.classList.remove('is-transitioning', 'is-animating');
+  panelShellEl.style.height = `${Math.max(1, outgoingHeight)}px`;
 
   panels.forEach((panel) => {
-    const wasVisible = !panel.hidden;
-    if (panel === activePanel || wasVisible) panel.hidden = false;
-    panel.classList.toggle('panel-exiting', panel !== activePanel && wasVisible);
+    const isOutgoing = panel === outgoingPanel;
+    if (panel === activePanel || isOutgoing) panel.hidden = false;
+    panel.classList.toggle('panel-exiting', isOutgoing);
+    panel.classList.toggle('panel-entering', panel === activePanel && panel !== outgoingPanel);
     if (panel === activePanel) {
       panel.classList.remove('panel-exiting');
       panel.removeAttribute('aria-hidden');
@@ -360,39 +368,48 @@ function transitionToPanel(activePanel, mode, focusEl) {
 
   requestAnimationFrame(() => {
     setCardMode(mode);
-    if (focusEl) focusEl.focus();
+    panelShellEl.classList.add('is-transitioning');
+    panelShellEl.style.height = `${Math.max(1, activePanel.offsetHeight)}px`;
     fitCardToViewport();
+    requestAnimationFrame(() => {
+      panelShellEl.classList.add('is-animating');
+    });
   });
 
   panelTransitionTimer = window.setTimeout(() => {
     panels.forEach((panel) => {
       panel.classList.remove('panel-exiting');
+      panel.classList.remove('panel-entering');
       if (panel !== activePanel) panel.hidden = true;
     });
+    cardEl.classList.remove('swipe-back');
+    panelShellEl.classList.remove('is-transitioning', 'is-animating');
+    panelShellEl.style.height = 'auto';
+    if (focusEl) focusEl.focus();
     fitCardToViewport();
   }, PANEL_TRANSITION_MS);
 }
 
-function showChoicePanel() {
+function showChoicePanel(direction = 'forward') {
   choiceResultEl.textContent = '';
   zoeVerifyBtn.disabled = true;
-  transitionToPanel(methodChoiceEl, 'choice', choiceFaceBtn);
+  transitionToPanel(methodChoiceEl, 'choice', choiceFaceBtn, direction);
 }
 
-function showZoeIdPanel(returnTarget = 'choice') {
+function showZoeIdPanel(returnTarget = 'choice', direction = 'forward') {
   zoeIdReturnTarget = returnTarget;
   idResultEl.textContent = '';
   zoeVerifyBtn.disabled = true;
-  transitionToPanel(zoeIdPanel, 'id', idUseBtn);
+  transitionToPanel(zoeIdPanel, 'id', idUseBtn, direction);
 }
 
-function showVerificationPanel() {
+function showVerificationPanel(direction = 'forward') {
   setEmergencyAssistAvailable(!pendingZoeIdRegistration);
   if (pendingZoeIdRegistration) {
     showCameraHelp('Zoe ID registration requires a face or hand check. In production, mobility/accessibility needs should go through manual review before passkey setup.');
   }
   zoeVerifyBtn.disabled = true;
-  transitionToPanel(dialogEl, 'verify', startBtn);
+  transitionToPanel(dialogEl, 'verify', startBtn, direction);
 }
 
 function showSuccessPanel() {
@@ -404,7 +421,7 @@ function showIntroPanel() {
   zoeIdReturnTarget = 'choice';
   setEmergencyAssistAvailable(true);
   zoeVerifyBtn.disabled = false;
-  transitionToPanel(zoeIntroEl, null, zoeVerifyBtn);
+  transitionToPanel(zoeIntroEl, null, zoeVerifyBtn, 'back');
 }
 
 function continueFromIntro() {
@@ -426,11 +443,11 @@ function choosePrimaryMethod(method) {
 
 function leaveZoeIdPanel() {
   if (zoeIdReturnTarget === 'verification') {
-    showVerificationPanel();
+    showVerificationPanel('back');
     return;
   }
 
-  showChoicePanel();
+  showChoicePanel('back');
 }
 
 function showPrompt(step) {
@@ -586,7 +603,7 @@ async function confirmProtectedAction() {
       await createFreshPasskey(resultEl);
       stopDetection();
       stopCamera();
-      showZoeIdPanel('choice');
+      showZoeIdPanel('choice', 'back');
       idResultEl.textContent = 'Zoe ID passkey saved. Next time, choose Use existing Zoe ID.';
       setAssistButtonsDisabled(false);
       return;
@@ -623,12 +640,8 @@ async function startVerification() {
 }
 
 function onResults(results) {
-  ctx.save();
   ctx.clearRect(0, 0, canvasEl.width, canvasEl.height);
-  ctx.translate(canvasEl.width, 0);
-  ctx.scale(-1, 1);
   if (results.image) ctx.drawImage(results.image, 0, 0, canvasEl.width, canvasEl.height);
-  ctx.restore();
 
   const hands = results.multiHandLandmarks || [];
   if (!hands.length) {
@@ -644,16 +657,12 @@ function onResults(results) {
 
   noHandFrames = 0;
   const lm = hands[0];
-  ctx.save();
-  ctx.translate(canvasEl.width, 0);
-  ctx.scale(-1, 1);
   if (window.drawConnectors && window.HAND_CONNECTIONS) {
     hands.forEach((hand) => {
       window.drawConnectors(ctx, hand, window.HAND_CONNECTIONS, { color: '#5b8cff', lineWidth: 3 });
       window.drawLandmarks(ctx, hand, { color: '#7b5bff', lineWidth: 1, radius: 4 });
     });
   }
-  ctx.restore();
 
   if (!currentStep || submittingStep) return;
   if (cooldownUntil && performance.now() < cooldownUntil) return;
@@ -1100,6 +1109,11 @@ const FACE_OVAL_SCALE_Y = 0.95;
 const FACE_BOX_SHIFT_X = -1.0;
 const FACE_BOX_SHIFT_Y = -0.55;
 const FACE_BOX_HEIGHT_SCALE = 1.02;
+// Face-box acceptance offsets are expressed as detected-box multipliers, not
+// fixed pixels or fixed frame percentages, so they scale with camera distance.
+const FACE_CENTER_GATE_X = 0.45;
+const FACE_CENTER_GATE_Y = 0.45;
+const FACE_MOTION_GATE_X = 0.45;
 
 function plausibleFace(candidate, vw, vh) {
   const wNorm = candidate.w / vw;
@@ -1323,7 +1337,7 @@ async function runFaceMotionPhase(engine, centers, sizes, opts) {
       const displayed = displayedFaceX(box);
       promptHintEl.textContent = opts.hint;
       drawFaceGuide(box, { state: 'move', arrow: opts.arrow });
-      if (opts.reached(displayed)) {
+      if (opts.reached(displayed, box)) {
         hits++;
         if (hits >= 2) return true;
       } else {
@@ -1359,7 +1373,7 @@ async function runGuidedFaceCheck() {
       const dx = Math.abs(displayedFaceX(box) - FACE_TARGET.cx);
       const dy = Math.abs(box.cy - FACE_TARGET.cy);
       const sizeOk = box.w > 0.12 && box.w < 0.7;
-      return dx < 0.13 && dy < 0.16 && sizeOk;
+      return dx < box.w * FACE_CENTER_GATE_X && dy < box.h * FACE_CENTER_GATE_Y && sizeOk;
     };
 
     // Phase 1: center the face inside the oval.
@@ -1399,7 +1413,7 @@ async function runGuidedFaceCheck() {
       hint: 'Slowly move your head to the left.',
       arrow: 'left',
       deadline,
-      reached: (displayed) => displayed <= FACE_TARGET.cx - 0.13,
+      reached: (displayed, box) => displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
     });
     if (!movedLeft) {
       throw new Error('Face motion timed out. Move your head left when prompted, then try again.');
@@ -1412,7 +1426,7 @@ async function runGuidedFaceCheck() {
       hint: 'Now slowly move your head to the right.',
       arrow: 'right',
       deadline,
-      reached: (displayed) => displayed >= FACE_TARGET.cx + 0.13,
+      reached: (displayed, box) => displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
     });
     if (!movedRight) {
       throw new Error('Face motion timed out. Move your head right when prompted, then try again.');
