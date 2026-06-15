@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RealHands — Prove You're Human</title>
+  <link rel="stylesheet" href="styles.css" />
+  <!-- MediaPipe Hands (client-side hand landmark detection) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js" crossorigin="anonymous"></script>
+</head>
+<body>
+  <main class="captcha-card">
+    <header>
+      <h1>RealHands<span class="dot">.</span></h1>
+      <p class="tagline">A tiny hand check, with a safer backup path when cameras are being rude.</p>
+    </header>
+
+    <!-- Active verification dialog: hidden after success, replaced by .verified panel -->
+    <div id="dialog">
+      <section class="difficulty">
+        <span class="difficulty-badge">3 gestures</span>
+        <span class="difficulty-hint">Complete all three to verify.</span>
+      </section>
+
+      <section class="stage">
+        <div class="video-wrap">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="overlay"></canvas>
+          <div id="status-pill" class="status idle">Idle</div>
+        </div>
+
+        <div class="prompt">
+          <div class="prompt-gesture" id="prompt-gesture">—</div>
+          <div class="prompt-name" id="prompt-name" aria-live="polite">Click "Start" to begin</div>
+          <div class="prompt-hint" id="prompt-hint" aria-live="polite"></div>
+          <div class="progress">
+            <div class="progress-bar" id="progress-bar"></div>
+          </div>
+          <div class="checks">
+            <div class="check" data-step="0"><span class="num">1</span><span class="label">—</span></div>
+            <div class="check" data-step="1"><span class="num">2</span><span class="label">—</span></div>
+            <div class="check" data-step="2"><span class="num">3</span><span class="label">—</span></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="controls">
+        <button id="start-btn" class="primary">Start verification</button>
+        <button id="assist-btn" class="ghost" type="button" aria-expanded="false" aria-controls="assist-panel">Need another way?</button>
+      </section>
+
+      <section id="camera-help" class="camera-help" hidden aria-live="polite">
+        <strong>Camera having a moment?</strong>
+        <span id="camera-help-text">Try brighter light, move your hand fully into frame, or hold still for a beat.</span>
+      </section>
+
+      <section id="assist-panel" class="assist-panel" hidden>
+        <div>
+          <strong>No camera, limited mobility, or the gestures just are not happening?</strong>
+          <p>Ask for an assisted check. It keeps the door open without turning accessibility into an automatic bypass.</p>
+        </div>
+        <button id="assist-request-btn" class="secondary" type="button">Request assisted check</button>
+        <div id="assist-result" class="assist-result" aria-live="polite"></div>
+      </section>
+    </div>
+
+    <!-- Compact server-verified panel: replaces #dialog after success -->
+    <section id="verified" class="verified" hidden>
+      <div class="verified-icon">✓</div>
+      <div class="verified-text">
+        <strong>Nice. Those count as real hands.</strong>
+        <span>Welcome to the other side.</span>
+      </div>
+      <button id="reset-btn" class="ghost">Reset</button>
+    </section>
+
+    <footer>
+      <small>Video stays local; challenge state and replay protection are enforced by the server.</small>
+    </footer>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
