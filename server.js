@@ -243,6 +243,27 @@ function issueVerificationToken(session, source, method = 'gesture', assurance =
   return token;
 }
 
+function consumeVerificationToken(session, token, allowed) {
+  const payload = verifySignedPayload(token);
+  if (!payload || payload.type !== 'zoe.verification') return { error: 'Invalid verification token.' };
+  if (payload.sid !== session.id) return { error: 'Token is not bound to this session.', status: 403 };
+  if (payload.action !== 'demo.protected-action') return { error: 'Token is not valid for this action.', status: 403 };
+  if (now() > payload.exp) return { error: 'Verification token expired.' };
+
+  const methods = allowed?.methods || null;
+  const assurances = allowed?.assurances || null;
+  if (methods && !methods.includes(payload.method)) return { error: 'Verification method is not allowed for this action.', status: 403 };
+  if (assurances && !assurances.includes(payload.assurance)) return { error: 'Verification assurance is not allowed for this action.', status: 403 };
+
+  const digest = crypto.createHash('sha256').update(token).digest('base64url');
+  if (usedTokenDigests.has(digest)) return { error: 'Verification token was already used.', status: 409 };
+  if (!session.issuedTokens.has(digest)) return { error: 'Token was not issued to this session.', status: 403 };
+
+  usedTokenDigests.add(digest);
+  session.issuedTokens.delete(digest);
+  return { payload };
+}
+
 function originAllowed(origin) {
   try {
     const url = new URL(origin);
@@ -394,8 +415,21 @@ async function handleApi(req, res, pathname) {
   }
 
   if (req.method === 'POST' && pathname === '/api/passkey/register/options') {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    const gate = consumeVerificationToken(session, body.registrationVerificationToken, {
+      methods: ['gesture', 'face-motion'],
+      assurances: ['standard', 'fallback'],
+    });
+    if (gate.error) return sendJson(res, gate.status || 401, { error: gate.error });
+
     const challenge = randomId(32);
-    session.passkeyRegisterChallenge = { challenge, createdAt: now() };
+    session.passkeyRegisterChallenge = { challenge, createdAt: now(), verifiedBy: gate.payload.method };
     return sendJson(res, 200, {
       challenge,
       rp: { name: APP_NAME },
@@ -419,7 +453,9 @@ async function handleApi(req, res, pathname) {
   }
 
   if (req.method === 'POST' && pathname === '/api/passkey/reset') {
-    session.credentials.clear();
+    // Demo-only escape hatch for local testing. Registration no longer calls this:
+    // users must verify before adding a new Zoe ID passkey, and existing passkeys
+    // are preserved instead of being silently cleared.
     session.passkeyRegisterChallenge = null;
     session.passkeyAuthChallenge = null;
     return sendJson(res, 200, { ok: true });
@@ -612,18 +648,8 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const payload = verifySignedPayload(body.verificationToken);
-    if (!payload || payload.type !== 'zoe.verification') return sendJson(res, 401, { error: 'Invalid verification token.' });
-    if (payload.sid !== session.id) return sendJson(res, 403, { error: 'Token is not bound to this session.' });
-    if (payload.action !== 'demo.protected-action') return sendJson(res, 403, { error: 'Token is not valid for this action.' });
-    if (now() > payload.exp) return sendJson(res, 401, { error: 'Verification token expired.' });
-
-    const digest = crypto.createHash('sha256').update(body.verificationToken).digest('base64url');
-    if (usedTokenDigests.has(digest)) return sendJson(res, 409, { error: 'Verification token was already used.' });
-    if (!session.issuedTokens.has(digest)) return sendJson(res, 403, { error: 'Token was not issued to this session.' });
-
-    usedTokenDigests.add(digest);
-    session.issuedTokens.delete(digest);
+    const gate = consumeVerificationToken(session, body.verificationToken);
+    if (gate.error) return sendJson(res, gate.status || 401, { error: gate.error });
     return sendJson(res, 200, { ok: true, message: 'Protected action accepted by the server.' });
   }
 

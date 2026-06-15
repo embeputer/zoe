@@ -52,7 +52,7 @@ The regression test starts a temporary local HTTP server and checks that:
 The UI gives camera guidance when detection struggles. Users can choose a different primary method before verification:
 
 - **Zoe ID**: strongest repeat-use path. Approved users verify with a passkey through WebAuthn, and the server verifies the signed assertion.
-- **Face motion**: primary local face-motion check using the MediaPipe Tasks Vision Face Landmarker (cross-browser; works in Chrome, Safari, and Firefox under a strict CSP). The 478-point face mesh only fits real faces, so it won't mistake a shoulder for a face. The model is served locally from `models/`. It falls back to the browser `FaceDetector` API only when the MediaPipe runtime cannot load. It checks simple motion, not identity.
+- **Face motion**: primary local face-motion check using MediaPipe Tasks Vision FaceDetector (cross-browser; works in Chrome, Safari, and Firefox under a strict CSP). The compatible short-range detector model is served locally from `models/`, and the browser verifies confidence, face-sized bounds, and target-oval position before counting motion. It falls back to the browser `FaceDetector` API only when the MediaPipe runtime cannot load. It checks simple motion, not identity.
 
 During camera verification, **Need another way?** is emergency-only:
 

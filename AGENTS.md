@@ -11,6 +11,7 @@ This is a plain Node/static app:
 - `index.html` is the single page.
 - `styles.css` is the complete UI styling.
 - `test_server.js` is the regression/security test suite.
+- `face-debug.html` + `face-debug.js` are a dev-only camera/model debugger.
 
 ## Run And Test
 
@@ -35,6 +36,14 @@ In this workspace, port `3000` is often busy, so previous work has used:
 env PORT=3001 npm start
 ```
 
+For isolated face detector debugging, use:
+
+```sh
+npm run dev
+```
+
+This starts `dev_face_debug.js`, serves `face-debug.html` (default `http://127.0.0.1:3010/face-debug.html`), opens the browser, and draws raw Blaze detections/keypoints/confidence over the camera feed without running the full verification flow. Use `PORT=3020 npm run dev` to pick another port.
+
 The test suite binds a temporary local HTTP server. In sandboxed Codex sessions, `npm test` may need elevated permission because binding `127.0.0.1` can fail with `EPERM`.
 
 ## Current Product Flow
@@ -58,9 +67,18 @@ Do not reintroduce a fake phone frame. The design is inspired by the card inside
 
 ### Face Motion
 
-Face motion is the default on mobile. It runs cross-browser using MediaPipe Tasks Vision (`@mediapipe/tasks-vision`), imported dynamically in `app.js`. The WASM runtime loads from `cdn.jsdelivr.net`, and the Face Landmarker model is vendored locally at `models/face_landmarker.task` and served from the same origin. The Face Landmarker (478-point face mesh) is used instead of a plain bounding-box detector because the mesh only fits real facial geometry, which avoids false positives such as detecting a shoulder as a face. The face box used by the guided flow is derived from the min/max of the mesh landmarks. (`models/blaze_face_short_range.tflite` remains vendored for reference but the landmarker is the active model.) This combination works in Chrome, Safari, and Firefox under the strict Content-Security-Policy (which allows only `wasm-unsafe-eval`, not `unsafe-eval`). The older `@mediapipe/face_detection` Solutions build is intentionally avoided because it evaluates strings as JavaScript and would require loosening the CSP. The browser's non-standard `FaceDetector` API is used only as an opportunistic fallback when the MediaPipe runtime cannot load. It is a liveness-style motion check, not identity verification.
+Face motion is the default on mobile. It runs cross-browser using MediaPipe Tasks Vision (`@mediapipe/tasks-vision`), imported dynamically in `app.js`. The WASM runtime loads from `cdn.jsdelivr.net`, and the active compatible short-range FaceDetector model is vendored locally at `models/blaze_face_short_range.tflite` and served from the same origin. The Tasks Vision FaceDetector is the active gate because it exposes confidence scores and a conventional bounding box; the browser validates confidence, size/aspect, and target-oval position before counting motion. The older `@mediapipe/face_detection` Solutions build is intentionally avoided because it evaluates strings as JavaScript and would require loosening the CSP. The browser's non-standard `FaceDetector` API is used only as an opportunistic fallback when the MediaPipe runtime cannot load. It is a liveness-style motion check, not identity verification.
 
-The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval on the overlay canvas, then walks the user through center → move left → move right with changing prompt text and a directional arrow. This horizontal sweep produces the motion the server requires. The interactive loop runs outside the start button's init timeout (only camera + model load are time-boxed). Mirroring rule: the overlay canvas mirrors the feed itself while drawing (so captions/arrows stay readable), therefore `#overlay` must NOT have a CSS `transform: scaleX(-1)` — only `#video` is CSS-mirrored. Do not re-add a CSS flip to `#overlay`.
+The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval on the overlay canvas, then walks the user through center → move left → move right with changing prompt text and a directional arrow. This horizontal sweep produces the motion the server requires. The camera starts unmirrored on purpose so Blaze detector coordinates, the video frame, and the overlay rectangle all share one coordinate space. Do not re-add `scaleX(-1)` to `#video` or `#overlay` unless the coordinate mapping is changed and verified in `npm run dev`.
+
+Known face-detector findings:
+
+- `models/blaze_face_short_range.tflite` is the compatible active model. The browser debug page has shown it can detect the user's face around ~86-87% confidence.
+- `models/blaze_face_full_range.tflite` was tested and is incompatible with the Tasks FaceDetector graph in this app (`raw_box_tensor ... 2304 vs 896`). Do not reintroduce it unless the graph/model compatibility is proven first.
+- `models/face_landmarker.task` was removed from the active path because the landmarker-only approach could hallucinate a mesh on shoulder/neck/background skin without a usable per-face confidence score.
+- Keep the face logic boring: detector output → one centralized box calibration (`calibratedFaceBox`) → size/oval gates → explicit center/left/right state machine. The default coordinate mode is unmirrored (`displayedFaceX(box) === box.cx`). Do not stack ad hoc keypoint-derived boxes, scattered `1 - box.cx` conversions, or extra draw-only offsets.
+- `calibratedFaceBox` currently shifts the raw Blaze box left by one raw box width and up by `0.55` raw box heights, then scales height by `1.02`. If screenshots show drift, tune only the constants in `calibratedFaceBox` in both `app.js` and `face-debug.js`.
+- `SHOW_FACE_DEBUG_BOX` in `app.js` controls whether the blue box appears in the real app. Prefer `npm run dev` for detailed debugging instead of adding temporary browser-console snippets.
 
 ### Hand Gestures
 
@@ -75,6 +93,16 @@ Important gesture details:
 ### Zoe ID
 
 Zoe ID is the high-assurance repeat-use path. It is implemented as WebAuthn/passkeys in this demo. Passkey credentials are stored in memory on the session, not in durable accounts.
+
+Zoe ID registration must be gated. Do not blindly create a passkey just because the user clicked register:
+
+- The user must first complete a fresh face or hand check.
+- `/api/passkey/register/options` requires `registrationVerificationToken`.
+- Only `gesture` and `face-motion` verification tokens with `standard`/`fallback` assurance may unlock registration.
+- Emergency text/audio tokens must not register Zoe ID.
+- Do not show `Need another way?` emergency checks while Zoe ID registration is waiting for face/hand verification.
+- Creating a passkey should not immediately act as proof of identity; future access uses `Use existing Zoe ID`.
+- Do not build a Zoe ID portal in this demo. That is production scope. Current copy may reference production manual review, but there should be no portal route/UI yet.
 
 There are multiple Zoe ID entry points:
 
@@ -104,6 +132,7 @@ Keep these properties intact:
 - Assisted/accessibility request IDs are not verification tokens.
 - Emergency fallback is one-use per session.
 - Passkey assertions must verify against a server-issued challenge.
+- Passkey registration must be gated by a fresh non-emergency verification token.
 
 The app is still a demo. For production, the README already calls out needed upgrades: durable storage, real account-backed passkeys, server-side media verification or stronger liveness, abuse monitoring, datastore-backed rate limits, deployment-specific CSRF/origin checks, secret management, and a complete accessibility fallback policy.
 

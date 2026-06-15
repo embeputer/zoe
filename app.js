@@ -33,6 +33,8 @@ let noMatchFrames = 0;
 let lastHelpMessageAt = 0;
 let selectedPrimaryMethod = 'hand';
 let zoeIdReturnTarget = 'choice';
+let pendingZoeIdRegistration = false;
+let pendingZoeIdResultEl = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -209,26 +211,23 @@ async function initMediaPipe() {
 // model is vendored locally so no extra connect-src origin is required.
 const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
 const TASKS_VISION_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
-const FACE_MODEL_URL = '/models/face_landmarker.task';
+const FACE_DETECTOR_MODEL_URL = '/models/blaze_face_short_range.tflite';
 
-// Use the Face Landmarker (478-point face mesh). Unlike a plain bounding-box
-// detector, it only locks onto real facial geometry, so it won't mistake a
-// shoulder or torso for a face.
+// Use the dedicated FaceDetector as the acceptance gate because it exposes a
+// confidence score and a conventional bounding box. The previous landmarker-only
+// path could hallucinate a canonical mesh on non-face skin without a reliable
+// per-face confidence score, which is what caused shoulder/neck false locks.
 async function initFaceDetection() {
   const vision = await import(TASKS_VISION_URL);
   const fileset = await vision.FilesetResolver.forVisionTasks(TASKS_VISION_WASM);
-  faceModel = await vision.FaceLandmarker.createFromOptions(fileset, {
-    baseOptions: { modelAssetPath: FACE_MODEL_URL },
+  const detector = await vision.FaceDetector.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: FACE_DETECTOR_MODEL_URL },
     runningMode: 'VIDEO',
-    // Detect several candidates so we can keep the real face and discard the
-    // shoulder/neck/background mesh the detector sometimes also reports. The
-    // geometry validation in detectFaceFrame filters the junk, so a permissive
-    // detector threshold here just maximizes the chance the real face is found.
-    numFaces: 5,
-    minFaceDetectionConfidence: 0.4,
-    minFacePresenceConfidence: 0.4,
-    minTrackingConfidence: 0.4,
+    // Keep model recall high; the app-level size/position gates below handle
+    // obvious false positives.
+    minDetectionConfidence: 0.5,
   });
+  faceModel = detector;
 }
 
 async function startCamera() {
@@ -310,6 +309,11 @@ function showError(msg) {
   setStatus('Error', 'error');
   promptHintEl.textContent = msg;
   setStartButton('Start check', false);
+  if (pendingZoeIdRegistration) {
+    pendingZoeIdRegistration = false;
+    pendingZoeIdResultEl = null;
+    setAssistButtonsDisabled(false);
+  }
 }
 
 function showCameraHelp(message) {
@@ -328,64 +332,79 @@ function isMobileLayout() {
   return window.matchMedia('(max-width: 560px)').matches;
 }
 
-function showChoicePanel() {
-  methodChoiceEl.hidden = false;
-  zoeIdPanel.hidden = true;
-  dialogEl.hidden = true;
-  verifiedEl.hidden = true;
-  choiceResultEl.textContent = '';
-  zoeIntroEl.setAttribute('aria-hidden', 'true');
-  zoeVerifyBtn.disabled = true;
-  requestAnimationFrame(() => {
-    cardEl.classList.remove('id-mode');
-    cardEl.classList.remove('verify-mode');
-    cardEl.classList.add('choice-mode');
-    choiceFaceBtn.focus();
+const PANEL_TRANSITION_MS = 440;
+let panelTransitionTimer = null;
+
+function setCardMode(mode) {
+  cardEl.classList.toggle('choice-mode', mode === 'choice');
+  cardEl.classList.toggle('id-mode', mode === 'id');
+  cardEl.classList.toggle('verify-mode', mode === 'verify');
+  cardEl.classList.toggle('success-mode', mode === 'success');
+}
+
+function transitionToPanel(activePanel, mode, focusEl) {
+  const panels = [zoeIntroEl, methodChoiceEl, zoeIdPanel, dialogEl, verifiedEl];
+  if (panelTransitionTimer) window.clearTimeout(panelTransitionTimer);
+
+  panels.forEach((panel) => {
+    const wasVisible = !panel.hidden;
+    if (panel === activePanel || wasVisible) panel.hidden = false;
+    panel.classList.toggle('panel-exiting', panel !== activePanel && wasVisible);
+    if (panel === activePanel) {
+      panel.classList.remove('panel-exiting');
+      panel.removeAttribute('aria-hidden');
+    } else {
+      panel.setAttribute('aria-hidden', 'true');
+    }
   });
+
+  requestAnimationFrame(() => {
+    setCardMode(mode);
+    if (focusEl) focusEl.focus();
+    fitCardToViewport();
+  });
+
+  panelTransitionTimer = window.setTimeout(() => {
+    panels.forEach((panel) => {
+      panel.classList.remove('panel-exiting');
+      if (panel !== activePanel) panel.hidden = true;
+    });
+    fitCardToViewport();
+  }, PANEL_TRANSITION_MS);
+}
+
+function showChoicePanel() {
+  choiceResultEl.textContent = '';
+  zoeVerifyBtn.disabled = true;
+  transitionToPanel(methodChoiceEl, 'choice', choiceFaceBtn);
 }
 
 function showZoeIdPanel(returnTarget = 'choice') {
   zoeIdReturnTarget = returnTarget;
-  methodChoiceEl.hidden = true;
-  zoeIdPanel.hidden = false;
-  dialogEl.hidden = true;
-  verifiedEl.hidden = true;
   idResultEl.textContent = '';
-  zoeIntroEl.setAttribute('aria-hidden', 'true');
   zoeVerifyBtn.disabled = true;
-  requestAnimationFrame(() => {
-    cardEl.classList.remove('choice-mode');
-    cardEl.classList.remove('verify-mode');
-    cardEl.classList.add('id-mode');
-    idUseBtn.focus();
-  });
+  transitionToPanel(zoeIdPanel, 'id', idUseBtn);
 }
 
 function showVerificationPanel() {
-  methodChoiceEl.hidden = true;
-  zoeIdPanel.hidden = true;
-  dialogEl.hidden = false;
-  verifiedEl.hidden = true;
-  zoeIntroEl.setAttribute('aria-hidden', 'true');
+  setEmergencyAssistAvailable(!pendingZoeIdRegistration);
+  if (pendingZoeIdRegistration) {
+    showCameraHelp('Zoe ID registration requires a face or hand check. In production, mobility/accessibility needs should go through manual review before passkey setup.');
+  }
   zoeVerifyBtn.disabled = true;
-  requestAnimationFrame(() => {
-    cardEl.classList.remove('choice-mode');
-    cardEl.classList.remove('id-mode');
-    cardEl.classList.add('verify-mode');
-    startBtn.focus();
-  });
+  transitionToPanel(dialogEl, 'verify', startBtn);
+}
+
+function showSuccessPanel() {
+  zoeVerifyBtn.disabled = true;
+  transitionToPanel(verifiedEl, 'success', resetBtn);
 }
 
 function showIntroPanel() {
   zoeIdReturnTarget = 'choice';
-  cardEl.classList.remove('choice-mode');
-  cardEl.classList.remove('id-mode');
-  cardEl.classList.remove('verify-mode');
-  zoeIntroEl.removeAttribute('aria-hidden');
+  setEmergencyAssistAvailable(true);
   zoeVerifyBtn.disabled = false;
-  methodChoiceEl.hidden = true;
-  zoeIdPanel.hidden = true;
-  dialogEl.hidden = true;
+  transitionToPanel(zoeIntroEl, null, zoeVerifyBtn);
 }
 
 function continueFromIntro() {
@@ -560,16 +579,23 @@ async function submitCurrentStep() {
 
 async function confirmProtectedAction() {
   try {
+    if (pendingZoeIdRegistration) {
+      const resultEl = pendingZoeIdResultEl || idResultEl;
+      pendingZoeIdRegistration = false;
+      pendingZoeIdResultEl = null;
+      await createFreshPasskey(resultEl);
+      stopDetection();
+      stopCamera();
+      showZoeIdPanel('choice');
+      idResultEl.textContent = 'Zoe ID passkey saved. Next time, choose Use existing Zoe ID.';
+      setAssistButtonsDisabled(false);
+      return;
+    }
+
     await apiJson('/api/protected-action', { verificationToken });
     stopDetection();
     stopCamera();
-    methodChoiceEl.hidden = true;
-    zoeIdPanel.hidden = true;
-    dialogEl.hidden = true;
-    verifiedEl.hidden = false;
-    cardEl.classList.remove('choice-mode');
-    cardEl.classList.remove('id-mode');
-    cardEl.classList.add('verify-mode');
+    showSuccessPanel();
     promptHintEl.textContent = '';
   } catch (err) {
     showError(err.message || 'Server rejected the verification token.');
@@ -789,8 +815,31 @@ function setAssistButtonsDisabled(disabled) {
   });
 }
 
-async function registerPasskey() {
-  const options = await apiJson('/api/passkey/register/options');
+function setEmergencyAssistAvailable(available) {
+  assistBtn.hidden = !available;
+  if (!available) {
+    assistPanel.hidden = true;
+    assistBtn.setAttribute('aria-expanded', 'false');
+    fallbackForm.hidden = true;
+    audioRepeatBtn.hidden = true;
+    activeFallbackChallenge = null;
+    assistResultEl.textContent = '';
+  }
+}
+
+function passkeyUnavailableMessage() {
+  if (!window.PublicKeyCredential) return 'This browser does not support passkeys here.';
+  if (!window.isSecureContext) {
+    return 'Passkeys require a secure origin. Open Zoe from http://localhost, http://127.0.0.1, or HTTPS.';
+  }
+  return '';
+}
+
+async function registerPasskey(registrationVerificationToken) {
+  const unavailable = passkeyUnavailableMessage();
+  if (unavailable) throw new Error(unavailable);
+
+  const options = await apiJson('/api/passkey/register/options', { registrationVerificationToken });
   const credential = await navigator.credentials.create({
     publicKey: {
       challenge: base64urlToBuffer(options.challenge),
@@ -824,6 +873,9 @@ async function registerPasskey() {
 }
 
 async function authenticatePasskey() {
+  const unavailable = passkeyUnavailableMessage();
+  if (unavailable) throw new Error(unavailable);
+
   const options = await apiJson('/api/passkey/auth/options');
   const assertion = await navigator.credentials.get({
     publicKey: {
@@ -848,16 +900,26 @@ async function authenticatePasskey() {
 }
 
 async function createFreshPasskey(resultEl = assistResultEl) {
-  await apiJson('/api/passkey/reset');
+  if (!verificationToken) {
+    pendingZoeIdRegistration = true;
+    pendingZoeIdResultEl = resultEl;
+    resultEl.textContent = 'First complete a face or hand check. Then Zoe will save your passkey.';
+    selectPrimaryMethod(isMobileLayout() ? 'face' : selectedPrimaryMethod);
+    showVerificationPanel();
+    autoStartVerification();
+    return;
+  }
+
   resultEl.textContent = 'Registering Zoe ID on this browser...';
-  await registerPasskey();
-  resultEl.textContent = 'ID passkey saved. Asking it to vouch for you now...';
-  await authenticatePasskey();
+  await registerPasskey(verificationToken);
+  verificationToken = null;
+  resultEl.textContent = 'Zoe ID passkey saved. Next time, choose Use existing Zoe ID.';
 }
 
 async function useZoeId(resultEl = assistResultEl) {
-  if (!window.PublicKeyCredential) {
-    resultEl.textContent = 'This browser does not support passkeys here.';
+  const unavailable = passkeyUnavailableMessage();
+  if (unavailable) {
+    resultEl.textContent = unavailable;
     return;
   }
 
@@ -956,9 +1018,53 @@ fallbackForm.addEventListener('submit', async (event) => {
 });
 
 // Where the user's face should sit, normalized to [0,1] in the displayed
-// (mirrored) overlay: a centered, slightly upper oval.
+// camera frame: a centered, slightly upper oval.
 const FACE_TARGET = { cx: 0.5, cy: 0.46, rx: 0.23, ry: 0.33 };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const FACE_BOX_GRACE_MS = 220;
+const SHOW_FACE_DEBUG_BOX = true;
+let recentFaceBox = null;
+let recentFaceBoxAt = 0;
+
+function sizeCanvasToDisplay(canvas) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const width = Math.max(1, Math.round(rect.width * dpr));
+  const height = Math.max(1, Math.round(rect.height * dpr));
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+  return { width, height, dpr };
+}
+
+function videoToCanvasTransform(canvasWidth, canvasHeight, fit = 'cover') {
+  const videoWidth = Math.max(1, videoEl.videoWidth || 640);
+  const videoHeight = Math.max(1, videoEl.videoHeight || 480);
+  const scale = fit === 'cover'
+    ? Math.max(canvasWidth / videoWidth, canvasHeight / videoHeight)
+    : Math.min(canvasWidth / videoWidth, canvasHeight / videoHeight);
+  const drawWidth = videoWidth * scale;
+  const drawHeight = videoHeight * scale;
+  return {
+    videoWidth,
+    videoHeight,
+    scale,
+    dx: (canvasWidth - drawWidth) / 2,
+    dy: (canvasHeight - drawHeight) / 2,
+    drawWidth,
+    drawHeight,
+  };
+}
+
+function mapVideoBoxToCanvas(box, transform) {
+  return {
+    x: transform.dx + box.x * transform.scale,
+    y: transform.dy + box.y * transform.scale,
+    w: box.w * transform.scale,
+    h: box.h * transform.scale,
+  };
+}
 
 // Pick the cross-browser MediaPipe Tasks Vision engine, falling back to the
 // non-standard FaceDetector only when the MediaPipe runtime cannot load.
@@ -981,16 +1087,19 @@ async function ensureFaceEngine() {
 // A real face box is roughly square and a sensible fraction of the frame. These
 // guards reject false positives (e.g. a shoulder) that the detector occasionally
 // reports with a bounding box that is too small, too large, or too elongated.
-const FACE_MIN_SCORE = 0.6;
-const FACE_MIN_W = 0.08;
+const FACE_MIN_SCORE = 0.5;
+const FACE_MIN_W = 0.06;
 const FACE_MAX_W = 0.85;
 const FACE_MIN_ASPECT = 0.55; // width / height, in pixels
 const FACE_MAX_ASPECT = 1.7;
 // Only accept a face whose center sits inside (a slightly padded) target oval.
-// Horizontal is generous so the move-left/right steps still register; vertical
-// is tight so a shoulder or torso below the oval is rejected.
-const FACE_OVAL_SCALE_X = 1.3;
-const FACE_OVAL_SCALE_Y = 1.05;
+// Horizontal is generous so the move-left/right steps still register. Vertical
+// stays tight: a real face should be in the oval, not down on the shoulder line.
+const FACE_OVAL_SCALE_X = 1.25;
+const FACE_OVAL_SCALE_Y = 0.95;
+const FACE_BOX_SHIFT_X = -1.0;
+const FACE_BOX_SHIFT_Y = -0.55;
+const FACE_BOX_HEIGHT_SCALE = 1.02;
 
 function plausibleFace(candidate, vw, vh) {
   const wNorm = candidate.w / vw;
@@ -1001,45 +1110,44 @@ function plausibleFace(candidate, vw, vh) {
   return true;
 }
 
-// FaceLandmarker always emits a full 478-point mesh wherever its detector fires,
-// even on a shoulder, neck, or background blob. The mesh keeps the canonical face
-// topology, so we validate it against a real upright-face template: the feature
-// rows must be ordered top→bottom and the eye span must be a sane fraction of the
-// face height. A patch of skin (shoulder/neck) fails these proportion checks.
-// Canonical MediaPipe FaceMesh indices: 10 forehead, 152 chin, 1 nose tip,
-// 33 & 263 outer eye corners, 13 & 14 inner lips.
-function validFaceGeometry(landmarks) {
-  const top = landmarks[10];
-  const chin = landmarks[152];
-  const nose = landmarks[1];
-  const eyeL = landmarks[33];
-  const eyeR = landmarks[263];
-  const lipTop = landmarks[13];
-  const lipBot = landmarks[14];
-  if (!top || !chin || !nose || !eyeL || !eyeR || !lipTop || !lipBot) return false;
+function detectionScore(detection) {
+  const category = detection.categories && detection.categories[0];
+  if (typeof category?.score === 'number') return category.score;
+  if (typeof detection.score === 'number') return detection.score;
+  return 0;
+}
 
-  const eyeY = (eyeL.y + eyeR.y) / 2;
-  const mouthY = (lipTop.y + lipBot.y) / 2;
-
-  // Vertical ordering (y grows downward): forehead < eyes < nose < mouth < chin.
-  if (!(top.y < eyeY && eyeY < nose.y && nose.y < mouthY && mouthY < chin.y)) {
-    return false;
+function detectionBox(detection, vw, vh) {
+  const b = detection.boundingBox || detection.bounding_box || {};
+  let x = b.originX ?? b.x ?? b.xMin ?? b.left ?? 0;
+  let y = b.originY ?? b.y ?? b.yMin ?? b.top ?? 0;
+  let w = b.width ?? ((b.xMax ?? b.right ?? 0) - x);
+  let h = b.height ?? ((b.yMax ?? b.bottom ?? 0) - y);
+  // Tasks Vision bounding boxes are pixel-space. This keeps the helper tolerant
+  // if a browser/runtime ever returns normalized values.
+  if (w <= 1 && h <= 1 && x <= 1 && y <= 1) {
+    x *= vw;
+    y *= vh;
+    w *= vw;
+    h *= vh;
   }
+  return { x, y, w, h };
+}
 
-  const faceH = chin.y - top.y;
-  if (faceH <= 0.05) return false; // too short to be a real, close-enough face
-
-  // Eyes must sit in the upper portion of the face.
-  if ((eyeY - top.y) / faceH > 0.65) return false;
-
-  // Eye span vs face height. The lower bound stays generous so a turned head
-  // (during the move-left/right steps, where the eye span foreshortens) still
-  // passes; the upper bound rejects the very squashed boxes a misfire produces.
-  const eyeSpan = Math.abs(eyeR.x - eyeL.x);
-  const ratio = eyeSpan / faceH;
-  if (ratio < 0.15 || ratio > 1.3) return false;
-
-  return true;
+function calibratedFaceBox(box, vw, vh) {
+  // In this camera/model setup Blaze's raw box tracks the face pattern but is
+  // consistently displaced down/right on the displayed frame. Keep all detector
+  // calibration centralized here so drawing and motion checks share one box.
+  const w = box.w;
+  const h = box.h * FACE_BOX_HEIGHT_SCALE;
+  const x = box.x + box.w * FACE_BOX_SHIFT_X;
+  const y = box.y + box.h * FACE_BOX_SHIFT_Y;
+  return {
+    x: Math.min(Math.max(0, x), Math.max(0, vw - w)),
+    y: Math.min(Math.max(0, y), Math.max(0, vh - h)),
+    w,
+    h,
+  };
 }
 
 // True when the box center lies within the target oval. The oval is symmetric
@@ -1050,8 +1158,15 @@ function centerInTargetOval(box) {
   return nx * nx + ny * ny <= 1;
 }
 
+function displayedFaceX(box) {
+  // Single conversion point between detector and display coordinates. The app
+  // deliberately starts unmirrored, so detector x maps directly to display x.
+  return box.cx;
+}
+
 // Returns the best detected face box normalized to [0,1] as { cx, cy, w, h, score }
-// in raw (un-mirrored) camera coordinates, or null when no plausible face is found.
+// in the same video-frame coordinates used by the overlay, or null when no
+// plausible face is found.
 async function detectFaceFrame(engine) {
   const vw = Math.max(1, videoEl.videoWidth || 640);
   const vh = Math.max(1, videoEl.videoHeight || 480);
@@ -1063,29 +1178,16 @@ async function detectFaceFrame(engine) {
     } catch {
       // Ignore transient per-frame errors.
     }
-    const faces = (result && result.faceLandmarks) || [];
-    candidates = faces
-      // Only keep meshes whose landmark geometry actually looks like a face.
-      .filter((landmarks) => validFaceGeometry(landmarks))
-      .map((landmarks) => {
-        let minX = 1;
-        let minY = 1;
-        let maxX = 0;
-        let maxY = 0;
-        for (const p of landmarks) {
-          if (p.x < minX) minX = p.x;
-          if (p.x > maxX) maxX = p.x;
-          if (p.y < minY) minY = p.y;
-          if (p.y > maxY) maxY = p.y;
-        }
-        // Landmarks are normalized [0,1]; convert to the pixel-space the rest of
-        // the pipeline expects.
+    const detections = (result && result.detections) || [];
+    candidates = detections
+      .map((detection) => {
+        const rawBox = detectionBox(detection, vw, vh);
+        const box = calibratedFaceBox(rawBox, vw, vh);
         return {
-          x: minX * vw,
-          y: minY * vh,
-          w: (maxX - minX) * vw,
-          h: (maxY - minY) * vh,
-          score: 1,
+          ...box,
+          score: detectionScore(detection),
+          detection,
+          rawBox,
         };
       });
   } else {
@@ -1107,16 +1209,36 @@ async function detectFaceFrame(engine) {
       cy: (c.y + c.h / 2) / vh,
       w: c.w / vw,
       h: c.h / vh,
-      // Prefer the largest valid face: the real, close-up face beats a small
-      // background/shoulder false positive.
-      score: (c.w / vw) * (c.h / vh),
+      pixelBox: { x: c.x, y: c.y, w: c.w, h: c.h },
+      // Confidence first, then area. This favors real close-up faces while the
+      // oval and size/aspect gates reject obvious non-face regions.
+      score: c.score * (c.w / vw) * (c.h / vh),
     };
+    // Prefer faces whose center is close to the target oval center.
+    // A well-centered real face beats a larger off-center shoulder.
+    const dx = (box.cx - FACE_TARGET.cx) / FACE_TARGET.rx;
+    const dy = (box.cy - FACE_TARGET.cy) / FACE_TARGET.ry;
+    const centerDist = Math.sqrt(dx * dx + dy * dy);
+    box.score *= Math.max(0.3, 1.8 - centerDist);
     // Reject anything whose center is outside the on-screen oval (e.g. a shoulder
     // sitting below the frame's face zone).
     if (!centerInTargetOval(box)) continue;
     if (!best || box.score > best.score) best = box;
   }
   return best;
+}
+
+async function detectStableFaceFrame(engine) {
+  const box = await detectFaceFrame(engine);
+  if (box) {
+    recentFaceBox = box;
+    recentFaceBoxAt = performance.now();
+    return box;
+  }
+  if (recentFaceBox && performance.now() - recentFaceBoxAt <= FACE_BOX_GRACE_MS) {
+    return { ...recentFaceBox, stale: true };
+  }
+  return null;
 }
 
 function drawGuideArrow(direction, color) {
@@ -1139,21 +1261,17 @@ function drawGuideArrow(direction, color) {
   ctx.restore();
 }
 
-// Renders the mirrored camera feed, the target oval, the live face box, an
-// optional directional arrow, and a caption. `box` is in raw camera coords.
+// Renders the camera feed, the target oval, the live face box, and an optional
+// directional arrow. `box` uses the same video-frame coordinates as the overlay.
 function drawFaceGuide(box, opts = {}) {
-  const W = canvasEl.width;
-  const H = canvasEl.height;
+  const { width: W, height: H } = sizeCanvasToDisplay(canvasEl);
+  const transform = videoToCanvasTransform(W, H, 'cover');
   const state = opts.state || 'neutral';
   const color = state === 'good' ? '#36c275' : state === 'move' ? '#ffce4d' : 'rgba(255,255,255,0.85)';
 
   ctx.clearRect(0, 0, W, H);
 
-  ctx.save();
-  ctx.translate(W, 0);
-  ctx.scale(-1, 1);
-  ctx.drawImage(videoEl, 0, 0, W, H);
-  ctx.restore();
+  ctx.drawImage(videoEl, transform.dx, transform.dy, transform.drawWidth, transform.drawHeight);
 
   // Spotlight: dim everything except the face-center oval. The even-odd fill
   // paints the region outside the ellipse, leaving the oval interior bright.
@@ -1175,16 +1293,13 @@ function drawFaceGuide(box, opts = {}) {
   ctx.stroke();
   ctx.restore();
 
-  // Live face box, mirrored to match the displayed feed.
-  if (box) {
-    const w = box.w * W;
-    const h = box.h * H;
-    const dcx = (1 - box.cx) * W;
-    const dcy = box.cy * H;
+  // Live face box in the same unmirrored coordinate space as the camera frame.
+  if (SHOW_FACE_DEBUG_BOX && box) {
+    const mappedBox = mapVideoBoxToCanvas(box.pixelBox, transform);
     ctx.save();
     ctx.strokeStyle = 'rgba(91,140,255,0.9)';
     ctx.lineWidth = 2;
-    ctx.strokeRect(dcx - w / 2, dcy - h / 2, w, h);
+    ctx.strokeRect(mappedBox.x, mappedBox.y, mappedBox.w, mappedBox.h);
     ctx.restore();
   }
 
@@ -1199,11 +1314,13 @@ async function runFaceMotionPhase(engine, centers, sizes, opts) {
   promptHintEl.textContent = opts.hint;
   let hits = 0;
   while (faceChecking && performance.now() < opts.deadline) {
-    const box = await detectFaceFrame(engine);
+    const box = await detectStableFaceFrame(engine);
     if (box) {
-      centers.push(box.cx);
-      sizes.push(box.w);
-      const displayed = 1 - box.cx;
+      if (!box.stale) {
+        centers.push(box.cx);
+        sizes.push(box.w);
+      }
+      const displayed = displayedFaceX(box);
       promptHintEl.textContent = opts.hint;
       drawFaceGuide(box, { state: 'move', arrow: opts.arrow });
       if (opts.reached(displayed)) {
@@ -1233,11 +1350,13 @@ async function runGuidedFaceCheck() {
   const sizes = [];
   const startedAt = performance.now();
   const deadline = startedAt + 30000;
+  recentFaceBox = null;
+  recentFaceBoxAt = 0;
 
   try {
     const inTarget = (box) => {
       if (!box) return false;
-      const dx = Math.abs((1 - box.cx) - FACE_TARGET.cx);
+      const dx = Math.abs(displayedFaceX(box) - FACE_TARGET.cx);
       const dy = Math.abs(box.cy - FACE_TARGET.cy);
       const sizeOk = box.w > 0.12 && box.w < 0.7;
       return dx < 0.13 && dy < 0.16 && sizeOk;
@@ -1249,8 +1368,8 @@ async function runGuidedFaceCheck() {
     promptHintEl.textContent = 'Fit your face inside the oval and hold still.';
     let centeredFrames = 0;
     while (faceChecking && performance.now() < deadline) {
-      const box = await detectFaceFrame(engine);
-      if (box) {
+      const box = await detectStableFaceFrame(engine);
+      if (box && !box.stale) {
         centers.push(box.cx);
         sizes.push(box.w);
       }
@@ -1269,26 +1388,35 @@ async function runGuidedFaceCheck() {
       }
       await sleep(55);
     }
+    if (centeredFrames < 6) {
+      throw new Error('Face was not centered in the oval. Center your face and try again.');
+    }
     progressEl.style.width = '33%';
 
     // Phase 2: move left (on-screen face crosses to the left zone).
-    await runFaceMotionPhase(engine, centers, sizes, {
+    const movedLeft = await runFaceMotionPhase(engine, centers, sizes, {
       label: 'Move left',
       hint: 'Slowly move your head to the left.',
       arrow: 'left',
       deadline,
       reached: (displayed) => displayed <= FACE_TARGET.cx - 0.13,
     });
+    if (!movedLeft) {
+      throw new Error('Face motion timed out. Move your head left when prompted, then try again.');
+    }
     progressEl.style.width = '66%';
 
     // Phase 3: move right (on-screen face crosses to the right zone).
-    await runFaceMotionPhase(engine, centers, sizes, {
+    const movedRight = await runFaceMotionPhase(engine, centers, sizes, {
       label: 'Move right',
       hint: 'Now slowly move your head to the right.',
       arrow: 'right',
       deadline,
       reached: (displayed) => displayed >= FACE_TARGET.cx + 0.13,
     });
+    if (!movedRight) {
+      throw new Error('Face motion timed out. Move your head right when prompted, then try again.');
+    }
     progressEl.style.width = '100%';
 
     if (!faceChecking) return;
@@ -1314,6 +1442,8 @@ async function runGuidedFaceCheck() {
     await confirmProtectedAction();
   } finally {
     faceChecking = false;
+    recentFaceBox = null;
+    recentFaceBoxAt = 0;
   }
 }
 
@@ -1339,7 +1469,6 @@ resetBtn.addEventListener('click', () => {
   choiceResultEl.textContent = '';
   idResultEl.textContent = '';
 
-  verifiedEl.hidden = true;
   showIntroPanel();
 
   setStartButton('Start check', false);
@@ -1359,14 +1488,16 @@ choiceHandBtn.addEventListener('click', () => choosePrimaryMethod('hand'));
 choiceIdBtn.addEventListener('click', () => showZoeIdPanel('choice'));
 idUseBtn.addEventListener('click', () => useZoeId(idResultEl));
 idRegisterBtn.addEventListener('click', async () => {
-  if (!window.PublicKeyCredential) {
-    idResultEl.textContent = 'This browser does not support passkeys here.';
+  const unavailable = passkeyUnavailableMessage();
+  if (unavailable) {
+    idResultEl.textContent = unavailable;
     return;
   }
 
   setAssistButtonsDisabled(true);
   try {
     await createFreshPasskey(idResultEl);
+    if (!pendingZoeIdRegistration) setAssistButtonsDisabled(false);
   } catch (err) {
     idResultEl.textContent = err.message || 'Could not register Zoe ID.';
     setAssistButtonsDisabled(false);

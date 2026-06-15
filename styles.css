@@ -13,6 +13,8 @@
   --danger: #c73645;
   --danger-soft: #fff0f2;
   --shadow: 0 26px 80px rgba(31, 28, 91, 0.24);
+  --screen-ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --screen-duration: 420ms;
 }
 
 * { box-sizing: border-box; }
@@ -25,7 +27,9 @@ body {
 }
 
 body {
-  background: linear-gradient(135deg, #302f2f, #070075);
+  background:
+    radial-gradient(circle at 82% 18%, rgba(7, 0, 117, 0.42), transparent 36%),
+    linear-gradient(135deg, #302f2f 0%, #171616 52%, #070075 100%);
   background-attachment: fixed;
   color: var(--ink);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -45,6 +49,7 @@ body {
   background: var(--phone);
   border-radius: 34px;
   box-shadow: var(--shadow);
+  overflow: hidden;
   padding: 28px;
 }
 
@@ -56,25 +61,27 @@ body {
 }
 
 .intro-card {
+  position: relative;
   max-height: 900px;
   opacity: 1;
   transform: translateY(0) scale(1);
   transition:
-    max-height 0.46s ease,
-    opacity 0.28s ease,
-    padding 0.34s ease,
-    transform 0.34s ease;
+    max-height var(--screen-duration) var(--screen-ease),
+    opacity 280ms ease,
+    padding var(--screen-duration) var(--screen-ease),
+    transform var(--screen-duration) var(--screen-ease);
 }
 
 .captcha-card.choice-mode .intro-card,
 .captcha-card.id-mode .intro-card,
-.captcha-card.verify-mode .intro-card {
+.captcha-card.verify-mode .intro-card,
+.captcha-card.success-mode .intro-card {
   max-height: 0;
   opacity: 0;
   padding-top: 0;
   padding-bottom: 0;
   pointer-events: none;
-  transform: translateY(-12px) scale(0.985);
+  transform: translateY(-14px) scale(0.985);
 }
 
 .zoe-icon {
@@ -204,22 +211,42 @@ h1 {
 }
 
 .choice-panel,
-.id-panel {
+.id-panel,
+.verification-panel,
+.verified {
+  position: relative;
   display: block;
   max-height: 0;
   opacity: 0;
   overflow: hidden;
   padding-top: 0;
-  transform: translateY(18px);
+  pointer-events: none;
+  transform: translateY(14px) scale(0.985);
   transition:
-    max-height 0.42s ease,
-    opacity 0.3s ease 0.08s,
-    padding-top 0.28s ease,
-    transform 0.36s ease 0.05s;
+    max-height var(--screen-duration) var(--screen-ease),
+    opacity 280ms ease,
+    padding-top var(--screen-duration) var(--screen-ease),
+    padding-bottom var(--screen-duration) var(--screen-ease),
+    margin-top var(--screen-duration) var(--screen-ease),
+    transform var(--screen-duration) var(--screen-ease);
+}
+
+.intro-card.panel-exiting,
+.choice-panel.panel-exiting,
+.id-panel.panel-exiting,
+.verification-panel.panel-exiting,
+.verified.panel-exiting {
+  position: absolute;
+  top: 28px;
+  left: 28px;
+  right: 28px;
+  z-index: 3;
 }
 
 .choice-panel[hidden],
-.id-panel[hidden] {
+.id-panel[hidden],
+.verification-panel[hidden],
+.verified[hidden] {
   display: none;
 }
 
@@ -228,7 +255,8 @@ h1 {
   max-height: 720px;
   opacity: 1;
   padding-top: 18px;
-  transform: translateY(0);
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
 }
 
 .choice-head {
@@ -264,6 +292,17 @@ h1 {
   margin: 0 0 16px;
   color: var(--muted);
   font-size: 15px;
+  line-height: 1.35;
+}
+
+.id-accessibility-note {
+  margin: -4px 0 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 13.5px;
   line-height: 1.35;
 }
 
@@ -320,27 +359,22 @@ h1 {
   font-weight: 900;
 }
 
-.verification-panel {
-  display: block;
-  max-height: 0;
-  opacity: 0;
-  overflow: hidden;
-  padding-top: 0;
-  transform: translateY(18px);
-  transition:
-    max-height 0.52s ease,
-    opacity 0.34s ease 0.10s,
-    padding-top 0.34s ease,
-    transform 0.42s ease 0.06s;
-}
-
-.verification-panel[hidden] { display: none; }
-
 .captcha-card.verify-mode .verification-panel {
   max-height: 1700px;
   opacity: 1;
   padding-top: 18px;
-  transform: translateY(0);
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
+}
+
+.captcha-card.success-mode .verified {
+  max-height: 180px;
+  opacity: 1;
+  margin-top: 18px;
+  padding-top: 18px;
+  padding-bottom: 18px;
+  pointer-events: auto;
+  transform: translateY(0) scale(1);
 }
 
 .verification-head {
@@ -512,11 +546,6 @@ h2 {
   object-fit: cover;
 }
 
-/* The raw camera feed is mirrored for a natural selfie view. The overlay canvas
-   is NOT CSS-mirrored: it does its own mirroring while drawing, so captions and
-   arrows stay readable and right-way-round. */
-#video { transform: scaleX(-1); }
-
 #overlay { pointer-events: none; }
 
 .status {
@@ -687,18 +716,15 @@ button.secondary.danger {
 }
 
 .verified {
-  margin-top: 18px;
+  margin-top: 0;
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 18px;
+  padding: 0 18px;
   background: #e9f8ef;
   border: 1px solid #bfe6cd;
   border-radius: 24px;
-  animation: pop 0.28s ease;
 }
-
-.verified[hidden] { display: none; }
 
 .verified-icon {
   width: 44px;
@@ -741,6 +767,16 @@ footer {
     width: 100%;
     border-radius: 28px;
     padding: 14px;
+  }
+
+  .intro-card.panel-exiting,
+  .choice-panel.panel-exiting,
+  .id-panel.panel-exiting,
+  .verification-panel.panel-exiting,
+  .verified.panel-exiting {
+    top: 14px;
+    left: 14px;
+    right: 14px;
   }
 
   .zoe-hero {
@@ -798,7 +834,3 @@ footer {
   }
 }
 
-@keyframes pop {
-  0% { transform: scale(0.98); opacity: 0; }
-  100% { transform: scale(1); opacity: 1; }
-}

@@ -108,12 +108,28 @@ async function main() {
     assert.strictEqual(emergencyAudioVerified.res.status, 200);
     assert.ok(emergencyAudioVerified.body.verificationToken);
 
+    const unverifiedRegisterOptions = await request(baseUrl, '/api/passkey/register/options', { method: 'POST' }, cookie);
+    assert.strictEqual(unverifiedRegisterOptions.res.status, 401);
+
+    const emergencyRegisterOptions = await request(baseUrl, '/api/passkey/register/options', {
+      method: 'POST',
+      body: JSON.stringify({ registrationVerificationToken: emergencyAudioVerified.body.verificationToken }),
+    }, emergencyAudioFallback.cookie);
+    assert.strictEqual(emergencyRegisterOptions.res.status, 403);
+
     const livenessVerified = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
       body: JSON.stringify({ durationMs: 1200, faceFrames: 10, motionScore: 0.12 }),
     }, cookie);
     assert.strictEqual(livenessVerified.res.status, 200);
     assert.ok(livenessVerified.body.verificationToken);
+
+    const verifiedRegisterOptions = await request(baseUrl, '/api/passkey/register/options', {
+      method: 'POST',
+      body: JSON.stringify({ registrationVerificationToken: livenessVerified.body.verificationToken }),
+    }, cookie);
+    assert.strictEqual(verifiedRegisterOptions.res.status, 200);
+    assert.ok(verifiedRegisterOptions.body.challenge);
 
     const noPasskey = await request(baseUrl, '/api/passkey/auth/options', { method: 'POST' }, cookie);
     assert.strictEqual(noPasskey.res.status, 409);
