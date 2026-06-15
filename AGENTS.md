@@ -50,6 +50,7 @@ The intended UX is:
 4. Mobile: user presses `Verify now`, then Zoe defaults directly to face verification.
 5. Mobile verification also shows a `Use Zoe ID` button, which opens the Zoe ID intermediate page.
 6. Once a user has chosen face or hands, the verification page should not show another face/hand switcher.
+7. Choosing face or hands auto-starts that check (camera + flow begin immediately via `autoStartVerification`/`beginVerification` in `app.js`); the `Start check` button remains as a manual retry after an error. Returning from the Zoe ID page does not auto-start.
 
 Do not reintroduce a fake phone frame. The design is inspired by the card inside a Persona Relay-style flow, not by rendering a whole phone mockup.
 
@@ -57,7 +58,9 @@ Do not reintroduce a fake phone frame. The design is inspired by the card inside
 
 ### Face Motion
 
-Face motion is the default on mobile. It uses the browser `FaceDetector` API when available. It is a liveness-style motion check, not identity verification.
+Face motion is the default on mobile. It runs cross-browser using MediaPipe Tasks Vision (`@mediapipe/tasks-vision`), imported dynamically in `app.js`. The WASM runtime loads from `cdn.jsdelivr.net`, and the Face Landmarker model is vendored locally at `models/face_landmarker.task` and served from the same origin. The Face Landmarker (478-point face mesh) is used instead of a plain bounding-box detector because the mesh only fits real facial geometry, which avoids false positives such as detecting a shoulder as a face. The face box used by the guided flow is derived from the min/max of the mesh landmarks. (`models/blaze_face_short_range.tflite` remains vendored for reference but the landmarker is the active model.) This combination works in Chrome, Safari, and Firefox under the strict Content-Security-Policy (which allows only `wasm-unsafe-eval`, not `unsafe-eval`). The older `@mediapipe/face_detection` Solutions build is intentionally avoided because it evaluates strings as JavaScript and would require loosening the CSP. The browser's non-standard `FaceDetector` API is used only as an opportunistic fallback when the MediaPipe runtime cannot load. It is a liveness-style motion check, not identity verification.
+
+The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval on the overlay canvas, then walks the user through center → move left → move right with changing prompt text and a directional arrow. This horizontal sweep produces the motion the server requires. The interactive loop runs outside the start button's init timeout (only camera + model load are time-boxed). Mirroring rule: the overlay canvas mirrors the feed itself while drawing (so captions/arrows stay readable), therefore `#overlay` must NOT have a CSS `transform: scaleX(-1)` — only `#video` is CSS-mirrored. Do not re-add a CSS flip to `#overlay`.
 
 ### Hand Gestures
 

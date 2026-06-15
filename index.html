@@ -47,6 +47,14 @@
       </div>
 
       <div class="choice-grid">
+        <button id="choice-id-btn" class="choice-card" type="button">
+          <span class="choice-icon">⌘</span>
+          <span>
+            <strong>Zoe ID</strong>
+            <small>Use your Zoe ID passkey.</small>
+          </span>
+        </button>
+        <div class="choice-or"><span>or</span></div>
         <button id="choice-face-btn" class="choice-card" type="button">
           <span class="choice-icon">🙂</span>
           <span>
@@ -59,13 +67,6 @@
           <span>
             <strong>Hand gestures</strong>
             <small>Use if face motion is not available.</small>
-          </span>
-        </button>
-        <button id="choice-id-btn" class="choice-card" type="button">
-          <span class="choice-icon">⌘</span>
-          <span>
-            <strong>Zoe ID</strong>
-            <small>Use an approved passkey.</small>
           </span>
         </button>
       </div>
@@ -116,31 +117,21 @@
         </button>
       </section>
 
-      <section class="difficulty">
-        <span class="difficulty-badge" id="method-label">Gesture check</span>
-        <span class="difficulty-hint" id="method-hint">3 quick steps</span>
-      </section>
-
       <section class="stage">
-        <div class="prompt">
-          <div class="prompt-kicker">Current step</div>
-          <div class="prompt-gesture" id="prompt-gesture">—</div>
-          <div class="prompt-name" id="prompt-name" aria-live="polite">Click "Start" to begin</div>
-          <div class="prompt-hint" id="prompt-hint" aria-live="polite"></div>
-          <div class="progress">
-            <div class="progress-bar" id="progress-bar"></div>
-          </div>
-          <div class="checks">
-            <div class="check" data-step="0"><span class="num">1</span><span class="label">—</span></div>
-            <div class="check" data-step="1"><span class="num">2</span><span class="label">—</span></div>
-            <div class="check" data-step="2"><span class="num">3</span><span class="label">—</span></div>
-          </div>
-        </div>
-
         <div class="video-wrap">
           <video id="video" autoplay playsinline muted></video>
           <canvas id="overlay"></canvas>
           <div id="status-pill" class="status idle">Idle</div>
+          <div class="stream-prompt" id="stream-prompt">
+            <span class="stream-prompt-emoji" id="prompt-gesture">—</span>
+            <span class="stream-prompt-text">
+              <span class="stream-prompt-name" id="prompt-name" aria-live="polite">Click "Start" to begin</span>
+              <span class="stream-prompt-hint" id="prompt-hint" aria-live="polite"></span>
+            </span>
+          </div>
+          <div class="progress" id="stream-progress">
+            <div class="progress-bar" id="progress-bar"></div>
+          </div>
         </div>
       </section>
 
@@ -151,7 +142,7 @@
 
       <section id="camera-help" class="camera-help" hidden aria-live="polite">
         <strong>Camera having a moment?</strong>
-        <span id="camera-help-text">Try brighter light, move your hand fully into frame, or hold still for a beat.</span>
+        <span id="camera-help-text">Try a brighter light, move your hand fully into frame, or hold still for a sec.</span>
       </section>
 
       <section id="assist-panel" class="assist-panel" hidden>
@@ -169,7 +160,7 @@
           <label for="fallback-answer" id="fallback-label">Answer</label>
           <div class="fallback-row">
             <input id="fallback-answer" autocomplete="one-time-code" />
-            <button id="audio-repeat-btn" class="secondary" type="button" hidden>Repeat audio</button>
+            <button id="audio-repeat-btn" class="secondary" type="button" hidden>Repeat challenge</button>
             <button id="fallback-submit-btn" class="secondary" type="submit">Check</button>
           </div>
         </form>
@@ -181,8 +172,8 @@
     <section id="verified" class="verified" hidden>
       <div class="verified-icon">✓</div>
       <div class="verified-text">
-        <strong>Nice. Real person confirmed.</strong>
-        <span>Welcome to the other side.</span>
+        <strong>You have been verified as a real person!</strong>
+        <span>Getting you back to where you were...</span>
       </div>
       <button id="reset-btn" class="ghost">Reset</button>
     </section>

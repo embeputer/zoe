@@ -8,6 +8,10 @@ const FRAME_SAMPLE_MS = 33;
 
 let stream = null;
 let handsModel = null;
+let faceModel = null;
+let legacyFaceDetector = null;
+let faceChecking = false;
+let verificationStarting = false;
 let rafId = null;
 let detecting = false;
 let submittingStep = false;
@@ -42,8 +46,6 @@ const promptHintEl = $('prompt-hint');
 const progressEl = $('progress-bar');
 const methodHandBtn = $('method-hand-btn');
 const methodFaceBtn = $('method-face-btn');
-const methodLabelEl = $('method-label');
-const methodHintEl = $('method-hint');
 const verificationTitleEl = $('verification-title');
 const startBtn = $('start-btn');
 const resetBtn = $('reset-btn');
@@ -202,6 +204,33 @@ async function initMediaPipe() {
   handsModel.onResults(onResults);
 }
 
+// MediaPipe Tasks Vision: cross-browser face detection that runs under a strict
+// CSP (only needs 'wasm-unsafe-eval'). The WASM runtime loads from the CDN; the
+// model is vendored locally so no extra connect-src origin is required.
+const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
+const TASKS_VISION_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
+const FACE_MODEL_URL = '/models/face_landmarker.task';
+
+// Use the Face Landmarker (478-point face mesh). Unlike a plain bounding-box
+// detector, it only locks onto real facial geometry, so it won't mistake a
+// shoulder or torso for a face.
+async function initFaceDetection() {
+  const vision = await import(TASKS_VISION_URL);
+  const fileset = await vision.FilesetResolver.forVisionTasks(TASKS_VISION_WASM);
+  faceModel = await vision.FaceLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath: FACE_MODEL_URL },
+    runningMode: 'VIDEO',
+    // Detect several candidates so we can keep the real face and discard the
+    // shoulder/neck/background mesh the detector sometimes also reports. The
+    // geometry validation in detectFaceFrame filters the junk, so a permissive
+    // detector threshold here just maximizes the chance the real face is found.
+    numFaces: 5,
+    minFaceDetectionConfidence: 0.4,
+    minFacePresenceConfidence: 0.4,
+    minTrackingConfidence: 0.4,
+  });
+}
+
 async function startCamera() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     throw new Error('Camera API not available in this browser. Use Chrome/Safari/Firefox on https or localhost.');
@@ -271,6 +300,10 @@ function setStatus(text, cls) {
 function setStartButton(label, disabled) {
   startBtn.disabled = !!disabled;
   startBtn.textContent = label;
+  // While a check is running/initializing the button is just a redundant disabled
+  // label (the status pill already shows progress), so hide it. It returns as the
+  // "Start check" retry button once it's actionable again.
+  startBtn.hidden = !!disabled;
 }
 
 function showError(msg) {
@@ -359,6 +392,7 @@ function continueFromIntro() {
   if (isMobileLayout()) {
     selectPrimaryMethod('face');
     showVerificationPanel();
+    autoStartVerification();
     return;
   }
 
@@ -368,6 +402,7 @@ function continueFromIntro() {
 function choosePrimaryMethod(method) {
   selectPrimaryMethod(method);
   showVerificationPanel();
+  autoStartVerification();
 }
 
 function leaveZoeIdPanel() {
@@ -411,8 +446,6 @@ function selectPrimaryMethod(method) {
   methodHandBtn.setAttribute('aria-pressed', String(!isFace));
   methodFaceBtn.setAttribute('aria-pressed', String(isFace));
 
-  methodLabelEl.textContent = isFace ? 'Face motion' : 'Gesture check';
-  methodHintEl.textContent = isFace ? '1 quick step' : '3 quick steps';
   verificationTitleEl.textContent = isFace ? 'Face verification' : 'Hand verification';
   promptEmojiEl.textContent = isFace ? '🙂' : '-';
   promptNameEl.textContent = isFace ? 'Move gently left and right' : 'Click "Start" to begin';
@@ -692,13 +725,24 @@ async function startFaceVerificationFlow() {
   }
   stopDetection();
   promptEmojiEl.textContent = '🙂';
-  promptNameEl.textContent = 'Face motion';
-  promptHintEl.textContent = 'Move your face gently left, then right.';
+  promptNameEl.textContent = 'Get ready';
+  promptHintEl.textContent = 'Loading the face check…';
   setStatus('Starting camera...', 'listening');
-  await runFaceMotionCheck({ primary: true });
+
+  // Setup (camera + model load) is the part that can hang, so it stays under the
+  // caller's init timeout. The interactive guided check then runs on its own.
+  if (!stream) await startCamera();
+  await ensureFaceEngine();
+
+  runGuidedFaceCheck().catch((err) => {
+    console.error(err);
+    showError(err.message || 'Face check failed. Try again.');
+  });
 }
 
-startBtn.addEventListener('click', async () => {
+async function beginVerification() {
+  if (verificationStarting || detecting || faceChecking) return;
+  verificationStarting = true;
   setStartButton('Starting camera...', true);
   setStatus('Initializing...', 'listening');
 
@@ -715,8 +759,19 @@ startBtn.addEventListener('click', async () => {
   } catch (err) {
     console.error(err);
     showError(err.message || 'Could not start verification.');
+  } finally {
+    verificationStarting = false;
   }
-});
+}
+
+// Auto-start once the verification stage is on screen. Called synchronously
+// within the user gesture so camera permission prompts keep their activation.
+function autoStartVerification() {
+  if (dialogEl.hidden) return;
+  beginVerification();
+}
+
+startBtn.addEventListener('click', beginVerification);
 
 assistBtn.addEventListener('click', () => {
   const expanded = assistPanel.hidden;
@@ -724,7 +779,7 @@ assistBtn.addEventListener('click', () => {
   assistBtn.setAttribute('aria-expanded', String(expanded));
   if (expanded) {
     assistResultEl.textContent = '';
-    showCameraHelp('You can keep trying the camera check, or choose a different check below.');
+    showCameraHelp('You can keep trying the camera check, or use the emergency check below.');
   }
 });
 
@@ -900,41 +955,370 @@ fallbackForm.addEventListener('submit', async (event) => {
   }
 });
 
-async function runFaceMotionCheck(options = {}) {
-  if (!('FaceDetector' in window)) {
-    throw new Error('Face motion check is not available in this browser. Try Zoe ID or emergency text/audio.');
+// Where the user's face should sit, normalized to [0,1] in the displayed
+// (mirrored) overlay: a centered, slightly upper oval.
+const FACE_TARGET = { cx: 0.5, cy: 0.46, rx: 0.23, ry: 0.33 };
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Pick the cross-browser MediaPipe Tasks Vision engine, falling back to the
+// non-standard FaceDetector only when the MediaPipe runtime cannot load.
+async function ensureFaceEngine() {
+  if (faceModel) return 'mediapipe';
+  if (legacyFaceDetector) return 'legacy';
+  try {
+    await initFaceDetection();
+    return 'mediapipe';
+  } catch (err) {
+    console.error('MediaPipe face detector failed to load:', err);
+    if ('FaceDetector' in window) {
+      legacyFaceDetector = new FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
+      return 'legacy';
+    }
+    throw new Error('Face check could not start. Reload, or try Zoe ID or emergency text/audio.');
+  }
+}
+
+// A real face box is roughly square and a sensible fraction of the frame. These
+// guards reject false positives (e.g. a shoulder) that the detector occasionally
+// reports with a bounding box that is too small, too large, or too elongated.
+const FACE_MIN_SCORE = 0.6;
+const FACE_MIN_W = 0.08;
+const FACE_MAX_W = 0.85;
+const FACE_MIN_ASPECT = 0.55; // width / height, in pixels
+const FACE_MAX_ASPECT = 1.7;
+// Only accept a face whose center sits inside (a slightly padded) target oval.
+// Horizontal is generous so the move-left/right steps still register; vertical
+// is tight so a shoulder or torso below the oval is rejected.
+const FACE_OVAL_SCALE_X = 1.3;
+const FACE_OVAL_SCALE_Y = 1.05;
+
+function plausibleFace(candidate, vw, vh) {
+  const wNorm = candidate.w / vw;
+  const aspect = candidate.w / Math.max(1, candidate.h);
+  if (candidate.score < FACE_MIN_SCORE) return false;
+  if (wNorm < FACE_MIN_W || wNorm > FACE_MAX_W) return false;
+  if (aspect < FACE_MIN_ASPECT || aspect > FACE_MAX_ASPECT) return false;
+  return true;
+}
+
+// FaceLandmarker always emits a full 478-point mesh wherever its detector fires,
+// even on a shoulder, neck, or background blob. The mesh keeps the canonical face
+// topology, so we validate it against a real upright-face template: the feature
+// rows must be ordered top→bottom and the eye span must be a sane fraction of the
+// face height. A patch of skin (shoulder/neck) fails these proportion checks.
+// Canonical MediaPipe FaceMesh indices: 10 forehead, 152 chin, 1 nose tip,
+// 33 & 263 outer eye corners, 13 & 14 inner lips.
+function validFaceGeometry(landmarks) {
+  const top = landmarks[10];
+  const chin = landmarks[152];
+  const nose = landmarks[1];
+  const eyeL = landmarks[33];
+  const eyeR = landmarks[263];
+  const lipTop = landmarks[13];
+  const lipBot = landmarks[14];
+  if (!top || !chin || !nose || !eyeL || !eyeR || !lipTop || !lipBot) return false;
+
+  const eyeY = (eyeL.y + eyeR.y) / 2;
+  const mouthY = (lipTop.y + lipBot.y) / 2;
+
+  // Vertical ordering (y grows downward): forehead < eyes < nose < mouth < chin.
+  if (!(top.y < eyeY && eyeY < nose.y && nose.y < mouthY && mouthY < chin.y)) {
+    return false;
   }
 
-  if (!stream) await startCamera();
-  const detector = new FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
-  const startedAt = performance.now();
+  const faceH = chin.y - top.y;
+  if (faceH <= 0.05) return false; // too short to be a real, close-enough face
+
+  // Eyes must sit in the upper portion of the face.
+  if ((eyeY - top.y) / faceH > 0.65) return false;
+
+  // Eye span vs face height. The lower bound stays generous so a turned head
+  // (during the move-left/right steps, where the eye span foreshortens) still
+  // passes; the upper bound rejects the very squashed boxes a misfire produces.
+  const eyeSpan = Math.abs(eyeR.x - eyeL.x);
+  const ratio = eyeSpan / faceH;
+  if (ratio < 0.15 || ratio > 1.3) return false;
+
+  return true;
+}
+
+// True when the box center lies within the target oval. The oval is symmetric
+// about cx=0.5, so the same distance test works in raw and displayed coords.
+function centerInTargetOval(box) {
+  const nx = (box.cx - FACE_TARGET.cx) / (FACE_TARGET.rx * FACE_OVAL_SCALE_X);
+  const ny = (box.cy - FACE_TARGET.cy) / (FACE_TARGET.ry * FACE_OVAL_SCALE_Y);
+  return nx * nx + ny * ny <= 1;
+}
+
+// Returns the best detected face box normalized to [0,1] as { cx, cy, w, h, score }
+// in raw (un-mirrored) camera coordinates, or null when no plausible face is found.
+async function detectFaceFrame(engine) {
+  const vw = Math.max(1, videoEl.videoWidth || 640);
+  const vh = Math.max(1, videoEl.videoHeight || 480);
+  let candidates = [];
+  if (engine === 'mediapipe') {
+    let result = null;
+    try {
+      result = faceModel.detectForVideo(videoEl, performance.now());
+    } catch {
+      // Ignore transient per-frame errors.
+    }
+    const faces = (result && result.faceLandmarks) || [];
+    candidates = faces
+      // Only keep meshes whose landmark geometry actually looks like a face.
+      .filter((landmarks) => validFaceGeometry(landmarks))
+      .map((landmarks) => {
+        let minX = 1;
+        let minY = 1;
+        let maxX = 0;
+        let maxY = 0;
+        for (const p of landmarks) {
+          if (p.x < minX) minX = p.x;
+          if (p.x > maxX) maxX = p.x;
+          if (p.y < minY) minY = p.y;
+          if (p.y > maxY) maxY = p.y;
+        }
+        // Landmarks are normalized [0,1]; convert to the pixel-space the rest of
+        // the pipeline expects.
+        return {
+          x: minX * vw,
+          y: minY * vh,
+          w: (maxX - minX) * vw,
+          h: (maxY - minY) * vh,
+          score: 1,
+        };
+      });
+  } else {
+    const faces = await legacyFaceDetector.detect(videoEl).catch(() => []);
+    candidates = faces.map((f) => ({
+      x: f.boundingBox.x,
+      y: f.boundingBox.y,
+      w: f.boundingBox.width,
+      h: f.boundingBox.height,
+      score: 1,
+    }));
+  }
+
+  let best = null;
+  for (const c of candidates) {
+    if (!plausibleFace(c, vw, vh)) continue;
+    const box = {
+      cx: (c.x + c.w / 2) / vw,
+      cy: (c.y + c.h / 2) / vh,
+      w: c.w / vw,
+      h: c.h / vh,
+      // Prefer the largest valid face: the real, close-up face beats a small
+      // background/shoulder false positive.
+      score: (c.w / vw) * (c.h / vh),
+    };
+    // Reject anything whose center is outside the on-screen oval (e.g. a shoulder
+    // sitting below the frame's face zone).
+    if (!centerInTargetOval(box)) continue;
+    if (!best || box.score > best.score) best = box;
+  }
+  return best;
+}
+
+function drawGuideArrow(direction, color) {
+  const W = canvasEl.width;
+  const H = canvasEl.height;
+  const cy = FACE_TARGET.cy * H;
+  const size = Math.min(W, H) * 0.08;
+  const x = direction === 'left' ? W * 0.1 : W * 0.9;
+  const dir = direction === 'left' ? -1 : 1;
+  ctx.save();
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 7;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x + dir * size * 0.5, cy - size);
+  ctx.lineTo(x - dir * size * 0.5, cy);
+  ctx.lineTo(x + dir * size * 0.5, cy + size);
+  ctx.stroke();
+  ctx.restore();
+}
+
+// Renders the mirrored camera feed, the target oval, the live face box, an
+// optional directional arrow, and a caption. `box` is in raw camera coords.
+function drawFaceGuide(box, opts = {}) {
+  const W = canvasEl.width;
+  const H = canvasEl.height;
+  const state = opts.state || 'neutral';
+  const color = state === 'good' ? '#36c275' : state === 'move' ? '#ffce4d' : 'rgba(255,255,255,0.85)';
+
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.translate(W, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(videoEl, 0, 0, W, H);
+  ctx.restore();
+
+  // Spotlight: dim everything except the face-center oval. The even-odd fill
+  // paints the region outside the ellipse, leaving the oval interior bright.
+  ctx.save();
+  ctx.fillStyle = 'rgba(8,10,18,0.6)';
+  ctx.beginPath();
+  ctx.rect(0, 0, W, H);
+  ctx.ellipse(FACE_TARGET.cx * W, FACE_TARGET.cy * H, FACE_TARGET.rx * W, FACE_TARGET.ry * H, 0, 0, Math.PI * 2);
+  ctx.fill('evenodd');
+  ctx.restore();
+
+  // Target oval where the face should sit.
+  ctx.save();
+  ctx.lineWidth = 4;
+  ctx.setLineDash([14, 10]);
+  ctx.strokeStyle = color;
+  ctx.beginPath();
+  ctx.ellipse(FACE_TARGET.cx * W, FACE_TARGET.cy * H, FACE_TARGET.rx * W, FACE_TARGET.ry * H, 0, 0, Math.PI * 2);
+  ctx.stroke();
+  ctx.restore();
+
+  // Live face box, mirrored to match the displayed feed.
+  if (box) {
+    const w = box.w * W;
+    const h = box.h * H;
+    const dcx = (1 - box.cx) * W;
+    const dcy = box.cy * H;
+    ctx.save();
+    ctx.strokeStyle = 'rgba(91,140,255,0.9)';
+    ctx.lineWidth = 2;
+    ctx.strokeRect(dcx - w / 2, dcy - h / 2, w, h);
+    ctx.restore();
+  }
+
+  if (opts.arrow === 'left' || opts.arrow === 'right') drawGuideArrow(opts.arrow, color);
+}
+
+// One guided motion phase: prompt the user and wait until the on-screen face
+// crosses the target side. Records every sampled face position into centers/sizes.
+async function runFaceMotionPhase(engine, centers, sizes, opts) {
+  setStatus(opts.label, 'listening');
+  promptNameEl.textContent = opts.label;
+  promptHintEl.textContent = opts.hint;
+  let hits = 0;
+  while (faceChecking && performance.now() < opts.deadline) {
+    const box = await detectFaceFrame(engine);
+    if (box) {
+      centers.push(box.cx);
+      sizes.push(box.w);
+      const displayed = 1 - box.cx;
+      promptHintEl.textContent = opts.hint;
+      drawFaceGuide(box, { state: 'move', arrow: opts.arrow });
+      if (opts.reached(displayed)) {
+        hits++;
+        if (hits >= 2) return true;
+      } else {
+        hits = 0;
+      }
+    } else {
+      promptHintEl.textContent = 'Keep your face in view';
+      drawFaceGuide(null, { state: 'move', arrow: opts.arrow });
+      hits = 0;
+    }
+    await sleep(55);
+  }
+  return false;
+}
+
+async function runGuidedFaceCheck() {
+  const engine = await ensureFaceEngine();
+  faceChecking = true;
+  setStartButton('Verification in progress', true);
+  promptEmojiEl.textContent = '🙂';
+  progressEl.style.width = '0%';
+
   const centers = [];
   const sizes = [];
-  if (!options.primary) assistResultEl.textContent = 'Move your face gently left, then right.';
-  setStatus('Face motion', 'listening');
+  const startedAt = performance.now();
+  const deadline = startedAt + 30000;
 
-  while (performance.now() - startedAt < 3200) {
-    const faces = await detector.detect(videoEl).catch(() => []);
-    if (faces.length) {
-      const box = faces[0].boundingBox;
-      centers.push((box.x + box.width / 2) / Math.max(1, videoEl.videoWidth || 640));
-      sizes.push(box.width / Math.max(1, videoEl.videoWidth || 640));
+  try {
+    const inTarget = (box) => {
+      if (!box) return false;
+      const dx = Math.abs((1 - box.cx) - FACE_TARGET.cx);
+      const dy = Math.abs(box.cy - FACE_TARGET.cy);
+      const sizeOk = box.w > 0.12 && box.w < 0.7;
+      return dx < 0.13 && dy < 0.16 && sizeOk;
+    };
+
+    // Phase 1: center the face inside the oval.
+    setStatus('Center your face', 'listening');
+    promptNameEl.textContent = 'Center your face';
+    promptHintEl.textContent = 'Fit your face inside the oval and hold still.';
+    let centeredFrames = 0;
+    while (faceChecking && performance.now() < deadline) {
+      const box = await detectFaceFrame(engine);
+      if (box) {
+        centers.push(box.cx);
+        sizes.push(box.w);
+      }
+      const ok = inTarget(box);
+      promptHintEl.textContent = !box
+        ? 'Show your face'
+        : ok
+          ? 'Great — hold still'
+          : 'Fit your face inside the oval';
+      drawFaceGuide(box, { state: ok ? 'good' : 'neutral', arrow: null });
+      if (ok) {
+        centeredFrames++;
+        if (centeredFrames >= 6) break;
+      } else {
+        centeredFrames = 0;
+      }
+      await sleep(55);
     }
-    await new Promise((resolve) => setTimeout(resolve, 120));
-  }
+    progressEl.style.width = '33%';
 
-  const centerMotion = centers.length ? Math.max(...centers) - Math.min(...centers) : 0;
-  const sizeMotion = sizes.length ? Math.max(...sizes) - Math.min(...sizes) : 0;
-  const result = await apiJson('/api/liveness/verify', {
-    durationMs: Math.round(performance.now() - startedAt),
-    faceFrames: centers.length,
-    motionScore: Math.max(centerMotion, sizeMotion),
-  });
-  verificationToken = result.verificationToken;
-  await confirmProtectedAction();
+    // Phase 2: move left (on-screen face crosses to the left zone).
+    await runFaceMotionPhase(engine, centers, sizes, {
+      label: 'Move left',
+      hint: 'Slowly move your head to the left.',
+      arrow: 'left',
+      deadline,
+      reached: (displayed) => displayed <= FACE_TARGET.cx - 0.13,
+    });
+    progressEl.style.width = '66%';
+
+    // Phase 3: move right (on-screen face crosses to the right zone).
+    await runFaceMotionPhase(engine, centers, sizes, {
+      label: 'Move right',
+      hint: 'Now slowly move your head to the right.',
+      arrow: 'right',
+      deadline,
+      reached: (displayed) => displayed >= FACE_TARGET.cx + 0.13,
+    });
+    progressEl.style.width = '100%';
+
+    if (!faceChecking) return;
+
+    if (centers.length < 8) {
+      throw new Error('No face was detected. Make sure your face is lit and centered, then try again.');
+    }
+
+    setStatus('Checking…', 'listening');
+    promptNameEl.textContent = 'Checking…';
+    promptHintEl.textContent = 'Confirming your liveness check.';
+    drawFaceGuide(null, { state: 'good' });
+
+    const durationMs = Math.min(15000, Math.max(900, Math.round(performance.now() - startedAt)));
+    const centerMotion = Math.max(...centers) - Math.min(...centers);
+    const sizeMotion = Math.max(...sizes) - Math.min(...sizes);
+    const result = await apiJson('/api/liveness/verify', {
+      durationMs,
+      faceFrames: centers.length,
+      motionScore: Math.max(centerMotion, sizeMotion),
+    });
+    verificationToken = result.verificationToken;
+    await confirmProtectedAction();
+  } finally {
+    faceChecking = false;
+  }
 }
 
 resetBtn.addEventListener('click', () => {
+  faceChecking = false;
   stopDetection();
   stopCamera();
   currentChallengeId = null;
@@ -992,3 +1376,24 @@ idBackBtn.addEventListener('click', leaveZoeIdPanel);
 mobileIdBtn.addEventListener('click', () => showZoeIdPanel('verification'));
 zoeVerifyBtn.addEventListener('click', continueFromIntro);
 selectPrimaryMethod(isMobileLayout() ? 'face' : 'hand');
+
+// Keep the whole card centered and fully in frame on any screen: scale it down
+// to fit the viewport whenever it would otherwise overflow (width or height).
+function fitCardToViewport() {
+  if (!cardEl) return;
+  const margin = 16;
+  const availW = window.innerWidth - margin * 2;
+  const availH = window.innerHeight - margin * 2;
+  const w = cardEl.offsetWidth;
+  const h = cardEl.offsetHeight;
+  if (!w || !h) return;
+  const scale = Math.min(1, availW / w, availH / h);
+  cardEl.style.transform = `translate(-50%, -50%) scale(${scale})`;
+}
+window.addEventListener('resize', fitCardToViewport);
+window.addEventListener('orientationchange', fitCardToViewport);
+// Recompute when the card's own size changes (panel switches, camera turning on).
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(fitCardToViewport).observe(cardEl);
+}
+fitCardToViewport();

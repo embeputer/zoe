@@ -25,9 +25,8 @@ body {
 }
 
 body {
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.10), transparent 38%),
-    var(--page);
+  background: linear-gradient(135deg, #302f2f, #070075);
+  background-attachment: fixed;
   color: var(--ink);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   display: flex;
@@ -37,7 +36,11 @@ body {
 }
 
 .captcha-card {
-  position: relative;
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  transform-origin: center center;
   width: min(560px, 100%);
   background: var(--phone);
   border-radius: 34px;
@@ -238,6 +241,25 @@ h1 {
   gap: 10px;
 }
 
+.choice-or {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.choice-or::before,
+.choice-or::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
 .id-copy {
   margin: 0 0 16px;
   color: var(--muted);
@@ -404,75 +426,64 @@ h2 {
   font-size: 20px;
 }
 
-.difficulty {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin-bottom: 12px;
-  color: var(--muted);
-  font-size: 14px;
-  font-weight: 650;
-}
-
-.difficulty-badge {
-  display: inline-flex;
-  align-items: center;
-  min-height: 30px;
-  padding: 6px 12px;
-  border-radius: 999px;
-  background: var(--panel);
-  color: var(--blue);
-  font-weight: 800;
-}
-
 .stage {
   display: grid;
   gap: 12px;
 }
 
-.prompt {
-  background: var(--panel-2);
-  border: 1px solid var(--line);
-  border-radius: 24px;
-  padding: 18px;
-  display: grid;
-  gap: 12px;
+/* Prompt overlaid on the camera stream as a translucent dark pill:
+   "[emoji] [name] [description]". */
+.stream-prompt {
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-radius: 16px;
+  background: rgba(10, 12, 20, 0.6);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  color: #fff;
+  pointer-events: none;
 }
 
-.prompt-kicker {
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 800;
-}
-
-.prompt-gesture {
-  min-height: 68px;
-  display: grid;
-  place-items: center;
-  font-size: 56px;
+.stream-prompt-emoji {
+  font-size: 28px;
   line-height: 1;
+  flex-shrink: 0;
 }
 
-.prompt-name {
-  text-align: center;
-  font-size: 20px;
-  line-height: 1.2;
+.stream-prompt-text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.stream-prompt-name {
+  font-size: 15px;
   font-weight: 850;
+  line-height: 1.2;
 }
 
-.prompt-hint {
-  min-height: 38px;
-  text-align: center;
-  color: var(--muted);
-  font-size: 14px;
-  line-height: 1.35;
+.stream-prompt-hint {
+  font-size: 12.5px;
+  line-height: 1.3;
+  color: rgba(255, 255, 255, 0.78);
 }
 
+.stream-prompt-hint:empty { display: none; }
+
+/* Progress bar sits as a thin border strip along the bottom of the stream. */
 .progress {
-  height: 8px;
-  background: #e0def8;
-  border-radius: 999px;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.16);
   overflow: hidden;
 }
 
@@ -480,66 +491,7 @@ h2 {
   height: 100%;
   width: 0%;
   background: var(--blue);
-  border-radius: 999px;
   transition: width 0.12s linear;
-}
-
-.checks {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.check {
-  min-width: 0;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 8px;
-  background: #fff;
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  color: var(--muted);
-  font-size: 12px;
-}
-
-.check[hidden] {
-  display: none;
-}
-
-.check .num {
-  display: inline-flex;
-  width: 20px;
-  height: 20px;
-  align-items: center;
-  justify-content: center;
-  background: var(--panel);
-  color: var(--blue);
-  border-radius: 50%;
-  font-size: 11px;
-  font-weight: 900;
-  flex-shrink: 0;
-}
-
-.check .label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.check.active {
-  border-color: #b7b1ff;
-  color: var(--blue);
-}
-
-.check.done {
-  border-color: #bfe6cd;
-  color: var(--success);
-}
-
-.check.done .num {
-  background: #e8f7ee;
-  color: var(--success);
 }
 
 .video-wrap {
@@ -558,8 +510,12 @@ h2 {
   width: 100%;
   height: 100%;
   object-fit: cover;
-  transform: scaleX(-1);
 }
+
+/* The raw camera feed is mirrored for a natural selfie view. The overlay canvas
+   is NOT CSS-mirrored: it does its own mirroring while drawing, so captions and
+   arrows stay readable and right-way-round. */
+#video { transform: scaleX(-1); }
 
 #overlay { pointer-events: none; }
 
@@ -779,7 +735,6 @@ footer {
 @media (max-width: 560px) {
   body {
     padding: 14px;
-    align-items: flex-start;
   }
 
   .captcha-card {
@@ -828,10 +783,6 @@ footer {
 
 @media (max-width: 390px) {
   .method-picker {
-    grid-template-columns: 1fr;
-  }
-
-  .checks {
     grid-template-columns: 1fr;
   }
 }
