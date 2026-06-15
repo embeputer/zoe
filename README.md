@@ -31,8 +31,7 @@ npm test
 The regression test starts a temporary local HTTP server and checks that:
 
 - fake client-side verification is rejected
-- assisted-check requests do not create verification tokens
-- emergency text/audio checks issue server-bound tokens only once per session
+- assisted/fallback verification endpoints are not available
 - empty Zoe ID sessions cannot authenticate a passkey
 - out-of-order challenge steps are rejected
 - valid challenge completion issues a token
@@ -54,15 +53,8 @@ The UI gives camera guidance when detection struggles. Users can choose a differ
 - **Zoe ID**: strongest repeat-use path. Approved users verify with a passkey through WebAuthn, and the server verifies the signed assertion.
 - **Face motion**: primary local face-motion check using MediaPipe Tasks Vision FaceDetector (cross-browser; works in Chrome, Safari, and Firefox under a strict CSP). The compatible short-range detector model is served locally from `models/`, and the browser verifies confidence, face-sized bounds, target-oval position, and eye/nose keypoint yaw before counting the prompted center/left/right head turns. It falls back to the browser `FaceDetector` API only when the MediaPipe runtime cannot load, using box motion because that fallback has no keypoints. It checks liveness-style motion, not identity.
 
-During camera verification, **Need another way?** is emergency-only:
-
-- **Emergency text**: one-use typed challenge for a user who is stuck right now. It issues an `emergency` assurance token and should only be accepted for low-risk actions.
-- **Emergency audio**: one-use spoken code using the browser's speech synthesis, then typed back by the user. It uses the same low-assurance emergency policy.
-
-The older assisted-request endpoint still exists as a safe queue-shaped stub: it creates a tracked request id, but does not issue a verification token.
-
-For a real no-hassle accessibility path, users should apply for a manual review through Zoe ID. Once approved, they can add a passkey and use that high-assurance path instead of repeating emergency text or audio.
+There is no emergency text/audio verification path. When camera detection takes a bit, Zoe shows passive camera guidance while the user keeps trying the selected method.
 
 ## Security Notes
 
-This patch fixes the original client-side trust-boundary problem, but it is still a demo. For high-value production use, add server-side media verification, abuse monitoring, durable storage, passkey credentials stored on user accounts instead of in memory, rate limits backed by a real datastore, secret management, CSRF/origin enforcement tuned to your deployment, and a fully designed accessibility fallback policy.
+This patch fixes the original client-side trust-boundary problem, but it is still a demo. For high-value production use, add server-side media verification, abuse monitoring, durable storage, passkey credentials stored on user accounts instead of in memory, rate limits backed by a real datastore, secret management, CSRF/origin enforcement tuned to your deployment, and a fully designed accessibility policy.

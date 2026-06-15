@@ -2,12 +2,12 @@
 
 ## Project
 
-Zoe is a server-bound human verification demo. The browser runs local camera checks for face motion or hand gestures, but the server owns challenge state, replay protection, passkey verification, fallback challenges, and one-use verification tokens.
+Zoe is a server-bound human verification demo. The browser runs local camera checks for face motion or hand gestures, but the server owns challenge state, replay protection, passkey verification, and one-use verification tokens.
 
 This is a plain Node/static app:
 
 - `server.js` serves files and implements all API routes.
-- `app.js` owns browser UI state, MediaPipe hand detection, face-motion checks, passkey calls, and fallback UI.
+- `app.js` owns browser UI state, MediaPipe hand detection, face-motion checks, passkey calls, and camera-help UI.
 - `index.html` is the single page.
 - `styles.css` is the complete UI styling.
 - `test_server.js` is the regression/security test suite.
@@ -90,29 +90,20 @@ Zoe ID registration must be gated. Do not blindly create a passkey just because 
 
 - The user must first complete a fresh face or hand check.
 - `/api/passkey/register/options` requires `registrationVerificationToken`.
-- Only `gesture` and `face-motion` verification tokens with `standard`/`fallback` assurance may unlock registration.
-- Emergency text/audio tokens must not register Zoe ID.
-- Do not show `Need another way?` emergency checks while Zoe ID registration is waiting for face/hand verification.
+- Only `gesture` and `face-motion` verification tokens with `standard` assurance may unlock registration.
 - Creating a passkey should not immediately act as proof of identity; future access uses `Use existing Zoe ID`.
-- Do not build a Zoe ID portal in this demo. That is production scope. Current copy may reference production manual review, but there should be no portal route/UI yet.
+- Do not build a Zoe ID portal in this demo. That is production scope.
 
 There are multiple Zoe ID entry points:
 
 - Desktop method-choice card.
 - Mobile verification header button.
 
-Keep those entry points routed through the Zoe ID intermediate page. Do not put Zoe ID back inside the `Need another way?` emergency panel.
+Keep those entry points routed through the Zoe ID intermediate page. Do not add Zoe ID back into alternate verification panels.
 
-### Emergency Text And Audio
+### Camera Help
 
-Emergency text/audio are low-assurance, one-use fallbacks. They should be treated as emergency access only, not as ordinary verification.
-
-The public fallback API should only expose:
-
-- `emergency_text`
-- `emergency_audio`
-
-Do not restore plain `text` or `audio` as normal fallback modes.
+Do not restore emergency text/audio verification, assisted verification, or a `Need another way?` fallback panel. When camera checks take a bit, Zoe should show passive camera guidance only while the user keeps trying the selected face or hand method.
 
 ## Security Boundaries
 
@@ -121,12 +112,10 @@ Keep these properties intact:
 - Client-side claims alone must never verify the user.
 - Server-issued verification tokens are short-lived and one-use.
 - Challenge steps must be ordered and session-bound.
-- Assisted/accessibility request IDs are not verification tokens.
-- Emergency fallback is one-use per session.
 - Passkey assertions must verify against a server-issued challenge.
-- Passkey registration must be gated by a fresh non-emergency verification token.
+- Passkey registration must be gated by a fresh face or hand verification token.
 
-The app is still a demo. For production, the README already calls out needed upgrades: durable storage, real account-backed passkeys, server-side media verification or stronger liveness, abuse monitoring, datastore-backed rate limits, deployment-specific CSRF/origin checks, secret management, and a complete accessibility fallback policy.
+The app is still a demo. For production, the README already calls out needed upgrades: durable storage, real account-backed passkeys, server-side media verification or stronger liveness, abuse monitoring, datastore-backed rate limits, deployment-specific CSRF/origin checks, secret management, and a complete accessibility policy.
 
 ## Branding
 

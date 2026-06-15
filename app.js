@@ -50,7 +50,6 @@ const methodHandBtn = $('method-hand-btn');
 const methodFaceBtn = $('method-face-btn');
 const verificationTitleEl = $('verification-title');
 const startBtn = $('start-btn');
-const resetBtn = $('reset-btn');
 const cardEl = $('captcha-card');
 const panelShellEl = $('panel-shell');
 const zoeIntroEl = $('zoe-intro');
@@ -68,21 +67,9 @@ const idResultEl = $('id-result');
 const dialogEl = $('dialog');
 const verifiedEl = $('verified');
 const mobileIdBtn = $('mobile-id-btn');
-const assistBtn = $('assist-btn');
-const assistPanel = $('assist-panel');
-const textChallengeBtn = $('text-challenge-btn');
-const audioChallengeBtn = $('audio-challenge-btn');
-const fallbackForm = $('fallback-form');
-const fallbackLabel = $('fallback-label');
-const fallbackAnswer = $('fallback-answer');
-const audioRepeatBtn = $('audio-repeat-btn');
-const fallbackSubmitBtn = $('fallback-submit-btn');
-const assistResultEl = $('assist-result');
 const cameraHelpEl = $('camera-help');
 const cameraHelpTextEl = $('camera-help-text');
 const checkEls = Array.from(document.querySelectorAll('.check'));
-
-let activeFallbackChallenge = null;
 
 const LM = {
   thumbTip: 4, thumbIp: 3, thumbMcp: 2, thumbCmc: 1,
@@ -313,7 +300,7 @@ function showError(msg) {
   if (pendingZoeIdRegistration) {
     pendingZoeIdRegistration = false;
     pendingZoeIdResultEl = null;
-    setAssistButtonsDisabled(false);
+    setZoeIdButtonsDisabled(false);
   }
 }
 
@@ -404,9 +391,8 @@ function showZoeIdPanel(returnTarget = 'choice', direction = 'forward') {
 }
 
 function showVerificationPanel(direction = 'forward') {
-  setEmergencyAssistAvailable(!pendingZoeIdRegistration);
   if (pendingZoeIdRegistration) {
-    showCameraHelp('Zoe ID registration requires a face or hand check. In production, mobility/accessibility needs should go through manual review before passkey setup.');
+    showCameraHelp('Zoe ID registration requires a face or hand check first.');
   }
   zoeVerifyBtn.disabled = true;
   transitionToPanel(dialogEl, 'verify', startBtn, direction);
@@ -414,12 +400,11 @@ function showVerificationPanel(direction = 'forward') {
 
 function showSuccessPanel() {
   zoeVerifyBtn.disabled = true;
-  transitionToPanel(verifiedEl, 'success', resetBtn);
+  transitionToPanel(verifiedEl, 'success', null);
 }
 
 function showIntroPanel() {
   zoeIdReturnTarget = 'choice';
-  setEmergencyAssistAvailable(true);
   zoeVerifyBtn.disabled = false;
   transitionToPanel(zoeIntroEl, null, zoeVerifyBtn, 'back');
 }
@@ -605,7 +590,7 @@ async function confirmProtectedAction() {
       stopCamera();
       showZoeIdPanel('choice', 'back');
       idResultEl.textContent = 'Zoe ID passkey saved. Next time, choose Use existing Zoe ID.';
-      setAssistButtonsDisabled(false);
+      setZoeIdButtonsDisabled(false);
       return;
     }
 
@@ -808,32 +793,10 @@ function autoStartVerification() {
 
 startBtn.addEventListener('click', beginVerification);
 
-assistBtn.addEventListener('click', () => {
-  const expanded = assistPanel.hidden;
-  assistPanel.hidden = !expanded;
-  assistBtn.setAttribute('aria-expanded', String(expanded));
-  if (expanded) {
-    assistResultEl.textContent = '';
-    showCameraHelp('You can keep trying the camera check, or use the emergency check below.');
-  }
-});
-
-function setAssistButtonsDisabled(disabled) {
-  [choiceIdBtn, mobileIdBtn, idUseBtn, idRegisterBtn, idBackBtn, textChallengeBtn, audioChallengeBtn, audioRepeatBtn, fallbackSubmitBtn].forEach((button) => {
+function setZoeIdButtonsDisabled(disabled) {
+  [choiceIdBtn, mobileIdBtn, idUseBtn, idRegisterBtn, idBackBtn].forEach((button) => {
     button.disabled = disabled;
   });
-}
-
-function setEmergencyAssistAvailable(available) {
-  assistBtn.hidden = !available;
-  if (!available) {
-    assistPanel.hidden = true;
-    assistBtn.setAttribute('aria-expanded', 'false');
-    fallbackForm.hidden = true;
-    audioRepeatBtn.hidden = true;
-    activeFallbackChallenge = null;
-    assistResultEl.textContent = '';
-  }
 }
 
 function passkeyUnavailableMessage() {
@@ -908,7 +871,7 @@ async function authenticatePasskey() {
   await confirmProtectedAction();
 }
 
-async function createFreshPasskey(resultEl = assistResultEl) {
+async function createFreshPasskey(resultEl = idResultEl) {
   if (!verificationToken) {
     pendingZoeIdRegistration = true;
     pendingZoeIdResultEl = resultEl;
@@ -925,14 +888,14 @@ async function createFreshPasskey(resultEl = assistResultEl) {
   resultEl.textContent = 'Zoe ID passkey saved. Next time, choose Use existing Zoe ID.';
 }
 
-async function useZoeId(resultEl = assistResultEl) {
+async function useZoeId(resultEl = idResultEl) {
   const unavailable = passkeyUnavailableMessage();
   if (unavailable) {
     resultEl.textContent = unavailable;
     return;
   }
 
-  setAssistButtonsDisabled(true);
+  setZoeIdButtonsDisabled(true);
   resultEl.textContent = 'Checking your Zoe ID...';
   try {
     await authenticatePasskey();
@@ -941,90 +904,9 @@ async function useZoeId(resultEl = assistResultEl) {
     resultEl.textContent = message.includes('No passkey')
       ? 'No Zoe ID passkey is registered in this session yet. Register Zoe ID below.'
       : `${err.message || 'Zoe ID check did not finish.'} If that passkey was deleted, register Zoe ID again.`;
-    setAssistButtonsDisabled(false);
+    setZoeIdButtonsDisabled(false);
   }
 }
-
-async function beginFallback(mode) {
-  const isAudioMode = mode === 'audio' || mode === 'emergency_audio';
-  const isEmergencyMode = mode.startsWith('emergency_');
-  if (isAudioMode && !window.speechSynthesis) {
-    assistResultEl.textContent = 'This browser cannot speak the audio challenge.';
-    return;
-  }
-
-  setAssistButtonsDisabled(true);
-  fallbackForm.hidden = true;
-  audioRepeatBtn.hidden = true;
-  assistResultEl.textContent = isAudioMode
-    ? 'Preparing the spoken emergency check...'
-    : isEmergencyMode
-      ? 'Preparing a one-use emergency check...'
-      : 'Preparing the text check...';
-  try {
-    activeFallbackChallenge = await apiJson('/api/fallback/challenge', { mode });
-    fallbackLabel.textContent = activeFallbackChallenge.prompt;
-    fallbackAnswer.value = '';
-    fallbackForm.hidden = false;
-    audioRepeatBtn.hidden = !isAudioMode;
-    fallbackAnswer.focus();
-    assistResultEl.textContent = isAudioMode
-      ? 'Emergency audio is temporary and lower assurance. I will say the digits twice.'
-      : isEmergencyMode
-        ? 'Emergency text is temporary and lower assurance.'
-        : 'Type the words exactly as shown.';
-
-    if (isAudioMode) {
-      speakAudioChallenge(2);
-    }
-  } catch (err) {
-    activeFallbackChallenge = null;
-    assistResultEl.textContent = err.message || 'Could not start that check.';
-  } finally {
-    setAssistButtonsDisabled(false);
-  }
-}
-
-textChallengeBtn.addEventListener('click', () => beginFallback('emergency_text'));
-audioChallengeBtn.addEventListener('click', () => beginFallback('emergency_audio'));
-
-function speakAudioChallenge(repeats = 1) {
-  if (!activeFallbackChallenge || !activeFallbackChallenge.mode.includes('audio') || !activeFallbackChallenge.speakText) return;
-  if (!window.speechSynthesis) return;
-
-  window.speechSynthesis.cancel();
-  for (let i = 0; i < repeats; i++) {
-    const prefix = repeats > 1 && i === 1 ? 'Repeating. ' : '';
-    const utterance = new SpeechSynthesisUtterance(`${prefix}${activeFallbackChallenge.speakText}`);
-    utterance.rate = 0.62;
-    utterance.pitch = 1;
-    utterance.volume = 1;
-    window.speechSynthesis.speak(utterance);
-  }
-}
-
-audioRepeatBtn.addEventListener('click', () => {
-  assistResultEl.textContent = 'Repeating the digits slowly.';
-  speakAudioChallenge(1);
-});
-
-fallbackForm.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  if (!activeFallbackChallenge) return;
-  setAssistButtonsDisabled(true);
-  assistResultEl.textContent = 'Checking...';
-  try {
-    const result = await apiJson('/api/fallback/verify', {
-      challengeId: activeFallbackChallenge.challengeId,
-      answer: fallbackAnswer.value,
-    });
-    verificationToken = result.verificationToken;
-    await confirmProtectedAction();
-  } catch (err) {
-    assistResultEl.textContent = err.message || 'That did not match.';
-    setAssistButtonsDisabled(false);
-  }
-});
 
 // Where the user's face should sit, normalized to [0,1] in the displayed
 // camera frame: a centered, slightly upper oval.
@@ -1089,7 +971,7 @@ async function ensureFaceEngine() {
       legacyFaceDetector = new FaceDetector({ fastMode: true, maxDetectedFaces: 1 });
       return 'legacy';
     }
-    throw new Error('Face check could not start. Reload, or try Zoe ID or emergency text/audio.');
+    throw new Error('Face check could not start. Reload, or try Zoe ID.');
   }
 }
 
@@ -1526,40 +1408,6 @@ async function runGuidedFaceCheck() {
   }
 }
 
-resetBtn.addEventListener('click', () => {
-  faceChecking = false;
-  stopDetection();
-  stopCamera();
-  currentChallengeId = null;
-  currentStep = null;
-  completedSteps = 0;
-  verificationToken = null;
-  cooldownUntil = 0;
-  submittingStep = false;
-  resetStepEvidence();
-  hideCameraHelp();
-  assistPanel.hidden = true;
-  assistBtn.setAttribute('aria-expanded', 'false');
-  setAssistButtonsDisabled(false);
-  fallbackForm.hidden = true;
-  audioRepeatBtn.hidden = true;
-  activeFallbackChallenge = null;
-  assistResultEl.textContent = '';
-  choiceResultEl.textContent = '';
-  idResultEl.textContent = '';
-
-  showIntroPanel();
-
-  setStartButton('Start check', false);
-  checkEls.forEach((el) => {
-    el.classList.remove('active', 'done');
-    el.hidden = selectedPrimaryMethod === 'face';
-    el.querySelector('.label').textContent = '-';
-  });
-  selectPrimaryMethod(selectedPrimaryMethod);
-  setStatus('Idle', 'idle');
-});
-
 methodHandBtn.addEventListener('click', () => selectPrimaryMethod('hand'));
 methodFaceBtn.addEventListener('click', () => selectPrimaryMethod('face'));
 choiceFaceBtn.addEventListener('click', () => choosePrimaryMethod('face'));
@@ -1573,13 +1421,13 @@ idRegisterBtn.addEventListener('click', async () => {
     return;
   }
 
-  setAssistButtonsDisabled(true);
+  setZoeIdButtonsDisabled(true);
   try {
     await createFreshPasskey(idResultEl);
-    if (!pendingZoeIdRegistration) setAssistButtonsDisabled(false);
+    if (!pendingZoeIdRegistration) setZoeIdButtonsDisabled(false);
   } catch (err) {
     idResultEl.textContent = err.message || 'Could not register Zoe ID.';
-    setAssistButtonsDisabled(false);
+    setZoeIdButtonsDisabled(false);
   }
 });
 idBackBtn.addEventListener('click', leaveZoeIdPanel);

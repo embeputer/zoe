@@ -40,82 +40,26 @@ async function main() {
     assert.strictEqual(protectedWithoutToken.res.status, 401);
     let cookie = protectedWithoutToken.cookie;
 
-    const assisted = await request(baseUrl, '/api/accessibility-request', {
+    const assistedRemoved = await request(baseUrl, '/api/accessibility-request', {
       method: 'POST',
       body: JSON.stringify({ reason: 'camera_or_accessibility' }),
     }, cookie);
-    assert.strictEqual(assisted.res.status, 202);
-    assert.ok(assisted.body.requestId);
-    assert.strictEqual(assisted.body.verificationToken, undefined);
-    cookie = assisted.cookie;
+    assert.strictEqual(assistedRemoved.res.status, 404);
 
-    const assistedTokenAttempt = await request(baseUrl, '/api/protected-action', {
-      method: 'POST',
-      body: JSON.stringify({ verificationToken: assisted.body.requestId }),
-    }, cookie);
-    assert.strictEqual(assistedTokenAttempt.res.status, 401);
-
-    const assistedRepeat = await request(baseUrl, '/api/accessibility-request', {
-      method: 'POST',
-      body: JSON.stringify({ reason: 'camera_or_accessibility' }),
-    }, cookie);
-    assert.strictEqual(assistedRepeat.res.status, 429);
-
-    const legacyTextFallback = await request(baseUrl, '/api/fallback/challenge', {
-      method: 'POST',
-      body: JSON.stringify({ mode: 'text' }),
-    }, cookie);
-    assert.strictEqual(legacyTextFallback.res.status, 400);
-
-    const emergencyTextFallback = await request(baseUrl, '/api/fallback/challenge', {
+    const fallbackChallengeRemoved = await request(baseUrl, '/api/fallback/challenge', {
       method: 'POST',
       body: JSON.stringify({ mode: 'emergency_text' }),
     }, cookie);
-    assert.strictEqual(emergencyTextFallback.res.status, 201);
-    const emergencyTextAnswer = emergencyTextFallback.body.prompt.match(/"([^"]+)"/)[1];
-    const emergencyTextVerified = await request(baseUrl, '/api/fallback/verify', {
-      method: 'POST',
-      body: JSON.stringify({ challengeId: emergencyTextFallback.body.challengeId, answer: emergencyTextAnswer }),
-    }, cookie);
-    assert.strictEqual(emergencyTextVerified.res.status, 200);
-    assert.ok(emergencyTextVerified.body.verificationToken);
+    assert.strictEqual(fallbackChallengeRemoved.res.status, 404);
 
-    const emergencyTextAccepted = await request(baseUrl, '/api/protected-action', {
+    const fallbackVerifyRemoved = await request(baseUrl, '/api/fallback/verify', {
       method: 'POST',
-      body: JSON.stringify({ verificationToken: emergencyTextVerified.body.verificationToken }),
+      body: JSON.stringify({ challengeId: 'fallback-test', answer: 'emergency 1234' }),
     }, cookie);
-    assert.strictEqual(emergencyTextAccepted.res.status, 200);
-
-    const emergencyRepeat = await request(baseUrl, '/api/fallback/challenge', {
-      method: 'POST',
-      body: JSON.stringify({ mode: 'emergency_audio' }),
-    }, cookie);
-    assert.strictEqual(emergencyRepeat.res.status, 429);
-
-    const emergencyAudioFallback = await request(baseUrl, '/api/fallback/challenge', {
-      method: 'POST',
-      body: JSON.stringify({ mode: 'emergency_audio' }),
-    });
-    assert.strictEqual(emergencyAudioFallback.res.status, 201);
-    assert.ok(emergencyAudioFallback.body.speakText);
-    const emergencyAudioVerified = await request(baseUrl, '/api/fallback/verify', {
-      method: 'POST',
-      body: JSON.stringify({
-        challengeId: emergencyAudioFallback.body.challengeId,
-        answer: emergencyAudioFallback.body.speakText.replace(/\s+/g, ''),
-      }),
-    }, emergencyAudioFallback.cookie);
-    assert.strictEqual(emergencyAudioVerified.res.status, 200);
-    assert.ok(emergencyAudioVerified.body.verificationToken);
+    assert.strictEqual(fallbackVerifyRemoved.res.status, 404);
 
     const unverifiedRegisterOptions = await request(baseUrl, '/api/passkey/register/options', { method: 'POST' }, cookie);
     assert.strictEqual(unverifiedRegisterOptions.res.status, 401);
-
-    const emergencyRegisterOptions = await request(baseUrl, '/api/passkey/register/options', {
-      method: 'POST',
-      body: JSON.stringify({ registrationVerificationToken: emergencyAudioVerified.body.verificationToken }),
-    }, emergencyAudioFallback.cookie);
-    assert.strictEqual(emergencyRegisterOptions.res.status, 403);
 
     const livenessVerified = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',

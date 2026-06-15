@@ -11,9 +11,7 @@ const MIN_STEP_DURATION_MS = 180;
 const MAX_STEP_DURATION_MS = 12 * 1000;
 const MIN_HOLD_FRAMES = 8;
 const MAX_BODY_BYTES = 32 * 1024;
-const ACCESSIBILITY_REQUEST_COOLDOWN_MS = 60 * 1000;
-const FALLBACK_TTL_MS = 2 * 60 * 1000;
-const FALLBACK_MAX_ATTEMPTS = 5;
+const PASSKEY_CHALLENGE_TTL_MS = 2 * 60 * 1000;
 const APP_NAME = 'Zoe';
 const COOKIE_NAME = 'zoe_sid';
 const SECRET = process.env.ZOE_SECRET || process.env.REALHANDS_SECRET || crypto.randomBytes(32).toString('hex');
@@ -33,14 +31,7 @@ const GESTURES = [
 
 const sessions = new Map();
 const challenges = new Map();
-const assistedRequests = new Map();
-const fallbackChallenges = new Map();
 const usedTokenDigests = new Set();
-
-const WORDS = [
-  'ember', 'signal', 'orbit', 'bright', 'steady', 'river',
-  'hand', 'proof', 'window', 'silver', 'kind', 'north',
-];
 
 function now() {
   return Date.now();
@@ -48,10 +39,6 @@ function now() {
 
 function randomId(bytes = 24) {
   return crypto.randomBytes(bytes).toString('base64url');
-}
-
-function normalizeAnswer(value) {
-  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
 function hmac(value) {
@@ -101,8 +88,6 @@ function getSession(req, res) {
       createdAt: now(),
       lastSeenAt: now(),
       issuedTokens: new Map(),
-      lastAccessibilityRequestAt: 0,
-      emergencyVerifiedAt: 0,
       credentials: new Map(),
       passkeyRegisterChallenge: null,
       passkeyAuthChallenge: null,
@@ -296,58 +281,6 @@ function parseClientData(value, expectedType, expectedChallenge) {
   }
 }
 
-function createFallbackChallenge(session, mode) {
-  const createdAt = now();
-  let prompt;
-  let speakText = null;
-  let answer;
-
-  if (mode === 'text') {
-    const words = Array.from({ length: 3 }, () => WORDS[crypto.randomInt(WORDS.length)]);
-    answer = words.join(' ');
-    prompt = `Type these words: ${answer}`;
-  } else if (mode === 'audio') {
-    const code = Array.from({ length: 6 }, () => String(crypto.randomInt(10))).join('');
-    answer = code;
-    prompt = 'Type the six digits you hear.';
-    speakText = code.split('').join(' ');
-  } else if (mode === 'emergency_text') {
-    const code = Array.from({ length: 4 }, () => String(crypto.randomInt(10))).join('');
-    answer = `emergency ${code}`;
-    prompt = `Emergency check: type "emergency ${code}" to continue once.`;
-  } else if (mode === 'emergency_audio') {
-    const code = Array.from({ length: 6 }, () => String(crypto.randomInt(10))).join('');
-    answer = code;
-    prompt = 'Emergency audio: type the six digits you hear.';
-    speakText = code.split('').join(' ');
-  } else {
-    return null;
-  }
-
-  const challenge = {
-    id: randomId(),
-    sessionId: session.id,
-    mode,
-    prompt,
-    speakText,
-    answerHash: hmac(normalizeAnswer(answer)),
-    attempts: 0,
-    createdAt,
-    expiresAt: createdAt + FALLBACK_TTL_MS,
-    consumedAt: null,
-  };
-  fallbackChallenges.set(challenge.id, challenge);
-  return challenge;
-}
-
-function verifyFallbackAnswer(challenge, answer) {
-  if (challenge.consumedAt) return 'Challenge was already used.';
-  if (now() > challenge.expiresAt) return 'Challenge expired.';
-  if (challenge.attempts >= FALLBACK_MAX_ATTEMPTS) return 'Too many attempts.';
-  challenge.attempts++;
-  return timingSafeEqual(challenge.answerHash, hmac(normalizeAnswer(answer))) ? null : 'That answer did not match.';
-}
-
 function parseSignCount(authenticatorData) {
   if (!Buffer.isBuffer(authenticatorData) || authenticatorData.length < 37) return 0;
   return authenticatorData.readUInt32BE(33);
@@ -424,7 +357,7 @@ async function handleApi(req, res, pathname) {
 
     const gate = consumeVerificationToken(session, body.registrationVerificationToken, {
       methods: ['gesture', 'face-motion'],
-      assurances: ['standard', 'fallback'],
+      assurances: ['standard'],
     });
     if (gate.error) return sendJson(res, gate.status || 401, { error: gate.error });
 
@@ -470,7 +403,7 @@ async function handleApi(req, res, pathname) {
     }
 
     const pending = session.passkeyRegisterChallenge;
-    if (!pending || now() - pending.createdAt > FALLBACK_TTL_MS) return sendJson(res, 410, { error: 'Passkey registration expired.' });
+    if (!pending || now() - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) return sendJson(res, 410, { error: 'Passkey registration expired.' });
     const client = parseClientData(body.clientDataJSON, 'webauthn.create', pending.challenge);
     if (!client) return sendJson(res, 400, { error: 'Passkey registration challenge did not verify.' });
 
@@ -513,7 +446,7 @@ async function handleApi(req, res, pathname) {
     }
 
     const pending = session.passkeyAuthChallenge;
-    if (!pending || now() - pending.createdAt > FALLBACK_TTL_MS) return sendJson(res, 410, { error: 'Passkey challenge expired.' });
+    if (!pending || now() - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) return sendJson(res, 410, { error: 'Passkey challenge expired.' });
     const credential = session.credentials.get(body.rawId);
     if (!credential) return sendJson(res, 404, { error: 'Unknown passkey credential.' });
 
@@ -535,55 +468,6 @@ async function handleApi(req, res, pathname) {
     return sendJson(res, 200, { verified: true, verificationToken: token, tokenExpiresAt: now() + TOKEN_TTL_MS });
   }
 
-  if (req.method === 'POST' && pathname === '/api/fallback/challenge') {
-    let body;
-    try {
-      body = await readJson(req);
-    } catch (err) {
-      return sendJson(res, 400, { error: err.message });
-    }
-
-    const mode = ['emergency_text', 'emergency_audio'].includes(body.mode) ? body.mode : null;
-    if (mode && mode.startsWith('emergency_') && session.emergencyVerifiedAt) {
-      return sendJson(res, 429, { error: 'Emergency verification was already used in this session.' });
-    }
-    const challenge = mode ? createFallbackChallenge(session, mode) : null;
-    if (!challenge) return sendJson(res, 400, { error: 'Unknown fallback mode.' });
-    return sendJson(res, 201, {
-      challengeId: challenge.id,
-      mode: challenge.mode,
-      prompt: challenge.prompt,
-      speakText: challenge.speakText,
-      expiresAt: challenge.expiresAt,
-    });
-  }
-
-  if (req.method === 'POST' && pathname === '/api/fallback/verify') {
-    let body;
-    try {
-      body = await readJson(req);
-    } catch (err) {
-      return sendJson(res, 400, { error: err.message });
-    }
-
-    const challenge = fallbackChallenges.get(body.challengeId);
-    if (!challenge || challenge.sessionId !== session.id) return sendJson(res, 404, { error: 'Unknown fallback challenge.' });
-    const answerError = verifyFallbackAnswer(challenge, body.answer);
-    if (answerError) return sendJson(res, 400, { error: answerError });
-    if (challenge.mode.startsWith('emergency_') && session.emergencyVerifiedAt) {
-      return sendJson(res, 429, { error: 'Emergency verification was already used in this session.' });
-    }
-    challenge.consumedAt = now();
-    if (challenge.mode.startsWith('emergency_')) session.emergencyVerifiedAt = now();
-    const assurance = challenge.mode.startsWith('emergency_') ? 'emergency' : 'fallback';
-    const token = issueVerificationToken(session, challenge, challenge.mode, assurance);
-    return sendJson(res, 200, {
-      verified: true,
-      verificationToken: token,
-      tokenExpiresAt: now() + TOKEN_TTL_MS,
-    });
-  }
-
   if (req.method === 'POST' && pathname === '/api/liveness/verify') {
     let body;
     try {
@@ -601,42 +485,11 @@ async function handleApi(req, res, pathname) {
     if (!Number.isFinite(faceFrames) || faceFrames < 8) return sendJson(res, 400, { error: 'Face was not visible for long enough.' });
     if (!Number.isFinite(motionScore) || motionScore < 0.08) return sendJson(res, 400, { error: 'Face motion was too small to count as liveness.' });
 
-    const token = issueVerificationToken(session, { id: `face:${randomId(12)}` }, 'face-motion', 'fallback');
+    const token = issueVerificationToken(session, { id: `face:${randomId(12)}` }, 'face-motion', 'standard');
     return sendJson(res, 200, {
       verified: true,
       verificationToken: token,
       tokenExpiresAt: now() + TOKEN_TTL_MS,
-    });
-  }
-
-  if (req.method === 'POST' && pathname === '/api/accessibility-request') {
-    let body;
-    try {
-      body = await readJson(req);
-    } catch (err) {
-      return sendJson(res, 400, { error: err.message });
-    }
-
-    if (now() - session.lastAccessibilityRequestAt < ACCESSIBILITY_REQUEST_COOLDOWN_MS) {
-      return sendJson(res, 429, { error: 'An assisted verification request is already open.' });
-    }
-
-    const requestId = `RH-${randomId(8).toUpperCase()}`;
-    session.lastAccessibilityRequestAt = now();
-    assistedRequests.set(requestId, {
-      id: requestId,
-      sessionId: session.id,
-      challengeId: typeof body.challengeId === 'string' ? body.challengeId : null,
-      completedSteps: Number.isFinite(Number(body.completedSteps)) ? Number(body.completedSteps) : 0,
-      reason: typeof body.reason === 'string' ? body.reason.slice(0, 80) : 'accessibility_or_camera',
-      createdAt: now(),
-      status: 'pending_assisted_review',
-    });
-
-    return sendJson(res, 202, {
-      requestId,
-      status: 'pending_assisted_review',
-      message: 'Assisted verification requested. This does not grant automatic access.',
     });
   }
 

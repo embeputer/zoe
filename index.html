@@ -71,7 +71,7 @@
           </span>
         </button>
       </div>
-      <div id="choice-result" class="assist-result" aria-live="polite"></div>
+      <div id="choice-result" class="panel-result" aria-live="polite"></div>
     </section>
 
     <section id="zoe-id-panel" class="id-panel panel-screen" hidden aria-label="Zoe ID verification">
@@ -81,7 +81,6 @@
       </div>
 
       <p class="id-copy">Use an existing Zoe ID passkey, or register one for this browser after a face or hand check.</p>
-      <p class="id-accessibility-note">For production, people with mobility needs should be routed to Zoe ID manual review before a passkey is issued. Once approved, Zoe ID lets them verify with a passkey instead of repeating camera checks.</p>
 
       <div class="id-actions">
         <button id="id-use-btn" class="primary" type="button">Use existing Zoe ID</button>
@@ -89,7 +88,7 @@
         <button id="id-back-btn" class="ghost" type="button">Back</button>
       </div>
 
-      <div id="id-result" class="assist-result" aria-live="polite"></div>
+      <div id="id-result" class="panel-result" aria-live="polite"></div>
     </section>
 
     <!-- Active verification dialog: hidden after success, replaced by .verified panel -->
@@ -139,34 +138,11 @@
 
       <section class="controls">
         <button id="start-btn" class="primary">Start check</button>
-        <button id="assist-btn" class="ghost" type="button" aria-expanded="false" aria-controls="assist-panel">Need another way?</button>
       </section>
 
       <section id="camera-help" class="camera-help" hidden aria-live="polite">
         <strong>Camera having a moment?</strong>
         <span id="camera-help-text">Try a brighter light, move your hand fully into frame, or hold still for a sec.</span>
-      </section>
-
-      <section id="assist-panel" class="assist-panel" hidden>
-        <div class="emergency-block">
-          <div class="emergency-copy">
-            <strong>Emergency verification</strong>
-            <p>For one-time access when camera checks are not usable. Lower assurance; sites should only accept it for low-risk actions.</p>
-          </div>
-          <div class="assist-actions">
-            <button id="text-challenge-btn" class="secondary danger" type="button">Emergency text</button>
-            <button id="audio-challenge-btn" class="secondary danger" type="button">Emergency audio</button>
-          </div>
-        </div>
-        <form id="fallback-form" class="fallback-form" hidden>
-          <label for="fallback-answer" id="fallback-label">Answer</label>
-          <div class="fallback-row">
-            <input id="fallback-answer" autocomplete="one-time-code" />
-            <button id="audio-repeat-btn" class="secondary" type="button" hidden>Repeat challenge</button>
-            <button id="fallback-submit-btn" class="secondary" type="submit">Check</button>
-          </div>
-        </form>
-        <div id="assist-result" class="assist-result" aria-live="polite"></div>
       </section>
     </div>
 
@@ -177,7 +153,6 @@
         <strong>You have been verified as a real person!</strong>
         <span>Getting you back to where you were...</span>
       </div>
-      <button id="reset-btn" class="ghost">Reset</button>
     </section>
     </div>
 
