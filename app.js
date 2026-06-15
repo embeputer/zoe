@@ -484,7 +484,7 @@ function selectPrimaryMethod(method) {
 
   verificationTitleEl.textContent = isFace ? 'Face verification' : 'Hand verification';
   promptEmojiEl.textContent = isFace ? '🙂' : '-';
-  promptNameEl.textContent = isFace ? 'Move gently left and right' : 'Click "Start" to begin';
+  promptNameEl.textContent = isFace ? 'Turn gently left and right' : 'Click "Start" to begin';
   promptHintEl.textContent = isFace
     ? 'Keep your face in frame. Zoe checks motion, not identity.'
     : '';
@@ -1031,7 +1031,7 @@ fallbackForm.addEventListener('submit', async (event) => {
 const FACE_TARGET = { cx: 0.5, cy: 0.46, rx: 0.23, ry: 0.33 };
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const FACE_BOX_GRACE_MS = 220;
-const SHOW_FACE_DEBUG_BOX = true;
+const SHOW_FACE_DEBUG_BOX = false;
 let recentFaceBox = null;
 let recentFaceBoxAt = 0;
 
@@ -1102,8 +1102,8 @@ const FACE_MAX_W = 0.85;
 const FACE_MIN_ASPECT = 0.55; // width / height, in pixels
 const FACE_MAX_ASPECT = 1.7;
 // Only accept a face whose center sits inside (a slightly padded) target oval.
-// Horizontal is generous so the move-left/right steps still register. Vertical
-// stays tight: a real face should be in the oval, not down on the shoulder line.
+// Horizontal is generous so natural head turns still register. Vertical stays
+// tight: a real face should be in the oval, not down on the shoulder line.
 const FACE_OVAL_SCALE_X = 1.25;
 const FACE_OVAL_SCALE_Y = 0.95;
 const FACE_BOX_SHIFT_X = -0.75;
@@ -1113,7 +1113,10 @@ const FACE_BOX_HEIGHT_SCALE = 1.02;
 // fixed pixels or fixed frame percentages, so they scale with camera distance.
 const FACE_CENTER_GATE_X = 0.75;
 const FACE_CENTER_GATE_Y = 0.75;
-const FACE_MOTION_GATE_X = 0.45;
+const FACE_MOTION_GATE_X = 0.45; // Legacy FaceDetector fallback only.
+const YAW_CENTER_MAX = 0.25;
+const YAW_TURN_MIN = 0.45;
+const YAW_MOTION_RANGE_MIN = 0.35;
 
 function plausibleFace(candidate, vw, vh) {
   const wNorm = candidate.w / vw;
@@ -1164,6 +1167,42 @@ function calibratedFaceBox(box, vw, vh) {
   };
 }
 
+function pointToPixel(point, vw, vh) {
+  return {
+    x: point.x <= 1 ? point.x * vw : point.x,
+    y: point.y <= 1 ? point.y * vh : point.y,
+  };
+}
+
+function poseFromKeypoints(keypoints, vw, vh) {
+  if (!keypoints || keypoints.length < 3) return null;
+  // MediaPipe FaceDetector keypoints are eyes, nose, mouth, and ear tragions.
+  // Ratios are based on eye distance so pose remains scale-independent.
+  const points = keypoints.map((point) => pointToPixel(point, vw, vh));
+  const eyeA = points[0];
+  const eyeB = points[1];
+  const nose = points[2];
+  const eyeDx = eyeB.x - eyeA.x;
+  const eyeDy = eyeB.y - eyeA.y;
+  const eyeDistance = Math.hypot(eyeDx, eyeDy);
+  if (!Number.isFinite(eyeDistance) || eyeDistance < 1) return null;
+  const eyeCenter = {
+    x: (eyeA.x + eyeB.x) / 2,
+    y: (eyeA.y + eyeB.y) / 2,
+  };
+  const yaw = (nose.x - eyeCenter.x) / eyeDistance;
+  const pose = Math.abs(yaw) <= YAW_CENTER_MAX
+    ? 'center'
+    : yaw <= -YAW_TURN_MIN
+      ? 'right'
+      : yaw >= YAW_TURN_MIN
+        ? 'left'
+        : yaw < 0
+          ? 'lean-right'
+          : 'lean-left';
+  return { yaw, pose };
+}
+
 // True when the box center lies within the target oval. The oval is symmetric
 // about cx=0.5, so the same distance test works in raw and displayed coords.
 function centerInTargetOval(box) {
@@ -1197,11 +1236,13 @@ async function detectFaceFrame(engine) {
       .map((detection) => {
         const rawBox = detectionBox(detection, vw, vh);
         const box = calibratedFaceBox(rawBox, vw, vh);
+        const pose = poseFromKeypoints(detection.keypoints, vw, vh);
         return {
           ...box,
           score: detectionScore(detection),
           detection,
           rawBox,
+          pose,
         };
       });
   } else {
@@ -1224,6 +1265,7 @@ async function detectFaceFrame(engine) {
       w: c.w / vw,
       h: c.h / vh,
       pixelBox: { x: c.x, y: c.y, w: c.w, h: c.h },
+      pose: c.pose || null,
       // Confidence first, then area. This favors real close-up faces while the
       // oval and size/aspect gates reject obvious non-face regions.
       score: c.score * (c.w / vw) * (c.h / vh),
@@ -1320,9 +1362,9 @@ function drawFaceGuide(box, opts = {}) {
   if (opts.arrow === 'left' || opts.arrow === 'right') drawGuideArrow(opts.arrow, color);
 }
 
-// One guided motion phase: prompt the user and wait until the on-screen face
-// crosses the target side. Records every sampled face position into centers/sizes.
-async function runFaceMotionPhase(engine, centers, sizes, opts) {
+// One guided motion phase: prompt the user and wait until keypoint geometry
+// shows the requested head pose. Records sampled box/yaw evidence.
+async function runFaceMotionPhase(engine, centers, sizes, yaws, poses, opts) {
   setStatus(opts.label, 'listening');
   promptNameEl.textContent = opts.label;
   promptHintEl.textContent = opts.hint;
@@ -1333,11 +1375,15 @@ async function runFaceMotionPhase(engine, centers, sizes, opts) {
       if (!box.stale) {
         centers.push(box.cx);
         sizes.push(box.w);
+        if (box.pose) {
+          yaws.push(box.pose.yaw);
+          poses.push(box.pose.pose);
+        }
       }
-      const displayed = displayedFaceX(box);
       promptHintEl.textContent = opts.hint;
       drawFaceGuide(box, { state: 'move', arrow: opts.arrow });
-      if (opts.reached(displayed, box)) {
+      const displayed = displayedFaceX(box);
+      if (!box.stale && opts.reached(box.pose, box, displayed)) {
         hits++;
         if (hits >= 2) return true;
       } else {
@@ -1355,6 +1401,7 @@ async function runFaceMotionPhase(engine, centers, sizes, opts) {
 
 async function runGuidedFaceCheck() {
   const engine = await ensureFaceEngine();
+  const requirePoseLiveness = engine === 'mediapipe';
   faceChecking = true;
   setStartButton('Verification in progress', true);
   promptEmojiEl.textContent = '🙂';
@@ -1362,6 +1409,8 @@ async function runGuidedFaceCheck() {
 
   const centers = [];
   const sizes = [];
+  const yaws = [];
+  const poses = [];
   const startedAt = performance.now();
   const deadline = startedAt + 30000;
   recentFaceBox = null;
@@ -1373,7 +1422,8 @@ async function runGuidedFaceCheck() {
       const dx = Math.abs(displayedFaceX(box) - FACE_TARGET.cx);
       const dy = Math.abs(box.cy - FACE_TARGET.cy);
       const sizeOk = box.w > 0.12 && box.w < 0.7;
-      return dx < box.w * FACE_CENTER_GATE_X && dy < box.h * FACE_CENTER_GATE_Y && sizeOk;
+      const poseOk = !requirePoseLiveness || (box.pose && box.pose.pose === 'center');
+      return dx < box.w * FACE_CENTER_GATE_X && dy < box.h * FACE_CENTER_GATE_Y && sizeOk && poseOk;
     };
 
     // Phase 1: center the face inside the oval.
@@ -1386,13 +1436,19 @@ async function runGuidedFaceCheck() {
       if (box && !box.stale) {
         centers.push(box.cx);
         sizes.push(box.w);
+        if (box.pose) {
+          yaws.push(box.pose.yaw);
+          poses.push(box.pose.pose);
+        }
       }
       const ok = inTarget(box);
       promptHintEl.textContent = !box
         ? 'Show your face'
         : ok
           ? 'Great — hold still'
-          : 'Fit your face inside the oval';
+          : box.pose && box.pose.pose !== 'center'
+            ? 'Face forward, then hold still'
+            : 'Fit your face inside the oval';
       drawFaceGuide(box, { state: ok ? 'good' : 'neutral', arrow: null });
       if (ok) {
         centeredFrames++;
@@ -1407,36 +1463,45 @@ async function runGuidedFaceCheck() {
     }
     progressEl.style.width = '33%';
 
-    // Phase 2: move left (on-screen face crosses to the left zone).
-    const movedLeft = await runFaceMotionPhase(engine, centers, sizes, {
-      label: 'Move left',
-      hint: 'Slowly move your head to the left.',
+    // Phase 2: turn left (keypoint geometry must show a left-facing pose).
+    const movedLeft = await runFaceMotionPhase(engine, centers, sizes, yaws, poses, {
+      label: 'Turn left',
+      hint: 'Slowly turn your head to the left.',
       arrow: 'left',
       deadline,
-      reached: (displayed, box) => displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
+      reached: (pose, box, displayed) => requirePoseLiveness
+        ? pose && pose.pose === 'left'
+        : displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
     });
     if (!movedLeft) {
-      throw new Error('Face motion timed out. Move your head left when prompted, then try again.');
+      throw new Error('Face motion timed out. Turn your head left when prompted, then try again.');
     }
     progressEl.style.width = '66%';
 
-    // Phase 3: move right (on-screen face crosses to the right zone).
-    const movedRight = await runFaceMotionPhase(engine, centers, sizes, {
-      label: 'Move right',
-      hint: 'Now slowly move your head to the right.',
+    // Phase 3: turn right (keypoint geometry must show a right-facing pose).
+    const movedRight = await runFaceMotionPhase(engine, centers, sizes, yaws, poses, {
+      label: 'Turn right',
+      hint: 'Now slowly turn your head to the right.',
       arrow: 'right',
       deadline,
-      reached: (displayed, box) => displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
+      reached: (pose, box, displayed) => requirePoseLiveness
+        ? pose && pose.pose === 'right'
+        : displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
     });
     if (!movedRight) {
-      throw new Error('Face motion timed out. Move your head right when prompted, then try again.');
+      throw new Error('Face motion timed out. Turn your head right when prompted, then try again.');
     }
     progressEl.style.width = '100%';
 
     if (!faceChecking) return;
 
-    if (centers.length < 8) {
+    if (centers.length < 8 || (requirePoseLiveness && yaws.length < 8)) {
       throw new Error('No face was detected. Make sure your face is lit and centered, then try again.');
+    }
+    const yawRange = yaws.length ? Math.max(...yaws) - Math.min(...yaws) : 0;
+    const poseSequenceOk = poses.includes('center') && poses.includes('left') && poses.includes('right');
+    if (requirePoseLiveness && (!poseSequenceOk || yawRange < YAW_MOTION_RANGE_MIN)) {
+      throw new Error('Head turn motion was too small. Face forward, then turn left and right when prompted.');
     }
 
     setStatus('Checking…', 'listening');
@@ -1450,7 +1515,7 @@ async function runGuidedFaceCheck() {
     const result = await apiJson('/api/liveness/verify', {
       durationMs,
       faceFrames: centers.length,
-      motionScore: Math.max(centerMotion, sizeMotion),
+      motionScore: Math.max(yawRange, centerMotion, sizeMotion),
     });
     verificationToken = result.verificationToken;
     await confirmProtectedAction();

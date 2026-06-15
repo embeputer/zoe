@@ -4,7 +4,6 @@
   "private": true,
   "description": "Zoe human verification demo with server-owned challenge state.",
   "scripts": {
-    "dev": "node dev_face_debug.js",
     "start": "node server.js",
     "test": "node test_server.js"
   },

@@ -11,7 +11,6 @@ This is a plain Node/static app:
 - `index.html` is the single page.
 - `styles.css` is the complete UI styling.
 - `test_server.js` is the regression/security test suite.
-- `face-debug.html` + `face-debug.js` are a dev-only camera/model debugger.
 
 ## Run And Test
 
@@ -36,14 +35,6 @@ In this workspace, port `3000` is often busy, so previous work has used:
 env PORT=3001 npm start
 ```
 
-For isolated face detector debugging, use:
-
-```sh
-npm run dev
-```
-
-This starts `dev_face_debug.js`, serves `face-debug.html` (default `http://127.0.0.1:3010/face-debug.html`), opens the browser, and draws raw Blaze detections/keypoints/confidence over the camera feed without running the full verification flow. Use `PORT=3020 npm run dev` to pick another port.
-
 The test suite binds a temporary local HTTP server. In sandboxed Codex sessions, `npm test` may need elevated permission because binding `127.0.0.1` can fail with `EPERM`.
 
 ## Current Product Flow
@@ -67,19 +58,19 @@ Do not reintroduce a fake phone frame. The design is inspired by the card inside
 
 ### Face Motion
 
-Face motion is the default on mobile. It runs cross-browser using MediaPipe Tasks Vision (`@mediapipe/tasks-vision`), imported dynamically in `app.js`. The WASM runtime loads from `cdn.jsdelivr.net`, and the active compatible short-range FaceDetector model is vendored locally at `models/blaze_face_short_range.tflite` and served from the same origin. The Tasks Vision FaceDetector is the active gate because it exposes confidence scores and a conventional bounding box; the browser validates confidence, size/aspect, and target-oval position before counting motion. The older `@mediapipe/face_detection` Solutions build is intentionally avoided because it evaluates strings as JavaScript and would require loosening the CSP. The browser's non-standard `FaceDetector` API is used only as an opportunistic fallback when the MediaPipe runtime cannot load. It is a liveness-style motion check, not identity verification.
+Face motion is the default on mobile. It runs cross-browser using MediaPipe Tasks Vision (`@mediapipe/tasks-vision`), imported dynamically in `app.js`. The WASM runtime loads from `cdn.jsdelivr.net`, and the active compatible short-range FaceDetector model is vendored locally at `models/blaze_face_short_range.tflite` and served from the same origin. The Tasks Vision FaceDetector is the active gate because it exposes confidence scores, a conventional bounding box, and face keypoints; the browser validates confidence, size/aspect, target-oval position, and eye/nose keypoint yaw before counting prompted head turns. The older `@mediapipe/face_detection` Solutions build is intentionally avoided because it evaluates strings as JavaScript and would require loosening the CSP. The browser's non-standard `FaceDetector` API is used only as an opportunistic fallback when the MediaPipe runtime cannot load; it has no keypoints, so only that fallback uses box-motion gates. It is a liveness-style motion check, not identity verification.
 
-The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval on the overlay canvas, then walks the user through center → move left → move right with changing prompt text and a directional arrow. This horizontal sweep produces the motion the server requires. The Zoe app camera starts unmirrored on purpose for both face and hand checks, so detector coordinates, video frames, and overlays all share one coordinate space. Do not re-add `scaleX(-1)`, `ctx.scale(-1, 1)`, or scattered x-flips to the app camera/overlay unless the coordinate mapping is changed and verified in the app and `npm run dev`.
+The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval on the overlay canvas, then walks the user through center → turn left → turn right with changing prompt text and a directional arrow. The app counts keypoint yaw poses (`center`, `left`, `right`) instead of only box translation, then submits yaw-range motion evidence to the server. The Zoe app camera starts unmirrored on purpose for both face and hand checks, so detector coordinates, video frames, and overlays all share one coordinate space. Do not re-add `scaleX(-1)`, `ctx.scale(-1, 1)`, or scattered x-flips to the app camera/overlay unless the coordinate mapping is changed and verified in the app.
 
 Known face-detector findings:
 
-- `models/blaze_face_short_range.tflite` is the compatible active model. The browser debug page has shown it can detect the user's face around ~86-87% confidence.
+- `models/blaze_face_short_range.tflite` is the compatible active model. Prior browser debugging showed it can detect the user's face around ~86-87% confidence.
 - `models/blaze_face_full_range.tflite` was tested and is incompatible with the Tasks FaceDetector graph in this app (`raw_box_tensor ... 2304 vs 896`). Do not reintroduce it unless the graph/model compatibility is proven first.
 - `models/face_landmarker.task` was removed from the active path because the landmarker-only approach could hallucinate a mesh on shoulder/neck/background skin without a usable per-face confidence score.
-- Keep the face logic boring: detector output → one centralized box calibration (`calibratedFaceBox`) → size/oval gates → explicit center/left/right state machine. The default coordinate mode is unmirrored (`displayedFaceX(box) === box.cx`). Do not stack ad hoc keypoint-derived boxes, scattered `1 - box.cx` conversions, or extra draw-only offsets.
-- `calibratedFaceBox` currently shifts the raw Blaze box left by `0.75` raw box widths and up by `0.55` raw box heights, then scales height by `1.02`. If screenshots show drift, tune only the constants in `calibratedFaceBox` in both `app.js` and `face-debug.js`.
+- Keep the face logic boring: detector output → one centralized box calibration (`calibratedFaceBox`) → size/oval gates → eye/nose keypoint yaw → explicit center/left/right state machine. The default coordinate mode is unmirrored (`displayedFaceX(box) === box.cx`). Do not stack ad hoc keypoint-derived boxes, scattered `1 - box.cx` conversions, or extra draw-only offsets.
+- `calibratedFaceBox` currently shifts the raw Blaze box left by `0.75` raw box widths and up by `0.55` raw box heights, then scales height by `1.02`. If screenshots show drift, tune only the constants in `calibratedFaceBox` in `app.js`.
 - Face-box offsets and gates must scale from the detected raw/calibrated box dimensions. Do not add fixed pixel offsets or fixed frame-percentage offsets for box correction, expansion, center acceptance, or motion thresholds; use multipliers such as `box.w * 0.1` or `box.h * 0.1`.
-- `SHOW_FACE_DEBUG_BOX` in `app.js` controls whether the blue box appears in the real app. Prefer `npm run dev` for detailed debugging instead of adding temporary browser-console snippets.
+- `SHOW_FACE_DEBUG_BOX` in `app.js` controls whether the blue box appears in the real app. Keep it disabled for normal product flow.
 
 ### Hand Gestures
 
