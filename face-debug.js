@@ -18,7 +18,7 @@ let lastDetections = 0;
 let lastScore = 0;
 let lastError = '';
 
-const FACE_BOX_SHIFT_X = -1.0;
+const FACE_BOX_SHIFT_X = -0.75;
 const FACE_BOX_SHIFT_Y = -0.55;
 const FACE_BOX_HEIGHT_SCALE = 1.02;
 const FACE_TARGET = { cx: 0.5, cy: 0.46, rx: 0.23, ry: 0.33 };
@@ -29,8 +29,14 @@ const FACE_MIN_ASPECT = 0.55;
 const FACE_MAX_ASPECT = 1.7;
 const FACE_OVAL_SCALE_X = 1.25;
 const FACE_OVAL_SCALE_Y = 0.95;
-const FACE_CENTER_GATE_X = 0.45;
-const FACE_CENTER_GATE_Y = 0.45;
+const FACE_CENTER_GATE_X = 0.75;
+const FACE_CENTER_GATE_Y = 0.75;
+const YAW_CENTER_MAX = 0.25;
+const YAW_TURN_MIN = 0.45;
+const YAW_MOTION_RANGE_MIN = 0.35;
+const POSE_HISTORY_MS = 2500;
+let poseHistory = [];
+let lastPoseSummary = null;
 
 function setStatus(message) {
   statusEl.innerHTML = message;
@@ -112,6 +118,91 @@ function pointToPixel(point, vw, vh) {
   };
 }
 
+function poseFromKeypoints(keypoints, vw, vh) {
+  if (!keypoints || keypoints.length < 3) return null;
+  // MediaPipe FaceDetector keypoints are eyes, nose, mouth, and ear tragions.
+  // Ratios are based on eye distance so pose remains scale-independent.
+  const points = keypoints.map((point) => pointToPixel(point, vw, vh));
+  const eyeA = points[0];
+  const eyeB = points[1];
+  const nose = points[2];
+  const mouth = points[3] || null;
+  const eyeDx = eyeB.x - eyeA.x;
+  const eyeDy = eyeB.y - eyeA.y;
+  const eyeDistance = Math.hypot(eyeDx, eyeDy);
+  if (!Number.isFinite(eyeDistance) || eyeDistance < 1) return null;
+  const eyeCenter = {
+    x: (eyeA.x + eyeB.x) / 2,
+    y: (eyeA.y + eyeB.y) / 2,
+  };
+  const yaw = (nose.x - eyeCenter.x) / eyeDistance;
+  const rollDeg = Math.atan2(eyeDy, eyeDx) * 180 / Math.PI;
+  const pose = Math.abs(yaw) <= YAW_CENTER_MAX
+    ? 'center'
+    : yaw <= -YAW_TURN_MIN
+      ? 'left'
+      : yaw >= YAW_TURN_MIN
+        ? 'right'
+        : yaw < 0
+          ? 'lean-left'
+          : 'lean-right';
+  return { points, eyeA, eyeB, nose, mouth, eyeCenter, eyeDistance, yaw, rollDeg, pose };
+}
+
+function updatePoseHistory(pose, accepted) {
+  const now = performance.now();
+  if (pose) {
+    poseHistory.push({ t: now, yaw: pose.yaw, pose: pose.pose, accepted });
+  }
+  poseHistory = poseHistory.filter((sample) => now - sample.t <= POSE_HISTORY_MS);
+  const usable = poseHistory.filter((sample) => sample.accepted);
+  if (usable.length < 2) {
+    lastPoseSummary = { range: 0, motion: 'collecting', samples: usable.length };
+    return lastPoseSummary;
+  }
+  const yaws = usable.map((sample) => sample.yaw);
+  const minYaw = Math.min(...yaws);
+  const maxYaw = Math.max(...yaws);
+  const range = maxYaw - minYaw;
+  const hasCenter = usable.some((sample) => Math.abs(sample.yaw) <= YAW_CENTER_MAX);
+  const hasLeft = usable.some((sample) => sample.yaw <= -YAW_TURN_MIN);
+  const hasRight = usable.some((sample) => sample.yaw >= YAW_TURN_MIN);
+  const motion = range >= YAW_MOTION_RANGE_MIN && (hasLeft || hasRight)
+    ? hasCenter
+      ? 'pose-motion'
+      : 'turn-held'
+    : 'static';
+  lastPoseSummary = { range, motion, samples: usable.length, hasCenter, hasLeft, hasRight };
+  return lastPoseSummary;
+}
+
+function drawPoseOverlay(pose, box, color) {
+  if (!pose) return;
+  ctx.save();
+  ctx.strokeStyle = 'rgba(120, 220, 255, 0.9)';
+  ctx.fillStyle = 'rgba(120, 220, 255, 0.95)';
+  ctx.lineWidth = 3;
+  ctx.setLineDash([]);
+  ctx.beginPath();
+  ctx.moveTo(pose.eyeA.x, pose.eyeA.y);
+  ctx.lineTo(pose.eyeB.x, pose.eyeB.y);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(pose.eyeCenter.x, pose.eyeCenter.y);
+  ctx.lineTo(pose.nose.x, pose.nose.y);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.arc(pose.eyeCenter.x, pose.eyeCenter.y, 5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = color;
+  ctx.fillText(
+    `pose:${pose.pose} yaw:${pose.yaw.toFixed(2)}`,
+    box.x + 6,
+    Math.min(box.y + box.h + 24, canvasEl.height - 12)
+  );
+  ctx.restore();
+}
+
 async function loadDetector() {
   setStatus('Loading MediaPipe Tasks Vision...');
   const vision = await import(TASKS_VISION_URL);
@@ -177,6 +268,8 @@ function drawDetections(detections, vw, vh) {
     const box = calibratedFaceBox(rawBox, vw, vh);
     const score = detectionScore(detection);
     const gate = appGateState(box, score, vw, vh);
+    const pose = poseFromKeypoints(detection.keypoints, vw, vh);
+    const poseSummary = index === 0 ? updatePoseHistory(pose, gate.accepted) : lastPoseSummary;
     ctx.strokeStyle = '#ff9f1c';
     ctx.fillStyle = '#ff9f1c';
     ctx.setLineDash([10, 8]);
@@ -193,6 +286,7 @@ function drawDetections(detections, vw, vh) {
       box.x + 6,
       Math.max(22, box.y - 8)
     );
+    drawPoseOverlay(pose, box, color);
 
     const gateW = gate.normalized.w * FACE_CENTER_GATE_X * 2 * vw;
     const gateH = gate.normalized.h * FACE_CENTER_GATE_Y * 2 * vh;
@@ -206,6 +300,17 @@ function drawDetections(detections, vw, vh) {
       gateH
     );
     ctx.restore();
+
+    if (index === 0 && poseSummary) {
+      ctx.save();
+      ctx.fillStyle = color;
+      ctx.fillText(
+        `motion:${poseSummary.motion} yawRange:${poseSummary.range.toFixed(2)}`,
+        box.x + 6,
+        Math.min(box.y + box.h + 48, canvasEl.height - 12)
+      );
+      ctx.restore();
+    }
 
     (detection.keypoints || []).forEach((rawPoint, pointIndex) => {
       const point = pointToPixel(rawPoint, vw, vh);
@@ -238,7 +343,11 @@ function loop() {
   frameCount++;
   lastDetections = detections.length;
   lastScore = detections[0] ? detectionScore(detections[0]) : 0;
+  if (!detections.length) updatePoseHistory(null, false);
   drawDetections(detections, vw, vh);
+  const poseStatus = lastPoseSummary
+    ? ` &nbsp; <strong>keypoint motion:</strong> ${lastPoseSummary.motion} (${lastPoseSummary.range.toFixed(2)})`
+    : '';
   setStatus(
     `<strong>frames:</strong> ${frameCount} &nbsp; ` +
     `<strong>detections:</strong> ${lastDetections} &nbsp; ` +
@@ -248,7 +357,8 @@ function loop() {
     `<strong>overlay mirrored:</strong> ${mirrorOverlayToggle.checked ? 'yes' : 'no'}<br>` +
     `<strong>orange:</strong> raw Blaze box &nbsp; <strong>green:</strong> calibrated app box &nbsp; ` +
     `<strong>calibration:</strong> x ${FACE_BOX_SHIFT_X}w, y ${FACE_BOX_SHIFT_Y}h &nbsp; ` +
-    `<strong>app gates:</strong> score/size/aspect/oval/center` +
+    `<strong>app gates:</strong> score/size/aspect/oval/center &nbsp; ` +
+    `<strong>pose:</strong> eye/nose yaw${poseStatus}` +
     (lastError ? `<br><strong>error:</strong> ${lastError}` : '')
   );
   requestAnimationFrame(loop);
