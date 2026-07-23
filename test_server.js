@@ -1,9 +1,16 @@
 const assert = require('assert');
 const crypto = require('crypto');
-const { createServer } = require('./server');
+const { createServer, checkRateLimit, resetRateLimitState, RATE_LIMIT_MAX_PER_IP, computeLivenessSeriesDigest, validateHandLandmarkGeometry } = require('./server');
 
 function request(baseUrl, path, options = {}, cookie) {
   const headers = { ...(options.headers || {}) };
+  if (!headers.Origin) {
+    try {
+      headers.Origin = new URL(baseUrl).origin;
+    } catch {
+      // Tests use a valid baseUrl; ignore parse failures.
+    }
+  }
   if (cookie) headers.Cookie = cookie;
   if (options.body && !headers['Content-Type']) headers['Content-Type'] = 'application/json';
   return fetch(`${baseUrl}${path}`, { ...options, headers }).then(async (res) => {
@@ -27,22 +34,33 @@ function evidence(overrides = {}) {
   };
 }
 
-function validLivenessPhases() {
+function validLivenessPhases(plan) {
+  const motion = plan.slice(1);
   return [
-    { id: 'center_hold', holdJitterRms: 0.002, tortuosity: 1.01, transitionMs: 320, sampleCount: 10 },
-    { id: 'center_to_left', holdJitterRms: 0.003, tortuosity: 1.05, transitionMs: 600, sampleCount: 12 },
-    { id: 'left_to_right', holdJitterRms: 0.0025, tortuosity: 1.04, transitionMs: 550, sampleCount: 11 },
+    { id: plan[0], holdJitterRms: 0.002, tortuosity: 1.01, transitionMs: 320, sampleCount: 10 },
+    { id: motion[0], holdJitterRms: 0.003, tortuosity: 1.05, transitionMs: 600, sampleCount: 12 },
+    { id: motion[1], holdJitterRms: 0.0025, tortuosity: 1.04, transitionMs: 550, sampleCount: 11 },
   ];
 }
 
-function livenessBody(challengeId, overrides = {}) {
+function sampleMotionSeries(plan) {
+  return plan.flatMap((phaseId, index) => ([
+    { p: phaseId, t: index * 200, v: 0.1 + index * 0.02 },
+    { p: phaseId, t: index * 200 + 80, v: 0.12 + index * 0.02 },
+    { p: phaseId, t: index * 200 + 160, v: 0.11 + index * 0.02 },
+  ]));
+}
+
+function livenessBody(challengeId, plan, overrides = {}) {
+  const motionSeries = sampleMotionSeries(plan);
   return {
     challengeId,
     durationMs: 1200,
     faceFrames: 10,
     motionScore: 0.12,
-    phases: validLivenessPhases(),
-    seriesDigest: crypto.randomBytes(32).toString('hex'),
+    phases: validLivenessPhases(plan),
+    motionSeries,
+    seriesDigest: computeLivenessSeriesDigest(challengeId, motionSeries),
     ...overrides,
   };
 }
@@ -91,23 +109,47 @@ async function main() {
     const livenessChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
     assert.strictEqual(livenessChallenge.res.status, 201);
     assert.ok(livenessChallenge.body.challengeId);
+    assert.ok(Array.isArray(livenessChallenge.body.plan));
+    assert.strictEqual(livenessChallenge.body.plan[0], 'center_hold');
+    assert.strictEqual(livenessChallenge.body.plan.length, 3);
 
     const livenessVerified = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
-      body: JSON.stringify(livenessBody(livenessChallenge.body.challengeId)),
+      body: JSON.stringify(livenessBody(livenessChallenge.body.challengeId, livenessChallenge.body.plan)),
     }, cookie);
     assert.strictEqual(livenessVerified.res.status, 200);
     assert.ok(livenessVerified.body.verificationToken);
 
+    const wrongPlanPhases = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const issuedPlan = wrongPlanPhases.body.plan;
+    const wrongSeriesBody = livenessBody(wrongPlanPhases.body.challengeId, issuedPlan);
+    const invalidPhase = issuedPlan.includes('center_to_left') ? 'center_to_right' : 'center_to_left';
+    wrongSeriesBody.motionSeries = wrongSeriesBody.motionSeries.map((sample, index) => (
+      index === 0 ? { ...sample, p: invalidPhase } : sample
+    ));
+    wrongSeriesBody.seriesDigest = computeLivenessSeriesDigest(
+      wrongPlanPhases.body.challengeId,
+      wrongSeriesBody.motionSeries
+    );
+    const wrongPlan = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(wrongSeriesBody),
+    }, cookie);
+    assert.strictEqual(wrongPlan.res.status, 400);
+
     const smoothChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const smoothPlan = smoothChallenge.body.plan;
+    const smoothSeries = smoothPlan.flatMap((phaseId, index) => ([
+      { p: phaseId, t: index * 300, v: 0.5 },
+      { p: phaseId, t: index * 300 + 100, v: 0.5 },
+      { p: phaseId, t: index * 300 + 200, v: 0.5 },
+    ]));
     const smoothStub = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
-      body: JSON.stringify(livenessBody(smoothChallenge.body.challengeId, {
-        phases: [
-          { id: 'center_hold', holdJitterRms: 0, tortuosity: 1, transitionMs: 300, sampleCount: 10 },
-          { id: 'center_to_left', holdJitterRms: 0, tortuosity: 1, transitionMs: 500, sampleCount: 10 },
-          { id: 'left_to_right', holdJitterRms: 0, tortuosity: 1, transitionMs: 500, sampleCount: 10 },
-        ],
+      body: JSON.stringify(livenessBody(smoothChallenge.body.challengeId, smoothPlan, {
+        motionSeries: smoothSeries,
+        seriesDigest: computeLivenessSeriesDigest(smoothChallenge.body.challengeId, smoothSeries),
+        phases: validLivenessPhases(smoothPlan),
       })),
     }, cookie);
     assert.strictEqual(smoothStub.res.status, 400);
@@ -145,6 +187,61 @@ async function main() {
     }, cookie);
     assert.strictEqual(wrongStep.res.status, 400);
 
+    const badThreeGeometry = validateHandLandmarkGeometry('three', [{
+      hands: [[
+        [0.5, 0.7, 0],
+        [0.42, 0.68, 0],
+        [0.48, 0.70, 0],
+        [0.46, 0.67, 0],
+        [0.48, 0.62, 0],
+        [0.48, 0.7, 0],
+        [0.52, 0.62, 0],
+        [0.52, 0.7, 0],
+        [0.56, 0.62, 0],
+        [0.56, 0.7, 0],
+        [0.6, 0.64, 0],
+        [0.6, 0.66, 0],
+      ]],
+    }]);
+    assert.ok(badThreeGeometry);
+
+    const goodThreeGeometry = validateHandLandmarkGeometry('three', [{
+      hands: [[
+        [0.5, 0.75, 0],
+        [0.42, 0.72, 0],
+        [0.48, 0.68, 0],
+        [0.45, 0.71, 0],
+        [0.48, 0.62, 0],
+        [0.48, 0.5, 0],
+        [0.52, 0.62, 0],
+        [0.52, 0.48, 0],
+        [0.56, 0.62, 0],
+        [0.56, 0.49, 0],
+        [0.6, 0.66, 0],
+        [0.6, 0.68, 0],
+      ]],
+    }]);
+    assert.strictEqual(goodThreeGeometry, null);
+
+    // Thumb folded for "three" uses index MCP, not index PIP (pip-only threshold falsely extends thumb).
+    const thumbMcpThreeGeometry = validateHandLandmarkGeometry('three', [{
+      hands: [[
+        [0.5, 0.75, 0],
+        [0.35, 0.72, 0],
+        [0.48, 0.70, 0],
+        [0.40, 0.735, 0],
+        [0.48, 0.62, 0],
+        [0.48, 0.5, 0],
+        [0.52, 0.62, 0],
+        [0.52, 0.48, 0],
+        [0.56, 0.62, 0],
+        [0.56, 0.49, 0],
+        [0.6, 0.66, 0],
+        [0.6, 0.68, 0],
+      ]],
+    }]);
+    assert.strictEqual(thumbMcpThreeGeometry, null);
+
     let finalToken = null;
     for (let i = 0; i < 3; i++) {
       const step = challenge.step;
@@ -175,6 +272,66 @@ async function main() {
       body: JSON.stringify({ verificationToken: finalToken }),
     }, cookie);
     assert.strictEqual(replay.res.status, 409);
+
+    const geometryChallenge = await request(baseUrl, '/api/challenge', { method: 'POST' }, cookie);
+    cookie = geometryChallenge.cookie;
+    let geometryStepChallenge = geometryChallenge.body;
+    let guard = 0;
+    while (geometryStepChallenge.step && geometryStepChallenge.step.id !== 'three' && guard < 3) {
+      const skip = await request(baseUrl, '/api/step', {
+        method: 'POST',
+        body: JSON.stringify({
+          challengeId: geometryStepChallenge.challengeId,
+          stepIndex: geometryStepChallenge.step.index,
+          gestureId: geometryStepChallenge.step.id,
+          evidence: evidence({ landmarkDigest: `skip-${geometryStepChallenge.step.id}` }),
+        }),
+      }, cookie);
+      assert.strictEqual(skip.res.status, 200);
+      geometryStepChallenge = skip.body;
+      guard += 1;
+    }
+    if (geometryStepChallenge.step && geometryStepChallenge.step.id === 'three') {
+      const badThreeStep = await request(baseUrl, '/api/step', {
+        method: 'POST',
+        body: JSON.stringify({
+          challengeId: geometryStepChallenge.challengeId,
+          stepIndex: geometryStepChallenge.step.index,
+          gestureId: 'three',
+          evidence: {
+            ...evidence(),
+            landmarkSamples: [{
+              hands: [[
+                [0.5, 0.75, 0],
+                [0.42, 0.72, 0],
+                [0.48, 0.70, 0],
+                [0.46, 0.71, 0],
+                [0.48, 0.62, 0],
+                [0.48, 0.7, 0],
+                [0.52, 0.62, 0],
+                [0.52, 0.7, 0],
+                [0.56, 0.62, 0],
+                [0.56, 0.7, 0],
+                [0.6, 0.64, 0],
+                [0.6, 0.66, 0],
+              ]],
+            }],
+          },
+        }),
+      }, cookie);
+      assert.strictEqual(badThreeStep.res.status, 400);
+    }
+
+    resetRateLimitState();
+    const testIp = 'rate-limit-test-ip';
+    for (let i = 0; i < RATE_LIMIT_MAX_PER_IP; i += 1) {
+      const allowed = checkRateLimit(testIp, null);
+      assert.strictEqual(allowed.limited, false, `request ${i + 1} should be allowed`);
+    }
+    const limited = checkRateLimit(testIp, null);
+    assert.strictEqual(limited.limited, true);
+    assert.strictEqual(limited.scope, 'ip');
+    resetRateLimitState();
 
     console.log('server security regression tests passed');
   } finally {

@@ -60,7 +60,7 @@ Do not reintroduce a fake phone frame. The design is inspired by the card inside
 
 Face motion is the default on mobile. It runs cross-browser using MediaPipe Tasks Vision (`@mediapipe/tasks-vision`), imported dynamically in `app.js`. The WASM runtime loads from `cdn.jsdelivr.net`, and the active compatible short-range FaceDetector model is vendored locally at `models/blaze_face_short_range.tflite` and served from the same origin. The Tasks Vision FaceDetector is the active gate because it exposes confidence scores, a conventional bounding box, and face keypoints; the browser validates confidence, size/aspect, target-oval position, and eye/nose keypoint yaw before counting prompted head turns. The older `@mediapipe/face_detection` Solutions build is intentionally avoided because it evaluates strings as JavaScript and would require loosening the CSP. The browser's non-standard `FaceDetector` API is used only as an opportunistic fallback when the MediaPipe runtime cannot load; it has no keypoints, so only that fallback uses box-motion gates. It is a liveness-style motion check, not identity verification.
 
-The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval on the overlay canvas, then walks the user through center → turn left → turn right with changing prompt text and a directional arrow. The app counts keypoint yaw poses (`center`, `left`, `right`) instead of only box translation, then submits yaw-range motion evidence plus phase-tagged micro-jitter/tortuosity summaries and a quantized series digest to the server. These heuristics catch obvious linear synthetic motion; they do not stop virtual cameras or deepfakes. The Zoe app camera starts unmirrored on purpose for both face and hand checks, so detector coordinates, video frames, and overlays all share one coordinate space. Do not re-add `scaleX(-1)`, `ctx.scale(-1, 1)`, or scattered x-flips to the app camera/overlay unless the coordinate mapping is changed and verified in the app.
+The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval on the overlay canvas, then follows the server-issued liveness plan from `POST /api/liveness/challenge` (always `center_hold`, then either `center_to_left` → `left_to_right` or `center_to_right` → `right_to_left`). The app counts keypoint yaw poses (`center`, `left`, `right`) instead of only box translation, then submits yaw-range motion evidence plus phase-tagged micro-jitter/tortuosity summaries, a bounded `motionSeries`, and a `seriesDigest` bound to `challengeId`. Optional quantized mouth/ear span samples may be included when Blaze keypoints are available.
 
 Known face-detector findings:
 
@@ -81,6 +81,7 @@ Important gesture details:
 - `three` means index, middle, and ring fingers up; thumb and pinky folded.
 - `Hand Hearts` requires both hands. It is not a pinch.
 - MediaPipe is configured with `maxNumHands: 2` because hand hearts need two hands.
+- Hand step evidence may include bounded `landmarkSamples`; the server applies cheap geometry checks for gestures like `three` and `ily` when samples are present.
 
 ### Zoe ID
 

@@ -604,14 +604,20 @@ function handMotionLooksSynthetic(stats) {
   return stats.holdJitterRms < HAND_MOTION_HOLD_JITTER_MIN && stats.formingMotion < HAND_MOTION_FORMING_MIN;
 }
 
+// Packed order must match server.js hand evidence indices for geometry checks.
+const HAND_EVIDENCE_LM = [
+  LM.wrist, LM.thumbCmc, LM.indexMcp, LM.thumbTip,
+  LM.indexPip, LM.indexTip, LM.middlePip, LM.middleTip,
+  LM.ringPip, LM.ringTip, LM.pinkyPip, LM.pinkyTip,
+];
+
 function sampleLandmarks(hands, detectedGesture) {
   if (landmarkSamples.length >= 24) return;
-  const selected = [LM.wrist, LM.thumbTip, LM.indexTip, LM.middleTip, LM.ringTip, LM.pinkyTip];
   landmarkSamples.push({
     t: Math.round(performance.now() - stepStartedAt),
     g: detectedGesture,
     hands: hands.slice(0, 2).map((lm) =>
-      selected.map((idx) => [quantize(lm[idx].x), quantize(lm[idx].y), quantize(lm[idx].z)])
+      HAND_EVIDENCE_LM.map((idx) => [quantize(lm[idx].x), quantize(lm[idx].y), quantize(lm[idx].z)])
     ),
   });
 }
@@ -629,6 +635,10 @@ async function digestString(value) {
   const input = new TextEncoder().encode(value);
   const hash = await crypto.subtle.digest('SHA-256', input);
   return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function livenessSeriesDigest(challengeId, motionSeries) {
+  return digestString(`${challengeId}\n${JSON.stringify(motionSeries)}`);
 }
 
 async function buildEvidence() {
@@ -655,6 +665,7 @@ async function buildEvidence() {
     frameCount: framesSinceStep,
     holdFrames: holdCounter,
     landmarkDigest: await digestString(JSON.stringify(landmarkSamples)),
+    landmarkSamples: landmarkSamples.slice(0, 24),
     motionDigest: await digestString(JSON.stringify(motionSamples)),
     motionStats,
   };
@@ -1290,6 +1301,7 @@ async function detectFaceFrame(engine) {
       h: c.h / vh,
       pixelBox: { x: c.x, y: c.y, w: c.w, h: c.h },
       pose: c.pose || null,
+      keypoints: c.detection?.keypoints || null,
       // Confidence first, then area. This favors real close-up faces while the
       // oval and size/aspect gates reject obvious non-face regions.
       score: c.score * (c.w / vw) * (c.h / vh),
@@ -1386,6 +1398,67 @@ function drawFaceGuide(box, opts = {}) {
   if (opts.arrow === 'left' || opts.arrow === 'right') drawGuideArrow(opts.arrow, color);
 }
 
+function quantizedFaceShapeExtras(keypoints) {
+  if (!keypoints || keypoints.length < 6) return {};
+  const mouth = keypoints[3];
+  const earA = keypoints[4];
+  const earB = keypoints[5];
+  const nose = keypoints[2];
+  if (!mouth || !earA || !earB || !nose) return {};
+  const mouthW = Math.hypot(mouth.x - nose.x, mouth.y - nose.y);
+  const earSpan = Math.hypot(earA.x - earB.x, earA.y - earB.y);
+  return { m: quantize(mouthW), e: quantize(earSpan) };
+}
+
+function pushFaceSeriesSample(phaseSeries, phase, flowStartedAt, motionValue, keypoints) {
+  if (phaseSeries.length >= 120) return;
+  const sample = {
+    phase,
+    t: Math.round(performance.now() - flowStartedAt),
+    v: quantize(motionValue),
+  };
+  Object.assign(sample, quantizedFaceShapeExtras(keypoints));
+  phaseSeries.push(sample);
+}
+
+function faceMotionPhaseConfig(phaseId, requirePoseLiveness) {
+  const configs = {
+    center_to_left: {
+      label: 'Turn left',
+      hint: 'Slowly turn your head to the left.',
+      arrow: 'left',
+      reached: (pose, box, displayed) => requirePoseLiveness
+        ? pose && pose.pose === 'left'
+        : displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
+    },
+    center_to_right: {
+      label: 'Turn right',
+      hint: 'Slowly turn your head to the right.',
+      arrow: 'right',
+      reached: (pose, box, displayed) => requirePoseLiveness
+        ? pose && pose.pose === 'right'
+        : displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
+    },
+    left_to_right: {
+      label: 'Turn right',
+      hint: 'Now slowly turn your head to the right.',
+      arrow: 'right',
+      reached: (pose, box, displayed) => requirePoseLiveness
+        ? pose && pose.pose === 'right'
+        : displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
+    },
+    right_to_left: {
+      label: 'Turn left',
+      hint: 'Now slowly turn your head to the left.',
+      arrow: 'left',
+      reached: (pose, box, displayed) => requirePoseLiveness
+        ? pose && pose.pose === 'left'
+        : displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
+    },
+  };
+  return configs[phaseId] || null;
+}
+
 // One guided motion phase: prompt the user and wait until keypoint geometry
 // shows the requested head pose. Records sampled box/yaw evidence.
 async function runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeries, opts) {
@@ -1405,11 +1478,7 @@ async function runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeri
         }
         if (opts.phase && phaseSeries.length < 120) {
           const motionValue = opts.motionValue(box);
-          phaseSeries.push({
-            phase: opts.phase,
-            t: Math.round(performance.now() - opts.flowStartedAt),
-            v: quantize(motionValue),
-          });
+          pushFaceSeriesSample(phaseSeries, opts.phase, opts.flowStartedAt, motionValue, box.keypoints);
         }
       }
       promptHintEl.textContent = opts.hint;
@@ -1438,6 +1507,9 @@ async function runGuidedFaceCheck() {
   const motionValue = (box) => (requirePoseLiveness && box.pose ? box.pose.yaw : box.cx);
 
   const livenessChallenge = await apiJson('/api/liveness/challenge');
+  const motionPlan = Array.isArray(livenessChallenge.plan) && livenessChallenge.plan.length >= 3
+    ? livenessChallenge.plan
+    : ['center_hold', 'center_to_left', 'left_to_right'];
   faceChecking = true;
   setStartButton('Verification in progress', true);
   promptEmojiEl.textContent = '🙂';
@@ -1478,11 +1550,7 @@ async function runGuidedFaceCheck() {
           poses.push(box.pose.pose);
         }
         if (centeredFrames > 0 && phaseSeries.length < 120) {
-          phaseSeries.push({
-            phase: 'center_hold',
-            t: Math.round(performance.now() - startedAt),
-            v: quantize(motionValue(box)),
-          });
+          pushFaceSeriesSample(phaseSeries, 'center_hold', startedAt, motionValue(box), box.keypoints);
         }
       }
       const ok = inTarget(box);
@@ -1505,43 +1573,29 @@ async function runGuidedFaceCheck() {
     if (centeredFrames < 6) {
       throw new Error('Face was not centered in the oval. Center your face and try again.');
     }
-    progressEl.style.width = '33%';
+    progressEl.style.width = `${Math.round(100 / motionPlan.length)}%`;
 
-    // Phase 2: turn left (keypoint geometry must show a left-facing pose).
-    const movedLeft = await runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeries, {
-      label: 'Turn left',
-      hint: 'Slowly turn your head to the left.',
-      arrow: 'left',
-      deadline,
-      flowStartedAt: startedAt,
-      phase: 'center_to_left',
-      motionValue,
-      reached: (pose, box, displayed) => requirePoseLiveness
-        ? pose && pose.pose === 'left'
-        : displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
-    });
-    if (!movedLeft) {
-      throw new Error('Face motion timed out. Turn your head left when prompted, then try again.');
+    for (let step = 1; step < motionPlan.length; step++) {
+      const phaseId = motionPlan[step];
+      const phaseUi = faceMotionPhaseConfig(phaseId, requirePoseLiveness);
+      if (!phaseUi) {
+        throw new Error('Face check could not start. Refresh and try again.');
+      }
+      const moved = await runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeries, {
+        label: phaseUi.label,
+        hint: phaseUi.hint,
+        arrow: phaseUi.arrow,
+        deadline,
+        flowStartedAt: startedAt,
+        phase: phaseId,
+        motionValue,
+        reached: phaseUi.reached,
+      });
+      if (!moved) {
+        throw new Error(`Face motion timed out. ${phaseUi.hint} Then try again.`);
+      }
+      progressEl.style.width = `${Math.round(((step + 1) / motionPlan.length) * 100)}%`;
     }
-    progressEl.style.width = '66%';
-
-    // Phase 3: turn right (keypoint geometry must show a right-facing pose).
-    const movedRight = await runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeries, {
-      label: 'Turn right',
-      hint: 'Now slowly turn your head to the right.',
-      arrow: 'right',
-      deadline,
-      flowStartedAt: startedAt,
-      phase: 'left_to_right',
-      motionValue,
-      reached: (pose, box, displayed) => requirePoseLiveness
-        ? pose && pose.pose === 'right'
-        : displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
-    });
-    if (!movedRight) {
-      throw new Error('Face motion timed out. Turn your head right when prompted, then try again.');
-    }
-    progressEl.style.width = '100%';
 
     if (!faceChecking) return;
 
@@ -1554,19 +1608,11 @@ async function runGuidedFaceCheck() {
       throw new Error('Head turn motion was too small. Face forward, then turn left and right when prompted.');
     }
 
-    const phaseBuckets = {
-      center_hold: [],
-      center_to_left: [],
-      left_to_right: [],
-    };
+    const phaseBuckets = Object.fromEntries(motionPlan.map((id) => [id, []]));
     for (const sample of phaseSeries) {
       if (phaseBuckets[sample.phase]) phaseBuckets[sample.phase].push(sample);
     }
-    const phases = [
-      summarizeLivenessPhase('center_hold', phaseBuckets.center_hold),
-      summarizeLivenessPhase('center_to_left', phaseBuckets.center_to_left),
-      summarizeLivenessPhase('left_to_right', phaseBuckets.left_to_right),
-    ];
+    const phases = motionPlan.map((id) => summarizeLivenessPhase(id, phaseBuckets[id]));
     const livenessError = evaluateFaceMotionLiveness(phases, { legacy: legacyEngine });
     if (livenessError) throw new Error(livenessError);
 
@@ -1578,18 +1624,20 @@ async function runGuidedFaceCheck() {
     const durationMs = Math.min(15000, Math.max(900, Math.round(performance.now() - startedAt)));
     const centerMotion = Math.max(...centers) - Math.min(...centers);
     const sizeMotion = Math.max(...sizes) - Math.min(...sizes);
-    const digestPayload = phaseSeries.map((sample) => ({
-      p: sample.phase,
-      t: sample.t,
-      v: sample.v,
-    }));
-    const seriesDigest = await digestString(JSON.stringify(digestPayload));
+    const motionSeries = phaseSeries.map((sample) => {
+      const entry = { p: sample.phase, t: sample.t, v: sample.v };
+      if (Number.isFinite(sample.m)) entry.m = sample.m;
+      if (Number.isFinite(sample.e)) entry.e = sample.e;
+      return entry;
+    });
+    const seriesDigest = await livenessSeriesDigest(livenessChallenge.challengeId, motionSeries);
     const result = await apiJson('/api/liveness/verify', {
       challengeId: livenessChallenge.challengeId,
       durationMs,
       faceFrames: centers.length,
       motionScore: Math.max(yawRange, centerMotion, sizeMotion),
       phases,
+      motionSeries,
       seriesDigest,
       legacyEngine,
     });

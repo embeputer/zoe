@@ -5,6 +5,37 @@ const path = require('path');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+const REQUIRE_SECRET = IS_PRODUCTION || process.env.ZOE_REQUIRE_SECRET === '1';
+const LOG_VERIFICATION_FAILURES = process.env.ZOE_LOG_VERIFICATION_FAILURES === '1';
+const RATE_LIMIT_WINDOW_MS = Number(process.env.ZOE_RATE_LIMIT_WINDOW_MS || 60_000);
+const RATE_LIMIT_MAX_PER_IP = Number(process.env.ZOE_RATE_LIMIT_MAX_PER_IP || 120);
+const RATE_LIMIT_MAX_PER_SESSION = Number(process.env.ZOE_RATE_LIMIT_MAX_PER_SESSION || 0);
+const SESSION_IDLE_TTL_MS = Number(process.env.ZOE_SESSION_IDLE_TTL_MS || 60 * 60 * 1000);
+const SWEEP_MIN_INTERVAL_MS = Number(process.env.ZOE_SWEEP_INTERVAL_MS || 30_000);
+const DEFAULT_ALLOWED_ORIGINS = [
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  'http://localhost:3000',
+  'http://localhost:3001',
+];
+const ALLOWED_ORIGINS = (process.env.ZOE_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((entry) => entry.trim())
+  .filter(Boolean);
+const ALLOWED_ORIGIN_SET = new Set(ALLOWED_ORIGINS.length ? ALLOWED_ORIGINS : DEFAULT_ALLOWED_ORIGINS);
+const STATE_CHANGING_POST_PATHS = new Set([
+  '/api/challenge',
+  '/api/step',
+  '/api/liveness/challenge',
+  '/api/liveness/verify',
+  '/api/passkey/register/options',
+  '/api/passkey/register/verify',
+  '/api/passkey/auth/options',
+  '/api/passkey/auth/verify',
+  '/api/passkey/reset',
+  '/api/protected-action',
+]);
 const TOKEN_TTL_MS = 2 * 60 * 1000;
 const CHALLENGE_TTL_MS = 90 * 1000;
 const MIN_STEP_DURATION_MS = 180;
@@ -20,11 +51,30 @@ const LIVENESS_SYNTHETIC_JITTER_MAX = 0.00015;
 const LIVENESS_SYNTHETIC_TORTUOSITY_MAX = 1.003;
 const HAND_FORMING_VAR_MIN = 1e-7;
 const HAND_HOLD_JITTER_MIN = 1e-5;
+const MAX_LANDMARK_SAMPLES = 24;
+const MAX_MOTION_SERIES = 120;
+const LIVENESS_PLAN_LEFT_FIRST = ['center_hold', 'center_to_left', 'left_to_right'];
+const LIVENESS_PLAN_RIGHT_FIRST = ['center_hold', 'center_to_right', 'right_to_left'];
 const MAX_BODY_BYTES = 32 * 1024;
 const PASSKEY_CHALLENGE_TTL_MS = 2 * 60 * 1000;
 const APP_NAME = 'Zoe';
 const COOKIE_NAME = 'zoe_sid';
-const SECRET = process.env.ZOE_SECRET || process.env.REALHANDS_SECRET || crypto.randomBytes(32).toString('hex');
+
+function resolveSecret() {
+  const fromEnv = process.env.ZOE_SECRET || process.env.REALHANDS_SECRET;
+  if (fromEnv) return fromEnv;
+  if (REQUIRE_SECRET) {
+    console.error('ZOE_SECRET is required when NODE_ENV=production or ZOE_REQUIRE_SECRET=1.');
+    process.exit(1);
+  }
+  if (!resolveSecret.warned) {
+    console.warn('Zoe: using an ephemeral ZOE_SECRET; set ZOE_SECRET for stable tokens across restarts.');
+    resolveSecret.warned = true;
+  }
+  return crypto.randomBytes(32).toString('hex');
+}
+
+const SECRET = resolveSecret();
 
 const GESTURES = [
   { id: 'wave', name: 'Wave', emoji: '👋', hint: 'Open hand, move it side to side.' },
@@ -42,9 +92,140 @@ const GESTURES = [
 const sessions = new Map();
 const challenges = new Map();
 const usedTokenDigests = new Set();
+const rateLimitByIp = new Map();
+const rateLimitBySession = new Map();
+let lastSweepAt = 0;
 
 function now() {
   return Date.now();
+}
+
+function clientIp(req) {
+  return req.socket?.remoteAddress || 'unknown';
+}
+
+function originAllowed(origin) {
+  if (typeof origin !== 'string' || !origin) return false;
+  const normalized = origin.endsWith('/') ? origin.slice(0, -1) : origin;
+  if (ALLOWED_ORIGIN_SET.has(origin) || ALLOWED_ORIGIN_SET.has(normalized)) return true;
+  if (!IS_PRODUCTION) {
+    try {
+      const url = new URL(normalized);
+      return url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost');
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+function validateStateChangingOrigin(req) {
+  const originHeader = req.headers.origin;
+  const refererHeader = req.headers.referer;
+  let candidate = typeof originHeader === 'string' && originHeader ? originHeader : null;
+  if (!candidate && typeof refererHeader === 'string' && refererHeader) {
+    try {
+      candidate = new URL(refererHeader).origin;
+    } catch {
+      candidate = null;
+    }
+  }
+  if (candidate && originAllowed(candidate)) return { ok: true };
+  if (!IS_PRODUCTION) {
+    if (!candidate) return { ok: true };
+  }
+  if (!candidate) return { ok: false, error: 'Missing Origin or Referer header.' };
+  return { ok: false, error: 'Origin is not allowed.' };
+}
+
+function checkRateLimit(ip, sessionId) {
+  const t = now();
+  let ipBucket = rateLimitByIp.get(ip);
+  if (!ipBucket || t >= ipBucket.resetAt) {
+    ipBucket = { count: 0, resetAt: t + RATE_LIMIT_WINDOW_MS };
+    rateLimitByIp.set(ip, ipBucket);
+  }
+  ipBucket.count += 1;
+  if (ipBucket.count > RATE_LIMIT_MAX_PER_IP) {
+    return { limited: true, scope: 'ip' };
+  }
+
+  if (RATE_LIMIT_MAX_PER_SESSION > 0 && sessionId) {
+    let sessionBucket = rateLimitBySession.get(sessionId);
+    if (!sessionBucket || t >= sessionBucket.resetAt) {
+      sessionBucket = { count: 0, resetAt: t + RATE_LIMIT_WINDOW_MS };
+      rateLimitBySession.set(sessionId, sessionBucket);
+    }
+    sessionBucket.count += 1;
+    if (sessionBucket.count > RATE_LIMIT_MAX_PER_SESSION) {
+      return { limited: true, scope: 'session' };
+    }
+  }
+
+  return { limited: false };
+}
+
+function resetRateLimitState() {
+  rateLimitByIp.clear();
+  rateLimitBySession.clear();
+}
+
+function logVerificationFailure(reasonCode, route) {
+  if (!LOG_VERIFICATION_FAILURES) return;
+  console.log(JSON.stringify({ event: 'verification_failure', reason: reasonCode, route }));
+}
+
+function sweepExpiredState(force = false) {
+  const t = now();
+  if (!force && t - lastSweepAt < SWEEP_MIN_INTERVAL_MS) return;
+  lastSweepAt = t;
+
+  for (const [challengeId, challenge] of challenges) {
+    const expired = t > challenge.expiresAt;
+    const staleConsumed = challenge.consumedAt && t - challenge.consumedAt > CHALLENGE_TTL_MS;
+    if (expired || staleConsumed) challenges.delete(challengeId);
+  }
+
+  for (const [sid, session] of sessions) {
+    if (t - session.lastSeenAt > SESSION_IDLE_TTL_MS) {
+      sessions.delete(sid);
+      continue;
+    }
+    for (const [digest, payload] of session.issuedTokens) {
+      if (t > payload.exp) session.issuedTokens.delete(digest);
+    }
+    if (session.passkeyRegisterChallenge && t - session.passkeyRegisterChallenge.createdAt > PASSKEY_CHALLENGE_TTL_MS) {
+      session.passkeyRegisterChallenge = null;
+    }
+    if (session.passkeyAuthChallenge && t - session.passkeyAuthChallenge.createdAt > PASSKEY_CHALLENGE_TTL_MS) {
+      session.passkeyAuthChallenge = null;
+    }
+    if (session.livenessChallenge && t > session.livenessChallenge.expiresAt) {
+      session.livenessChallenge = null;
+    }
+  }
+}
+
+function enforcePostSecurity(req, res, pathname, session) {
+  if (req.method !== 'POST' || !STATE_CHANGING_POST_PATHS.has(pathname)) return true;
+
+  const originCheck = validateStateChangingOrigin(req);
+  if (!originCheck.ok) {
+    logVerificationFailure('origin_rejected', pathname);
+    sendJson(res, 403, { error: originCheck.error });
+    return false;
+  }
+
+  const rateLimit = checkRateLimit(clientIp(req), session.id);
+  if (rateLimit.limited) {
+    sendJson(res, 429, {
+      error: 'Too many requests. Please slow down and try again.',
+      rateLimitScope: rateLimit.scope,
+    });
+    return false;
+  }
+
+  return true;
 }
 
 function randomId(bytes = 24) {
@@ -230,7 +411,190 @@ function validateEvidence(challenge, body) {
     }
   }
 
+  const landmarkSamples = evidence.landmarkSamples;
+  if (landmarkSamples !== undefined) {
+    const geometryError = validateHandLandmarkGeometry(expectedGesture, landmarkSamples);
+    if (geometryError) return geometryError;
+  }
+
   challenge.evidenceDigests.add(digest);
+  return null;
+}
+
+function createLivenessPlan() {
+  return crypto.randomInt(2) === 0 ? [...LIVENESS_PLAN_LEFT_FIRST] : [...LIVENESS_PLAN_RIGHT_FIRST];
+}
+
+function computeLivenessSeriesDigest(challengeId, motionSeries) {
+  return crypto.createHash('sha256').update(`${challengeId}\n${JSON.stringify(motionSeries)}`).digest('hex');
+}
+
+function validateMotionSeriesAgainstPlan(motionSeries, plan) {
+  if (!Array.isArray(plan) || plan.length < 3) return 'Face liveness plan is invalid.';
+  const allowed = new Set(plan);
+  for (const sample of motionSeries) {
+    if (!sample || typeof sample.p !== 'string' || !allowed.has(sample.p)) {
+      return 'Face motion series does not match the issued challenge.';
+    }
+  }
+  return null;
+}
+
+// Packed hand landmarks from the client (see HAND_EVIDENCE_LM in app.js).
+const H = {
+  wrist: 0,
+  thumbCmc: 1,
+  indexMcp: 2,
+  thumbTip: 3,
+  indexPip: 4,
+  indexTip: 5,
+  middlePip: 6,
+  middleTip: 7,
+  ringPip: 8,
+  ringTip: 9,
+  pinkyPip: 10,
+  pinkyTip: 11,
+};
+const HAND_EVIDENCE_LM_COUNT = 12;
+
+function packedThumbIpY(hand) {
+  const cmcY = hand[H.thumbCmc][1];
+  const tipY = hand[H.thumbTip][1];
+  return cmcY + (tipY - cmcY) * 0.5;
+}
+
+function dist2dLandmark(a, b) {
+  const dx = a[0] - b[0];
+  const dy = a[1] - b[1];
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+function dist3dLandmark(a, b) {
+  const dx = a[0] - b[0];
+  const dy = a[1] - b[1];
+  const dz = (a[2] || 0) - (b[2] || 0);
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function fingerExtendedPacked(hand, tipIdx, pipIdx) {
+  return hand[tipIdx][1] < hand[pipIdx][1] - 0.02;
+}
+
+function thumbExtendedPacked(hand) {
+  const tip = hand[H.thumbTip];
+  const cmc = hand[H.thumbCmc];
+  const idxMcpY = hand[H.indexMcp][1];
+  const ipY = packedThumbIpY(hand);
+  const sideExtent = Math.abs(tip[0] - cmc[0]) > 0.10;
+  const tipNotFolded = tip[1] < idxMcpY + 0.02;
+  const ipAboveBase = ipY < cmc[1] + 0.05;
+  return sideExtent && tipNotFolded && ipAboveBase;
+}
+
+function handMatchesThree(hand) {
+  if (!Array.isArray(hand) || hand.length < HAND_EVIDENCE_LM_COUNT) return false;
+  const index = fingerExtendedPacked(hand, H.indexTip, H.indexPip);
+  const middle = fingerExtendedPacked(hand, H.middleTip, H.middlePip);
+  const ring = fingerExtendedPacked(hand, H.ringTip, H.ringPip);
+  const pinky = fingerExtendedPacked(hand, H.pinkyTip, H.pinkyPip);
+  const thumb = thumbExtendedPacked(hand);
+  return !thumb && index && middle && ring && !pinky;
+}
+
+function handsMatchHeart(hands) {
+  if (!Array.isArray(hands) || hands.length < 2) return false;
+  for (let i = 0; i < hands.length; i++) {
+    for (let j = i + 1; j < hands.length; j++) {
+      const left = hands[i];
+      const right = hands[j];
+      if (!left || !right || left.length < HAND_EVIDENCE_LM_COUNT || right.length < HAND_EVIDENCE_LM_COUNT) continue;
+      const thumbTipsTouch = dist3dLandmark(left[H.thumbTip], right[H.thumbTip]) < 0.10;
+      const indexTipsTouch = dist3dLandmark(left[H.indexTip], right[H.indexTip]) < 0.10;
+      const wristsSeparated = dist3dLandmark(left[H.wrist], right[H.wrist]) > 0.12;
+      const leftFingerGap = dist3dLandmark(left[H.thumbTip], left[H.indexTip]) > 0.05;
+      const rightFingerGap = dist3dLandmark(right[H.thumbTip], right[H.indexTip]) > 0.05;
+      const indexPairY = (left[H.indexTip][1] + right[H.indexTip][1]) / 2;
+      const thumbPairY = (left[H.thumbTip][1] + right[H.thumbTip][1]) / 2;
+      const indexPairAboveThumbs = indexPairY < thumbPairY + 0.08;
+      if (
+        thumbTipsTouch
+        && indexTipsTouch
+        && wristsSeparated
+        && leftFingerGap
+        && rightFingerGap
+        && indexPairAboveThumbs
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function motionScalar(sample) {
+  if (sample && Number.isFinite(sample.v)) return sample.v;
+  return 0;
+}
+
+function computeMotionFeatures(samples) {
+  if (!samples || samples.length < 2) {
+    return { holdJitterRms: 0, tortuosity: 1, transitionMs: 0, sampleCount: samples?.length || 0 };
+  }
+  const values = samples.map(motionScalar);
+  const times = samples.map((sample) => Number(sample.t));
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const holdJitterRms = Math.sqrt(
+    values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length
+  );
+  let pathLength = 0;
+  for (let i = 1; i < values.length; i++) {
+    pathLength += Math.abs(values[i] - values[i - 1]);
+  }
+  const chord = Math.abs(values[values.length - 1] - values[0]);
+  const tortuosity = pathLength / Math.max(chord, 1e-9);
+  return {
+    holdJitterRms,
+    tortuosity,
+    transitionMs: times[times.length - 1] - times[0],
+    sampleCount: samples.length,
+  };
+}
+
+function deriveLivenessPhasesFromMotionSeries(motionSeries, plan) {
+  const expected = Array.isArray(plan) && plan.length ? plan : LIVENESS_PLAN_LEFT_FIRST;
+  return expected.map((phaseId) => {
+    const phaseSamples = motionSeries
+      .filter((sample) => sample && sample.p === phaseId)
+      .sort((a, b) => Number(a.t) - Number(b.t))
+      .map((sample) => ({ t: sample.t, v: sample.v }));
+    return { id: phaseId, ...computeMotionFeatures(phaseSamples) };
+  });
+}
+
+function validateMotionSeriesCoverage(motionSeries, plan) {
+  for (const phaseId of plan) {
+    const count = motionSeries.filter((sample) => sample?.p === phaseId).length;
+    if (count < 3) return 'Face motion series is too sparse for a challenge phase.';
+  }
+  return null;
+}
+
+function validateHandLandmarkGeometry(gestureId, samples) {
+  if (!Array.isArray(samples)) return 'Landmark evidence is invalid.';
+  if (samples.length > MAX_LANDMARK_SAMPLES) return 'Landmark evidence is too large.';
+  if (!samples.length) return null;
+
+  const relevant = samples.filter((sample) => sample && Array.isArray(sample.hands) && sample.hands.length);
+  if (!relevant.length) return null;
+
+  if (gestureId === 'three') {
+    const ok = relevant.some((sample) => sample.hands[0] && handMatchesThree(sample.hands[0]));
+    if (!ok) return 'Hand geometry does not match the requested gesture.';
+  }
+  if (gestureId === 'ily') {
+    const ok = relevant.some((sample) => handsMatchHeart(sample.hands));
+    if (!ok) return 'Hand geometry does not match the requested gesture.';
+  }
   return null;
 }
 
@@ -241,8 +605,8 @@ function isSyntheticLivenessPhase(phase) {
   return jitter <= LIVENESS_SYNTHETIC_JITTER_MAX && tortuosity >= 1 && tortuosity <= LIVENESS_SYNTHETIC_TORTUOSITY_MAX;
 }
 
-function validateLivenessPhases(phases, { legacy = false } = {}) {
-  const expected = ['center_hold', 'center_to_left', 'left_to_right'];
+function validateLivenessPhases(phases, plan, { legacy = false } = {}) {
+  const expected = Array.isArray(plan) && plan.length ? plan : LIVENESS_PLAN_LEFT_FIRST;
   if (!Array.isArray(phases) || phases.length !== expected.length) return 'Face liveness phases are incomplete.';
   for (let i = 0; i < expected.length; i++) {
     if (phases[i]?.id !== expected[i]) return 'Face liveness phase order is invalid.';
@@ -260,15 +624,12 @@ function validateLivenessPhases(phases, { legacy = false } = {}) {
   const transitionJitterMin = legacy ? LIVENESS_TRANSITION_JITTER_MIN * 0.5 : LIVENESS_TRANSITION_JITTER_MIN;
   const tortuosityMin = legacy ? 1.002 : LIVENESS_TORTUOSITY_MIN;
 
-  const hold = phases[0];
-  const toLeft = phases[1];
-  const toRight = phases[2];
+  const transitions = phases.slice(1);
 
-  if (toLeft.transitionMs < LIVENESS_TRANSITION_MS_MIN || toLeft.transitionMs > LIVENESS_TRANSITION_MS_MAX) {
-    return 'Head turn timing is outside the allowed range.';
-  }
-  if (toRight.transitionMs < LIVENESS_TRANSITION_MS_MIN || toRight.transitionMs > LIVENESS_TRANSITION_MS_MAX) {
-    return 'Head turn timing is outside the allowed range.';
+  for (const phase of transitions) {
+    if (phase.transitionMs < LIVENESS_TRANSITION_MS_MIN || phase.transitionMs > LIVENESS_TRANSITION_MS_MAX) {
+      return 'Head turn timing is outside the allowed range.';
+    }
   }
 
   const hasIrregularity = phases.some(
@@ -276,13 +637,12 @@ function validateLivenessPhases(phases, { legacy = false } = {}) {
   );
   if (!hasIrregularity) return 'Face motion looked too uniform to count as live presence.';
 
-  const allSynthetic =
-    isSyntheticLivenessPhase(hold) && isSyntheticLivenessPhase(toLeft) && isSyntheticLivenessPhase(toRight);
+  const allSynthetic = phases.every((phase) => isSyntheticLivenessPhase(phase));
   if (allSynthetic) return 'Face motion looked synthetic.';
 
   const transitionOk = (phase) =>
     phase.holdJitterRms >= transitionJitterMin || phase.tortuosity >= tortuosityMin;
-  if (!transitionOk(toLeft) || !transitionOk(toRight)) {
+  if (transitions.some((phase) => !transitionOk(phase))) {
     return 'Between-pose head motion was too smooth or too abrupt.';
   }
 
@@ -328,15 +688,6 @@ function consumeVerificationToken(session, token, allowed) {
   return { payload };
 }
 
-function originAllowed(origin) {
-  try {
-    const url = new URL(origin);
-    return url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost');
-  } catch {
-    return false;
-  }
-}
-
 function decodeCredentialPart(value) {
   if (typeof value !== 'string') return null;
   try {
@@ -378,7 +729,9 @@ function verifyPasskeySignature(credential, authenticatorData, clientDataJSON, s
 }
 
 async function handleApi(req, res, pathname) {
+  sweepExpiredState();
   const session = getSession(req, res);
+  if (!enforcePostSecurity(req, res, pathname, session)) return;
 
   if (req.method === 'POST' && pathname === '/api/challenge') {
     const challenge = createChallenge(session);
@@ -404,7 +757,10 @@ async function handleApi(req, res, pathname) {
     if (now() > challenge.expiresAt) return sendJson(res, 410, { error: 'Challenge expired.' });
 
     const evidenceError = validateEvidence(challenge, body);
-    if (evidenceError) return sendJson(res, 400, { error: evidenceError });
+    if (evidenceError) {
+      logVerificationFailure('gesture_step_rejected', pathname);
+      return sendJson(res, 400, { error: evidenceError });
+    }
 
     challenge.currentStep++;
     if (challenge.currentStep >= challenge.steps.length) {
@@ -438,7 +794,10 @@ async function handleApi(req, res, pathname) {
       methods: ['gesture', 'face-motion'],
       assurances: ['standard'],
     });
-    if (gate.error) return sendJson(res, gate.status || 401, { error: gate.error });
+    if (gate.error) {
+      logVerificationFailure('passkey_register_gate', pathname);
+      return sendJson(res, gate.status || 401, { error: gate.error });
+    }
 
     const challenge = randomId(32);
     session.passkeyRegisterChallenge = { challenge, createdAt: now(), verifiedBy: gate.payload.method };
@@ -550,8 +909,10 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'POST' && pathname === '/api/liveness/challenge') {
     const created = now();
     const challengeId = randomId();
+    const plan = createLivenessPlan();
     session.livenessChallenge = {
       id: challengeId,
+      plan,
       createdAt: created,
       expiresAt: created + LIVENESS_CHALLENGE_TTL_MS,
       consumedAt: null,
@@ -559,6 +920,7 @@ async function handleApi(req, res, pathname) {
     };
     return sendJson(res, 201, {
       challengeId,
+      plan,
       expiresAt: session.livenessChallenge.expiresAt,
     });
   }
@@ -590,8 +952,25 @@ async function handleApi(req, res, pathname) {
     if (!Number.isFinite(motionScore) || motionScore < 0.08) return sendJson(res, 400, { error: 'Face motion was too small to count as liveness.' });
     if (!/^[a-f0-9]{64}$/.test(seriesDigest)) return sendJson(res, 400, { error: 'Face motion digest is invalid.' });
 
-    const phaseError = validateLivenessPhases(body.phases, { legacy });
-    if (phaseError) return sendJson(res, 400, { error: phaseError });
+    const motionSeries = body.motionSeries;
+    if (!Array.isArray(motionSeries) || motionSeries.length < 3 || motionSeries.length > MAX_MOTION_SERIES) {
+      return sendJson(res, 400, { error: 'Face motion series is invalid.' });
+    }
+    const seriesPlanError = validateMotionSeriesAgainstPlan(motionSeries, pending.plan);
+    if (seriesPlanError) return sendJson(res, 400, { error: seriesPlanError });
+    const coverageError = validateMotionSeriesCoverage(motionSeries, pending.plan);
+    if (coverageError) return sendJson(res, 400, { error: coverageError });
+    const expectedDigest = computeLivenessSeriesDigest(pending.id, motionSeries);
+    if (expectedDigest !== seriesDigest) {
+      return sendJson(res, 400, { error: 'Face motion digest does not match the submitted series.' });
+    }
+
+    const derivedPhases = deriveLivenessPhasesFromMotionSeries(motionSeries, pending.plan);
+    const phaseError = validateLivenessPhases(derivedPhases, pending.plan, { legacy });
+    if (phaseError) {
+      logVerificationFailure('liveness_phases_rejected', pathname);
+      return sendJson(res, 400, { error: phaseError });
+    }
 
     if (pending.seriesDigests.has(seriesDigest)) {
       return sendJson(res, 400, { error: 'Replay face motion evidence was already submitted.' });
@@ -617,7 +996,10 @@ async function handleApi(req, res, pathname) {
     }
 
     const gate = consumeVerificationToken(session, body.verificationToken);
-    if (gate.error) return sendJson(res, gate.status || 401, { error: gate.error });
+    if (gate.error) {
+      logVerificationFailure('protected_action_gate', pathname);
+      return sendJson(res, gate.status || 401, { error: gate.error });
+    }
     return sendJson(res, 200, { ok: true, message: 'Protected action accepted by the server.' });
   }
 
@@ -674,4 +1056,16 @@ if (require.main === module) {
   });
 }
 
-module.exports = { createServer };
+module.exports = {
+  createServer,
+  checkRateLimit,
+  resetRateLimitState,
+  validateStateChangingOrigin,
+  sweepExpiredState,
+  STATE_CHANGING_POST_PATHS,
+  RATE_LIMIT_MAX_PER_IP,
+  createLivenessPlan,
+  computeLivenessSeriesDigest,
+  deriveLivenessPhasesFromMotionSeries,
+  validateHandLandmarkGeometry,
+};
