@@ -1,4 +1,5 @@
 const assert = require('assert');
+const crypto = require('crypto');
 const { createServer } = require('./server');
 
 function request(baseUrl, path, options = {}, cookie) {
@@ -22,6 +23,26 @@ function evidence(overrides = {}) {
     holdFrames: 8,
     landmarkDigest: `landmarks-${Math.random()}`,
     motionDigest: `motion-${Math.random()}`,
+    ...overrides,
+  };
+}
+
+function validLivenessPhases() {
+  return [
+    { id: 'center_hold', holdJitterRms: 0.002, tortuosity: 1.01, transitionMs: 320, sampleCount: 10 },
+    { id: 'center_to_left', holdJitterRms: 0.003, tortuosity: 1.05, transitionMs: 600, sampleCount: 12 },
+    { id: 'left_to_right', holdJitterRms: 0.0025, tortuosity: 1.04, transitionMs: 550, sampleCount: 11 },
+  ];
+}
+
+function livenessBody(challengeId, overrides = {}) {
+  return {
+    challengeId,
+    durationMs: 1200,
+    faceFrames: 10,
+    motionScore: 0.12,
+    phases: validLivenessPhases(),
+    seriesDigest: crypto.randomBytes(32).toString('hex'),
     ...overrides,
   };
 }
@@ -61,12 +82,35 @@ async function main() {
     const unverifiedRegisterOptions = await request(baseUrl, '/api/passkey/register/options', { method: 'POST' }, cookie);
     assert.strictEqual(unverifiedRegisterOptions.res.status, 401);
 
-    const livenessVerified = await request(baseUrl, '/api/liveness/verify', {
+    const livenessWithoutChallenge = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
       body: JSON.stringify({ durationMs: 1200, faceFrames: 10, motionScore: 0.12 }),
     }, cookie);
+    assert.strictEqual(livenessWithoutChallenge.res.status, 400);
+
+    const livenessChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    assert.strictEqual(livenessChallenge.res.status, 201);
+    assert.ok(livenessChallenge.body.challengeId);
+
+    const livenessVerified = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(livenessChallenge.body.challengeId)),
+    }, cookie);
     assert.strictEqual(livenessVerified.res.status, 200);
     assert.ok(livenessVerified.body.verificationToken);
+
+    const smoothChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const smoothStub = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(smoothChallenge.body.challengeId, {
+        phases: [
+          { id: 'center_hold', holdJitterRms: 0, tortuosity: 1, transitionMs: 300, sampleCount: 10 },
+          { id: 'center_to_left', holdJitterRms: 0, tortuosity: 1, transitionMs: 500, sampleCount: 10 },
+          { id: 'left_to_right', holdJitterRms: 0, tortuosity: 1, transitionMs: 500, sampleCount: 10 },
+        ],
+      })),
+    }, cookie);
+    assert.strictEqual(smoothStub.res.status, 400);
 
     const verifiedRegisterOptions = await request(baseUrl, '/api/passkey/register/options', {
       method: 'POST',

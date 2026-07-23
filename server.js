@@ -10,6 +10,16 @@ const CHALLENGE_TTL_MS = 90 * 1000;
 const MIN_STEP_DURATION_MS = 180;
 const MAX_STEP_DURATION_MS = 12 * 1000;
 const MIN_HOLD_FRAMES = 8;
+const LIVENESS_CHALLENGE_TTL_MS = 90 * 1000;
+const LIVENESS_TRANSITION_MS_MIN = 150;
+const LIVENESS_TRANSITION_MS_MAX = 14 * 1000;
+const LIVENESS_HOLD_JITTER_MIN = 0.00035;
+const LIVENESS_TRANSITION_JITTER_MIN = 0.00035;
+const LIVENESS_TORTUOSITY_MIN = 1.004;
+const LIVENESS_SYNTHETIC_JITTER_MAX = 0.00015;
+const LIVENESS_SYNTHETIC_TORTUOSITY_MAX = 1.003;
+const HAND_FORMING_VAR_MIN = 1e-7;
+const HAND_HOLD_JITTER_MIN = 1e-5;
 const MAX_BODY_BYTES = 32 * 1024;
 const PASSKEY_CHALLENGE_TTL_MS = 2 * 60 * 1000;
 const APP_NAME = 'Zoe';
@@ -91,6 +101,7 @@ function getSession(req, res) {
       credentials: new Map(),
       passkeyRegisterChallenge: null,
       passkeyAuthChallenge: null,
+      livenessChallenge: null,
     });
     res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`);
   } else {
@@ -206,7 +217,75 @@ function validateEvidence(challenge, body) {
     motionDigest: String(evidence.motionDigest || ''),
   })).digest('base64url');
   if (challenge.evidenceDigests.has(digest)) return 'Replay evidence was already submitted.';
+
+  const motionStats = evidence.motionStats;
+  if (motionStats && typeof motionStats === 'object') {
+    const formingMotion = Number(motionStats.formingMotion);
+    const holdJitterRms = Number(motionStats.holdJitterRms);
+    if (Number.isFinite(formingMotion) && formingMotion < HAND_FORMING_VAR_MIN) {
+      return 'Hand motion while forming the gesture was too static.';
+    }
+    if (Number.isFinite(holdJitterRms) && holdJitterRms < HAND_HOLD_JITTER_MIN) {
+      return 'Hand hold looked unnaturally steady.';
+    }
+  }
+
   challenge.evidenceDigests.add(digest);
+  return null;
+}
+
+function isSyntheticLivenessPhase(phase) {
+  const jitter = Number(phase?.holdJitterRms);
+  const tortuosity = Number(phase?.tortuosity);
+  if (!Number.isFinite(jitter) || !Number.isFinite(tortuosity)) return true;
+  return jitter <= LIVENESS_SYNTHETIC_JITTER_MAX && tortuosity >= 1 && tortuosity <= LIVENESS_SYNTHETIC_TORTUOSITY_MAX;
+}
+
+function validateLivenessPhases(phases, { legacy = false } = {}) {
+  const expected = ['center_hold', 'center_to_left', 'left_to_right'];
+  if (!Array.isArray(phases) || phases.length !== expected.length) return 'Face liveness phases are incomplete.';
+  for (let i = 0; i < expected.length; i++) {
+    if (phases[i]?.id !== expected[i]) return 'Face liveness phase order is invalid.';
+    const jitter = Number(phases[i].holdJitterRms);
+    const tortuosity = Number(phases[i].tortuosity);
+    const transitionMs = Number(phases[i].transitionMs);
+    const sampleCount = Number(phases[i].sampleCount);
+    if (!Number.isFinite(jitter) || !Number.isFinite(tortuosity) || !Number.isFinite(transitionMs) || !Number.isFinite(sampleCount)) {
+      return 'Face liveness phase metrics are invalid.';
+    }
+    if (sampleCount < 3) return 'Face liveness sampling was too sparse.';
+  }
+
+  const holdJitterMin = legacy ? LIVENESS_HOLD_JITTER_MIN * 0.5 : LIVENESS_HOLD_JITTER_MIN;
+  const transitionJitterMin = legacy ? LIVENESS_TRANSITION_JITTER_MIN * 0.5 : LIVENESS_TRANSITION_JITTER_MIN;
+  const tortuosityMin = legacy ? 1.002 : LIVENESS_TORTUOSITY_MIN;
+
+  const hold = phases[0];
+  const toLeft = phases[1];
+  const toRight = phases[2];
+
+  if (toLeft.transitionMs < LIVENESS_TRANSITION_MS_MIN || toLeft.transitionMs > LIVENESS_TRANSITION_MS_MAX) {
+    return 'Head turn timing is outside the allowed range.';
+  }
+  if (toRight.transitionMs < LIVENESS_TRANSITION_MS_MIN || toRight.transitionMs > LIVENESS_TRANSITION_MS_MAX) {
+    return 'Head turn timing is outside the allowed range.';
+  }
+
+  const hasIrregularity = phases.some(
+    (phase) => phase.holdJitterRms >= holdJitterMin || phase.tortuosity >= tortuosityMin
+  );
+  if (!hasIrregularity) return 'Face motion looked too uniform to count as live presence.';
+
+  const allSynthetic =
+    isSyntheticLivenessPhase(hold) && isSyntheticLivenessPhase(toLeft) && isSyntheticLivenessPhase(toRight);
+  if (allSynthetic) return 'Face motion looked synthetic.';
+
+  const transitionOk = (phase) =>
+    phase.holdJitterRms >= transitionJitterMin || phase.tortuosity >= tortuosityMin;
+  if (!transitionOk(toLeft) || !transitionOk(toRight)) {
+    return 'Between-pose head motion was too smooth or too abrupt.';
+  }
+
   return null;
 }
 
@@ -468,6 +547,22 @@ async function handleApi(req, res, pathname) {
     return sendJson(res, 200, { verified: true, verificationToken: token, tokenExpiresAt: now() + TOKEN_TTL_MS });
   }
 
+  if (req.method === 'POST' && pathname === '/api/liveness/challenge') {
+    const created = now();
+    const challengeId = randomId();
+    session.livenessChallenge = {
+      id: challengeId,
+      createdAt: created,
+      expiresAt: created + LIVENESS_CHALLENGE_TTL_MS,
+      consumedAt: null,
+      seriesDigests: new Set(),
+    };
+    return sendJson(res, 201, {
+      challengeId,
+      expiresAt: session.livenessChallenge.expiresAt,
+    });
+  }
+
   if (req.method === 'POST' && pathname === '/api/liveness/verify') {
     let body;
     try {
@@ -476,16 +571,36 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 400, { error: err.message });
     }
 
+    const pending = session.livenessChallenge;
+    if (!pending || body.challengeId !== pending.id) {
+      return sendJson(res, 400, { error: 'Face liveness challenge is missing or invalid.' });
+    }
+    if (pending.consumedAt) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
+    if (now() > pending.expiresAt) return sendJson(res, 410, { error: 'Face liveness challenge expired.' });
+
     const durationMs = Number(body.durationMs);
     const faceFrames = Number(body.faceFrames);
     const motionScore = Number(body.motionScore);
+    const seriesDigest = typeof body.seriesDigest === 'string' ? body.seriesDigest : '';
+    const legacy = body.legacyEngine === true;
     if (!Number.isFinite(durationMs) || durationMs < 900 || durationMs > 15000) {
       return sendJson(res, 400, { error: 'Face check timing is outside the allowed range.' });
     }
     if (!Number.isFinite(faceFrames) || faceFrames < 8) return sendJson(res, 400, { error: 'Face was not visible for long enough.' });
     if (!Number.isFinite(motionScore) || motionScore < 0.08) return sendJson(res, 400, { error: 'Face motion was too small to count as liveness.' });
+    if (!/^[a-f0-9]{64}$/.test(seriesDigest)) return sendJson(res, 400, { error: 'Face motion digest is invalid.' });
 
-    const token = issueVerificationToken(session, { id: `face:${randomId(12)}` }, 'face-motion', 'standard');
+    const phaseError = validateLivenessPhases(body.phases, { legacy });
+    if (phaseError) return sendJson(res, 400, { error: phaseError });
+
+    if (pending.seriesDigests.has(seriesDigest)) {
+      return sendJson(res, 400, { error: 'Replay face motion evidence was already submitted.' });
+    }
+    pending.seriesDigests.add(seriesDigest);
+    pending.consumedAt = now();
+    session.livenessChallenge = null;
+
+    const token = issueVerificationToken(session, { id: `face:${pending.id}` }, 'face-motion', 'standard');
     return sendJson(res, 200, {
       verified: true,
       verificationToken: token,
