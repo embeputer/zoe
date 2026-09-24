@@ -54,6 +54,7 @@ const methodFaceBtn = $('method-face-btn');
 const verificationTitleEl = $('verification-title');
 const startBtn = $('start-btn');
 const cardEl = $('captcha-card');
+const flashOverlayEl = $('flash-overlay');
 const panelShellEl = $('panel-shell');
 const zoeIntroEl = $('zoe-intro');
 const zoeVerifyBtn = $('zoe-verify-btn');
@@ -1500,6 +1501,102 @@ async function runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeri
   return false;
 }
 
+const FLASH_FACE_W = 12;
+const FLASH_FACE_H = 9;
+const FLASH_BG_W = 4;
+const FLASH_BG_H = 1;
+const flashFaceCanvas = document.createElement('canvas');
+flashFaceCanvas.width = FLASH_FACE_W;
+flashFaceCanvas.height = FLASH_FACE_H;
+const flashFaceCtx = flashFaceCanvas.getContext('2d', { willReadFrequently: true });
+const flashBgCanvas = document.createElement('canvas');
+flashBgCanvas.width = FLASH_BG_W;
+flashBgCanvas.height = FLASH_BG_H;
+const flashBgCtx = flashBgCanvas.getContext('2d', { willReadFrequently: true });
+
+function rgbBytes(ctx, w, h) {
+  const data = ctx.getImageData(0, 0, w, h).data;
+  const out = new Uint8Array(w * h * 3);
+  let j = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    out[j++] = data[i];
+    out[j++] = data[i + 1];
+    out[j++] = data[i + 2];
+  }
+  return out;
+}
+
+function bytesToB64(bytes) {
+  let s = '';
+  for (const b of bytes) s += String.fromCharCode(b);
+  return btoa(s);
+}
+
+function setFlashOverlay(rgb) {
+  if (!flashOverlayEl) return;
+  if (rgb) {
+    flashOverlayEl.hidden = false;
+    flashOverlayEl.style.background = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
+    flashOverlayEl.style.opacity = '0.85';
+  } else {
+    flashOverlayEl.style.opacity = '0';
+    flashOverlayEl.hidden = true;
+  }
+}
+
+// Downscale the detected face region and a background strip from the live
+// video into tiny RGB payloads the server can verify against the flash plan.
+function sampleFlashPixels(box) {
+  const vw = Math.max(1, videoEl.videoWidth || 640);
+  const vh = Math.max(1, videoEl.videoHeight || 480);
+  const sample = {};
+  if (box && box.pixelBox) {
+    const pb = box.pixelBox;
+    const grow = 1.2;
+    const cx = pb.x + pb.w / 2;
+    const cy = pb.y + pb.h / 2;
+    const w = Math.min(pb.w * grow, vw);
+    const h = Math.min(pb.h * grow, vh);
+    const x = Math.max(0, Math.min(cx - w / 2, vw - w));
+    const y = Math.max(0, Math.min(cy - h / 2, vh - h));
+    if (w > 8 && h > 8) {
+      flashFaceCtx.drawImage(videoEl, x, y, w, h, 0, 0, FLASH_FACE_W, FLASH_FACE_H);
+      sample.f = bytesToB64(rgbBytes(flashFaceCtx, FLASH_FACE_W, FLASH_FACE_H));
+      sample.fb = [quantize(box.cx), quantize(box.cy), quantize(box.w)];
+    }
+  }
+  const bgH = Math.max(4, Math.round(vh * 0.06));
+  flashBgCtx.drawImage(videoEl, 0, 0, vw, bgH, 0, 0, FLASH_BG_W, FLASH_BG_H);
+  sample.b = bytesToB64(rgbBytes(flashBgCtx, FLASH_BG_W, FLASH_BG_H));
+  return sample;
+}
+
+// Full-screen color flashes light the user's face; the camera samples face and
+// background pixels on the flash clock so the server can check the reflected
+// light actually tracked a sequence only it issued.
+async function runFlashPixelCheck(engine, flashPlan) {
+  const t0 = performance.now();
+  const last = flashPlan[flashPlan.length - 1];
+  const endMs = last.o + last.d + 320;
+  const samples = [];
+  setStatus('Hold still', 'listening');
+  promptNameEl.textContent = 'Hold still';
+  promptHintEl.textContent = 'Keep your face in view while the screen flashes.';
+  while (faceChecking) {
+    const now = performance.now() - t0;
+    if (now > endMs) break;
+    const active = flashPlan.find((f) => now >= f.o && now <= f.o + f.d);
+    setFlashOverlay(active ? active.c : null);
+    const box = await detectStableFaceFrame(engine);
+    const sample = sampleFlashPixels(box);
+    sample.t = Math.round(now);
+    samples.push(sample);
+    await sleep(70);
+  }
+  setFlashOverlay(null);
+  return samples;
+}
+
 async function runGuidedFaceCheck() {
   const engine = await ensureFaceEngine();
   const requirePoseLiveness = engine === 'mediapipe';
@@ -1510,6 +1607,7 @@ async function runGuidedFaceCheck() {
   const motionPlan = Array.isArray(livenessChallenge.plan) && livenessChallenge.plan.length >= 3
     ? livenessChallenge.plan
     : ['center_hold', 'center_to_left', 'left_to_right'];
+  const flashPlan = Array.isArray(livenessChallenge.flashPlan) ? livenessChallenge.flashPlan : null;
   faceChecking = true;
   setStartButton('Verification in progress', true);
   promptEmojiEl.textContent = '🙂';
@@ -1599,6 +1697,14 @@ async function runGuidedFaceCheck() {
 
     if (!faceChecking) return;
 
+    let pixelSeries = null;
+    if (flashPlan && flashPlan.length) {
+      promptEmojiEl.textContent = '💡';
+      progressEl.style.width = '100%';
+      pixelSeries = await runFlashPixelCheck(engine, flashPlan);
+      if (!faceChecking) return;
+    }
+
     if (centers.length < 8 || (requirePoseLiveness && yaws.length < 8)) {
       throw new Error('No face was detected. Make sure your face is lit and centered, then try again.');
     }
@@ -1639,12 +1745,14 @@ async function runGuidedFaceCheck() {
       phases,
       motionSeries,
       seriesDigest,
+      pixelSeries,
       legacyEngine,
     });
     verificationToken = result.verificationToken;
     await confirmProtectedAction();
   } finally {
     faceChecking = false;
+    setFlashOverlay(null);
     recentFaceBox = null;
     recentFaceBoxAt = 0;
   }

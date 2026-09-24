@@ -57,7 +57,34 @@ function sampleMotionSeries(plan) {
   ]));
 }
 
-function livenessBody(challengeId, plan, overrides = {}) {
+function gaussian() {
+  const u = Math.max(Math.random(), 1e-9);
+  const v = Math.max(Math.random(), 1e-9);
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+
+// Fabricated pixel evidence matching an issued flash plan: baseline-lit frames
+// with sensor noise, shifted toward each flash color inside its window.
+function samplePixelSeries(flashPlan) {
+  const baseline = [40, 45, 50];
+  const last = flashPlan[flashPlan.length - 1];
+  const endMs = last.o + last.d + 300;
+  const samples = [];
+  for (let t = 0; t <= endMs; t += 75) {
+    const active = flashPlan.find((f) => t >= f.o && t <= f.o + f.d);
+    const mean = active ? baseline.map((v, i) => v + active.c[i] * 0.5) : baseline;
+    const f = Buffer.alloc(324);
+    for (let i = 0; i < f.length; i++) {
+      f[i] = Math.max(0, Math.min(255, Math.round(mean[i % 3] + gaussian() * 6)));
+    }
+    const b = Buffer.alloc(12);
+    for (let i = 0; i < b.length; i++) b[i] = Math.max(0, Math.min(255, 30 + gaussian() * 3));
+    samples.push({ t, f: f.toString('base64'), b: b.toString('base64') });
+  }
+  return samples;
+}
+
+function livenessBody(challengeId, plan, flashPlan, overrides = {}) {
   const motionSeries = sampleMotionSeries(plan);
   return {
     challengeId,
@@ -67,6 +94,7 @@ function livenessBody(challengeId, plan, overrides = {}) {
     phases: validLivenessPhases(plan),
     motionSeries,
     seriesDigest: computeLivenessSeriesDigest(challengeId, motionSeries),
+    pixelSeries: flashPlan ? samplePixelSeries(flashPlan) : undefined,
     ...overrides,
   };
 }
@@ -118,17 +146,19 @@ async function main() {
     assert.ok(Array.isArray(livenessChallenge.body.plan));
     assert.strictEqual(livenessChallenge.body.plan[0], 'center_hold');
     assert.strictEqual(livenessChallenge.body.plan.length, 3);
+    assert.ok(Array.isArray(livenessChallenge.body.flashPlan));
+    assert.strictEqual(livenessChallenge.body.flashPlan.length, 4);
 
     const livenessVerified = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
-      body: JSON.stringify(livenessBody(livenessChallenge.body.challengeId, livenessChallenge.body.plan)),
+      body: JSON.stringify(livenessBody(livenessChallenge.body.challengeId, livenessChallenge.body.plan, livenessChallenge.body.flashPlan)),
     }, cookie);
     assert.strictEqual(livenessVerified.res.status, 200);
     assert.ok(livenessVerified.body.verificationToken);
 
     const wrongPlanPhases = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
     const issuedPlan = wrongPlanPhases.body.plan;
-    const wrongSeriesBody = livenessBody(wrongPlanPhases.body.challengeId, issuedPlan);
+    const wrongSeriesBody = livenessBody(wrongPlanPhases.body.challengeId, issuedPlan, wrongPlanPhases.body.flashPlan);
     const invalidPhase = issuedPlan.includes('center_to_left') ? 'center_to_right' : 'center_to_left';
     wrongSeriesBody.motionSeries = wrongSeriesBody.motionSeries.map((sample, index) => (
       index === 0 ? { ...sample, p: invalidPhase } : sample
@@ -152,13 +182,27 @@ async function main() {
     ]));
     const smoothStub = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
-      body: JSON.stringify(livenessBody(smoothChallenge.body.challengeId, smoothPlan, {
+      body: JSON.stringify(livenessBody(smoothChallenge.body.challengeId, smoothPlan, smoothChallenge.body.flashPlan, {
         motionSeries: smoothSeries,
         seriesDigest: computeLivenessSeriesDigest(smoothChallenge.body.challengeId, smoothSeries),
         phases: validLivenessPhases(smoothPlan),
       })),
     }, cookie);
     assert.strictEqual(smoothStub.res.status, 400);
+
+    // Pixels that ignore the issued flash sequence must be rejected.
+    const darkChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const darkPixels = samplePixelSeries(darkChallenge.body.flashPlan).map((s) => ({
+      ...s,
+      f: Buffer.alloc(324).fill(40).toString('base64'),
+    }));
+    const noFlash = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(darkChallenge.body.challengeId, darkChallenge.body.plan, darkChallenge.body.flashPlan, {
+        pixelSeries: darkPixels,
+      })),
+    }, cookie);
+    assert.strictEqual(noFlash.res.status, 400);
 
     const noPasskey = await request(baseUrl, '/api/passkey/auth/options', { method: 'POST' }, cookie);
     assert.strictEqual(noPasskey.res.status, 409);
@@ -367,7 +411,7 @@ async function main() {
     const rpSeries = sampleMotionSeries(rpChallenge.body.plan);
     const rpVerify = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
-      body: JSON.stringify(livenessBody(rpChallenge.body.challengeId, rpChallenge.body.plan, { motionSeries: rpSeries, seriesDigest: computeLivenessSeriesDigest(rpChallenge.body.challengeId, rpSeries) })),
+      body: JSON.stringify(livenessBody(rpChallenge.body.challengeId, rpChallenge.body.plan, rpChallenge.body.flashPlan, { motionSeries: rpSeries, seriesDigest: computeLivenessSeriesDigest(rpChallenge.body.challengeId, rpSeries) })),
     }, cookie);
     assert.strictEqual(rpVerify.res.status, 200);
     const rpToken = rpVerify.body.verificationToken;
