@@ -5,9 +5,10 @@
   "description": "Zoe human verification demo with server-owned challenge state.",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_server.js"
+    "test": "node test_server.js",
+    "attack": "node attack_server.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22.5"
   }
 }
