@@ -1,6 +1,12 @@
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+process.env.ZOE_DB_PATH = path.join(os.tmpdir(), `zoe-test-${process.pid}.sqlite3`);
+process.env.ZOE_SECRET = process.env.ZOE_SECRET || 'zoe-test-secret';
 const assert = require('assert');
 const crypto = require('crypto');
-const { createServer, checkRateLimit, resetRateLimitState, RATE_LIMIT_MAX_PER_IP, computeLivenessSeriesDigest, validateHandLandmarkGeometry } = require('./server');
+const { execFileSync } = require('child_process');
+const { createServer, checkRateLimit, resetRateLimitState, RATE_LIMIT_MAX_PER_IP, computeLivenessSeriesDigest, validateHandLandmarkGeometry, verifyAuthenticatorData } = require('./server');
 
 function request(baseUrl, path, options = {}, cookie) {
   const headers = { ...(options.headers || {}) };
@@ -154,6 +160,9 @@ async function main() {
     }, cookie);
     assert.strictEqual(smoothStub.res.status, 400);
 
+    const noPasskey = await request(baseUrl, '/api/passkey/auth/options', { method: 'POST' }, cookie);
+    assert.strictEqual(noPasskey.res.status, 409);
+
     const verifiedRegisterOptions = await request(baseUrl, '/api/passkey/register/options', {
       method: 'POST',
       body: JSON.stringify({ registrationVerificationToken: livenessVerified.body.verificationToken }),
@@ -161,8 +170,23 @@ async function main() {
     assert.strictEqual(verifiedRegisterOptions.res.status, 200);
     assert.ok(verifiedRegisterOptions.body.challenge);
 
-    const noPasskey = await request(baseUrl, '/api/passkey/auth/options', { method: 'POST' }, cookie);
-    assert.strictEqual(noPasskey.res.status, 409);
+    const registerVerify = await request(baseUrl, '/api/passkey/register/verify', {
+      method: 'POST',
+      body: JSON.stringify({
+        rawId: `test-credential-${Math.random().toString(36).slice(2)}`,
+        clientDataJSON: Buffer.from(JSON.stringify({
+          type: 'webauthn.create',
+          challenge: verifiedRegisterOptions.body.challenge,
+          origin: baseUrl,
+        })).toString('base64url'),
+        publicKey: Buffer.from('fake-der-key').toString('base64url'),
+        alg: -7,
+      }),
+    }, cookie);
+    assert.strictEqual(registerVerify.res.status, 201);
+
+    const passkeyRegistered = await request(baseUrl, '/api/passkey/auth/options', { method: 'POST' }, cookie);
+    assert.strictEqual(passkeyRegistered.res.status, 200);
 
     const passkeyReset = await request(baseUrl, '/api/passkey/reset', { method: 'POST' }, cookie);
     assert.strictEqual(passkeyReset.res.status, 200);
@@ -322,6 +346,54 @@ async function main() {
       assert.strictEqual(badThreeStep.res.status, 400);
     }
 
+    const rpIdHash = crypto.createHash('sha256').update('127.0.0.1').digest();
+    const authData = Buffer.concat([rpIdHash, Buffer.from([0x05]), Buffer.alloc(4)]);
+    const authResult = verifyAuthenticatorData(authData, 'http://127.0.0.1:3000');
+    assert.strictEqual(authResult.error, undefined);
+    assert.strictEqual(authResult.userVerified, true);
+
+    const noUv = Buffer.concat([rpIdHash, Buffer.from([0x01]), Buffer.alloc(4)]);
+    const noUvResult = verifyAuthenticatorData(noUv, 'http://127.0.0.1:3000');
+    assert.strictEqual(noUvResult.error, undefined);
+    assert.strictEqual(noUvResult.userVerified, false);
+
+    const noUp = Buffer.concat([rpIdHash, Buffer.from([0x04]), Buffer.alloc(4)]);
+    assert.ok(verifyAuthenticatorData(noUp, 'http://127.0.0.1:3000').error);
+
+    const wrongRp = Buffer.concat([crypto.createHash('sha256').update('evil.example').digest(), Buffer.from([0x05]), Buffer.alloc(4)]);
+    assert.ok(verifyAuthenticatorData(wrongRp, 'http://127.0.0.1:3000').error);
+
+    const rpChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const rpSeries = sampleMotionSeries(rpChallenge.body.plan);
+    const rpVerify = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(rpChallenge.body.challengeId, rpChallenge.body.plan, { motionSeries: rpSeries, seriesDigest: computeLivenessSeriesDigest(rpChallenge.body.challengeId, rpSeries) })),
+    }, cookie);
+    assert.strictEqual(rpVerify.res.status, 200);
+    const rpToken = rpVerify.body.verificationToken;
+
+    // A relying party redeems the token without the user's session cookie.
+    const rpRedeem = await request(baseUrl, '/api/verify', {
+      method: 'POST',
+      body: JSON.stringify({ verificationToken: rpToken }),
+    });
+    assert.strictEqual(rpRedeem.res.status, 200);
+    assert.strictEqual(rpRedeem.body.valid, true);
+    assert.strictEqual(rpRedeem.body.method, 'face-motion');
+    assert.strictEqual(rpRedeem.body.assurance, 'standard');
+
+    const rpReplay = await request(baseUrl, '/api/verify', {
+      method: 'POST',
+      body: JSON.stringify({ verificationToken: rpToken }),
+    });
+    assert.strictEqual(rpReplay.res.status, 409);
+
+    const rpBadToken = await request(baseUrl, '/api/verify', {
+      method: 'POST',
+      body: JSON.stringify({ verificationToken: 'not-a-token' }),
+    });
+    assert.strictEqual(rpBadToken.res.status, 401);
+
     resetRateLimitState();
     const testIp = 'rate-limit-test-ip';
     for (let i = 0; i < RATE_LIMIT_MAX_PER_IP; i += 1) {
@@ -333,9 +405,40 @@ async function main() {
     assert.strictEqual(limited.scope, 'ip');
     resetRateLimitState();
 
+    // A fresh process on the same DB must still reject the consumed token and
+    // must see the registered passkey — proves state survives a restart.
+    const childScript = `
+      const { createServer } = require(${JSON.stringify(path.join(__dirname, 'server.js'))});
+      const server = createServer();
+      server.listen(0, '127.0.0.1', async () => {
+        const base = 'http://127.0.0.1:' + server.address().port;
+        const headers = {
+          'Content-Type': 'application/json',
+          Origin: base,
+          Cookie: process.env.ZOE_COOKIE,
+        };
+        try {
+          const opts = await fetch(base + '/api/passkey/auth/options', { method: 'POST', headers });
+          const action = await fetch(base + '/api/protected-action', {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({ verificationToken: process.env.ZOE_TOKEN }),
+          });
+          console.log(JSON.stringify({ options: opts.status, action: action.status }));
+        } finally {
+          server.close();
+        }
+      });
+    `;
+    const childOut = execFileSync(process.execPath, ['-e', childScript], {
+      env: { ...process.env, ZOE_COOKIE: cookie, ZOE_TOKEN: finalToken },
+    }).toString().trim();
+    assert.deepStrictEqual(JSON.parse(childOut), { options: 200, action: 409 });
+
     console.log('server security regression tests passed');
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(process.env.ZOE_DB_PATH, { force: true });
   }
 }
 

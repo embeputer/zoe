@@ -4,7 +4,7 @@ Zoe is a small human-presence verification demo. The browser can run hand gestur
 
 ## Requirements
 
-- Node.js 18 or newer
+- Node.js 22.5 or newer (uses `node:sqlite` for durable state)
 - A browser with camera support
 - Network access to `cdn.jsdelivr.net` for MediaPipe assets
 
@@ -46,6 +46,7 @@ Then open `http://127.0.0.1:3001` (or match your `PORT`).
 | `ZOE_SESSION_IDLE_TTL_MS` | `3600000` | Drop idle sessions after this many ms |
 | `ZOE_SWEEP_INTERVAL_MS` | `30000` | Minimum interval between in-memory expiry sweeps |
 | `ZOE_LOG_VERIFICATION_FAILURES` | off | Set to `1` to emit JSON lines for verification rejections (reason code only, no PII) |
+| `ZOE_DB_PATH` | `./zoe-data.sqlite3` | SQLite file for durable sessions, passkey credentials, and consumed token digests (`:memory:` disables persistence) |
 
 ### Production behavior
 
@@ -64,6 +65,14 @@ Rate limits apply in-memory to POST routes under `/api/challenge`, `/api/step`, 
 npm test
 ```
 
+## Adversarial Harness
+
+```sh
+npm run attack
+```
+
+`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera, no MediaPipe — reporting which checks a scripted client fools. It documents the honest ceiling of client-side evidence checks: the server validates statistics of submitted numbers, not real media.
+
 The regression test starts a temporary local HTTP server and checks that:
 
 - fake client-side verification is rejected
@@ -81,6 +90,8 @@ The regression test starts a temporary local HTTP server and checks that:
 4. The server validates order, timing, replay state, and session binding.
 5. After all steps pass, the server issues a short-lived signed token.
 6. The protected action accepts only that server-issued token, once.
+
+Relying parties can redeem a token without the user's session cookie via `POST /api/verify` with `{ "verificationToken": "..." }`. It validates the signature and expiry, enforces one-use, and returns `{ valid, action, method, assurance, expiresAt }`. A second redemption returns `409`. Production deployments should additionally authenticate the calling party (e.g. a shared RP secret).
 
 ## Accessibility And Bad Camera Conditions
 

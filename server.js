@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const http = require('http');
 const path = require('path');
+const { DatabaseSync } = require('node:sqlite');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -35,6 +36,7 @@ const STATE_CHANGING_POST_PATHS = new Set([
   '/api/passkey/auth/verify',
   '/api/passkey/reset',
   '/api/protected-action',
+  '/api/verify',
 ]);
 const TOKEN_TTL_MS = 2 * 60 * 1000;
 const CHALLENGE_TTL_MS = 90 * 1000;
@@ -95,6 +97,83 @@ const usedTokenDigests = new Set();
 const rateLimitByIp = new Map();
 const rateLimitBySession = new Map();
 let lastSweepAt = 0;
+
+// Durable state: sessions, passkey credentials, and consumed token digests
+// survive restarts. Short-lived challenge state stays in memory on purpose.
+const DB_PATH = process.env.ZOE_DB_PATH || path.join(__dirname, 'zoe-data.sqlite3');
+const db = new DatabaseSync(DB_PATH);
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    id TEXT PRIMARY KEY,
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS credentials (
+    session_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    public_key TEXT NOT NULL,
+    alg INTEGER NOT NULL,
+    sign_count INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, id)
+  );
+  CREATE TABLE IF NOT EXISTS used_tokens (
+    digest TEXT PRIMARY KEY,
+    used_at INTEGER NOT NULL
+  );
+`);
+
+for (const row of db.prepare('SELECT id, created_at, last_seen_at FROM sessions').all()) {
+  sessions.set(row.id, {
+    id: row.id,
+    createdAt: row.created_at,
+    lastSeenAt: row.last_seen_at,
+    issuedTokens: new Map(),
+    credentials: new Map(),
+    passkeyRegisterChallenge: null,
+    passkeyAuthChallenge: null,
+    livenessChallenge: null,
+  });
+}
+for (const row of db.prepare('SELECT session_id, id, public_key, alg, sign_count, created_at FROM credentials').all()) {
+  const session = sessions.get(row.session_id);
+  if (session) {
+    session.credentials.set(row.id, {
+      id: row.id,
+      publicKey: row.public_key,
+      alg: row.alg,
+      signCount: row.sign_count,
+      createdAt: row.created_at,
+    });
+  }
+}
+for (const row of db.prepare('SELECT digest FROM used_tokens').all()) {
+  usedTokenDigests.add(row.digest);
+}
+
+const persistSessionStmt = db.prepare('INSERT OR REPLACE INTO sessions (id, created_at, last_seen_at) VALUES (?, ?, ?)');
+const persistCredentialStmt = db.prepare('INSERT OR REPLACE INTO credentials (session_id, id, public_key, alg, sign_count, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+const persistUsedTokenStmt = db.prepare('INSERT OR IGNORE INTO used_tokens (digest, used_at) VALUES (?, ?)');
+const deleteSessionStmt = db.prepare('DELETE FROM sessions WHERE id = ?');
+const deleteSessionCredentialsStmt = db.prepare('DELETE FROM credentials WHERE session_id = ?');
+const pruneUsedTokensStmt = db.prepare('DELETE FROM used_tokens WHERE used_at < ?');
+
+function persistSession(session) {
+  persistSessionStmt.run(session.id, session.createdAt, session.lastSeenAt);
+}
+
+function persistCredential(sessionId, credential) {
+  persistCredentialStmt.run(sessionId, credential.id, credential.publicKey, credential.alg, credential.signCount, credential.createdAt);
+}
+
+function persistUsedToken(digest) {
+  persistUsedTokenStmt.run(digest, now());
+}
+
+function deletePersistedSession(sessionId) {
+  deleteSessionStmt.run(sessionId);
+  deleteSessionCredentialsStmt.run(sessionId);
+}
 
 function now() {
   return Date.now();
@@ -186,9 +265,11 @@ function sweepExpiredState(force = false) {
     if (expired || staleConsumed) challenges.delete(challengeId);
   }
 
+  pruneUsedTokensStmt.run(t - TOKEN_TTL_MS);
   for (const [sid, session] of sessions) {
     if (t - session.lastSeenAt > SESSION_IDLE_TTL_MS) {
       sessions.delete(sid);
+      deletePersistedSession(sid);
       continue;
     }
     for (const [digest, payload] of session.issuedTokens) {
@@ -209,7 +290,10 @@ function sweepExpiredState(force = false) {
 function enforcePostSecurity(req, res, pathname, session) {
   if (req.method !== 'POST' || !STATE_CHANGING_POST_PATHS.has(pathname)) return true;
 
-  const originCheck = validateStateChangingOrigin(req);
+  // /api/verify is the relying-party redemption endpoint: the caller is a
+  // backend redeeming a bearer token, not the verified browser session, so
+  // browser-origin rules do not apply (the token itself is the credential).
+  const originCheck = pathname === '/api/verify' ? { ok: true } : validateStateChangingOrigin(req);
   if (!originCheck.ok) {
     logVerificationFailure('origin_rejected', pathname);
     sendJson(res, 403, { error: originCheck.error });
@@ -285,8 +369,11 @@ function getSession(req, res) {
       livenessChallenge: null,
     });
     res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`);
+    persistSession(sessions.get(sid));
   } else {
-    sessions.get(sid).lastSeenAt = now();
+    const session = sessions.get(sid);
+    session.lastSeenAt = now();
+    persistSession(session);
   }
   return sessions.get(sid);
 }
@@ -684,6 +771,7 @@ function consumeVerificationToken(session, token, allowed) {
   if (!session.issuedTokens.has(digest)) return { error: 'Token was not issued to this session.', status: 403 };
 
   usedTokenDigests.add(digest);
+  persistUsedToken(digest);
   session.issuedTokens.delete(digest);
   return { payload };
 }
@@ -714,6 +802,31 @@ function parseClientData(value, expectedType, expectedChallenge) {
 function parseSignCount(authenticatorData) {
   if (!Buffer.isBuffer(authenticatorData) || authenticatorData.length < 37) return 0;
   return authenticatorData.readUInt32BE(33);
+}
+
+const WEBAUTHN_FLAG_UP = 0x01;
+const WEBAUTHN_FLAG_UV = 0x04;
+
+// The browser never sends rp.id in this demo, so the RP ID is the effective
+// domain of the validated clientData origin.
+function verifyAuthenticatorData(authenticatorData, origin) {
+  if (!Buffer.isBuffer(authenticatorData) || authenticatorData.length < 37) {
+    return { error: 'Passkey authenticator data was incomplete.' };
+  }
+  let rpId;
+  try {
+    rpId = new URL(origin).hostname;
+  } catch {
+    return { error: 'Passkey origin was invalid.' };
+  }
+  const rpIdHash = crypto.createHash('sha256').update(rpId).digest();
+  if (!authenticatorData.subarray(0, 32).equals(rpIdHash)) {
+    return { error: 'Passkey RP ID hash did not verify.' };
+  }
+  if (!(authenticatorData[32] & WEBAUTHN_FLAG_UP)) {
+    return { error: 'Passkey user presence was not verified.' };
+  }
+  return { userVerified: Boolean(authenticatorData[32] & WEBAUTHN_FLAG_UV) };
 }
 
 function verifyPasskeySignature(credential, authenticatorData, clientDataJSON, signature) {
@@ -859,6 +972,7 @@ async function handleApi(req, res, pathname) {
       signCount: 0,
       createdAt: now(),
     });
+    persistCredential(session.id, session.credentials.get(rawId));
     session.passkeyRegisterChallenge = null;
     return sendJson(res, 201, { ok: true, credentialId: rawId });
   }
@@ -892,6 +1006,11 @@ async function handleApi(req, res, pathname) {
     const authenticatorData = decodeCredentialPart(body.authenticatorData);
     const signature = decodeCredentialPart(body.signature);
     if (!client || !authenticatorData || !signature) return sendJson(res, 400, { error: 'Passkey response was incomplete.' });
+    const authData = verifyAuthenticatorData(authenticatorData, client.parsed.origin);
+    if (authData.error) {
+      logVerificationFailure('passkey_authenticator_data', pathname);
+      return sendJson(res, 401, { error: authData.error });
+    }
     if (!verifyPasskeySignature(credential, authenticatorData, client.bytes, signature)) {
       return sendJson(res, 401, { error: 'Passkey signature did not verify.' });
     }
@@ -901,8 +1020,10 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 401, { error: 'Passkey replay was detected.' });
     }
     credential.signCount = signCount || credential.signCount;
+    persistCredential(session.id, credential);
     session.passkeyAuthChallenge = null;
-    const token = issueVerificationToken(session, { id: `passkey:${credential.id}` }, 'passkey', 'strong');
+    const assurance = authData.userVerified ? 'strong' : 'standard';
+    const token = issueVerificationToken(session, { id: `passkey:${credential.id}` }, 'passkey', assurance);
     return sendJson(res, 200, { verified: true, verificationToken: token, tokenExpiresAt: now() + TOKEN_TTL_MS });
   }
 
@@ -987,6 +1108,35 @@ async function handleApi(req, res, pathname) {
     });
   }
 
+  if (req.method === 'POST' && pathname === '/api/verify') {
+    let body;
+    try {
+      body = await readJson(req);
+    } catch (err) {
+      return sendJson(res, 400, { error: err.message });
+    }
+
+    const payload = verifySignedPayload(body.verificationToken);
+    if (!payload || payload.type !== 'zoe.verification') return sendJson(res, 401, { error: 'Invalid verification token.' });
+    if (now() > payload.exp) return sendJson(res, 401, { error: 'Verification token expired.' });
+
+    const digest = crypto.createHash('sha256').update(body.verificationToken).digest('base64url');
+    if (usedTokenDigests.has(digest)) return sendJson(res, 409, { error: 'Verification token was already used.' });
+
+    usedTokenDigests.add(digest);
+    persistUsedToken(digest);
+    const issuingSession = sessions.get(payload.sid);
+    if (issuingSession) issuingSession.issuedTokens.delete(digest);
+
+    return sendJson(res, 200, {
+      valid: true,
+      action: payload.action,
+      method: payload.method,
+      assurance: payload.assurance,
+      expiresAt: payload.exp,
+    });
+  }
+
   if (req.method === 'POST' && pathname === '/api/protected-action') {
     let body;
     try {
@@ -1068,4 +1218,5 @@ module.exports = {
   computeLivenessSeriesDigest,
   deriveLivenessPhasesFromMotionSeries,
   validateHandLandmarkGeometry,
+  verifyAuthenticatorData,
 };
