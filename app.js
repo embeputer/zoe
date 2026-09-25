@@ -1672,6 +1672,7 @@ async function runPulseCheck(engine, measureMs, samples, t0) {
     if (g !== null) samples.push({ g: Math.round(g * 100) / 100, t: Math.round(performance.now() - t0) });
     const remaining = Math.max(1, Math.ceil((measureMs - now) / 1000));
     promptHintEl.textContent = `Keep your face lit and steady — ${remaining}s left`;
+    drawFaceGuide(box, { state: box && !box.stale ? 'good' : 'neutral' });
     await sleep(PULSE_SAMPLE_MS);
   }
   return samples;
@@ -1698,6 +1699,7 @@ async function runFlashPixelCheck(engine, flashPlan) {
     const sample = sampleFlashPixels(box);
     sample.t = Math.round(now);
     samples.push(sample);
+    drawFaceGuide(box, { state: box && !box.stale ? 'good' : 'neutral' });
     await sleep(70);
   }
   setFlashOverlay(null);
