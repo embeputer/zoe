@@ -729,14 +729,21 @@ function validatePulseSeries(pulseSeries, reducedMotion) {
   const span = sig[sig.length - 1].t - sig[0].t;
   if (span < minSpanMs) return { error: 'Pulse measurement was too short.' };
 
-  const mean = sig.reduce((a, s) => a + s.g, 0) / sig.length;
-  const xs = sig.map((s) => s.g - mean);
-  const std = Math.sqrt(xs.reduce((a, v) => a + v * v, 0) / xs.length);
+  // Clients collect pulse samples in the background during the motion phases
+  // too; those are noisier, so the spectral checks run on the stillness tail
+  // (the dedicated hold-still segment the client appends last).
+  const tailStart = sig[sig.length - 1].t - minSpanMs;
+  const tail = sig.filter((s) => s.t >= tailStart);
+  const win = tail.length >= PULSE_MIN_SAMPLES ? tail : sig;
+
+  const mean = win.reduce((a, s) => a + s.g, 0) / win.length;
+  const xs = win.map((s) => s.g - mean);
+  const std = Math.sqrt(xs.reduce((a, v) => a + v * v, 0) / win.length);
   if (std < PULSE_STD_MIN) return { error: 'Pulse signal was flat — no living tissue detected.' };
 
   // Median sample interval gives the effective sample rate.
   const dts = [];
-  for (let i = 1; i < sig.length; i++) dts.push(sig[i].t - sig[i - 1].t);
+  for (let i = 1; i < win.length; i++) dts.push(win[i].t - win[i - 1].t);
   dts.sort((a, b) => a - b);
   const fs = 1000 / Math.max(1, dts[Math.floor(dts.length / 2)]);
   if (fs < 4) return { error: 'Pulse sampling rate is too low.' };

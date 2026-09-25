@@ -1500,6 +1500,7 @@ async function runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeri
           const motionValue = opts.motionValue(box);
           pushFaceSeriesSample(phaseSeries, opts.phase, opts.flowStartedAt, motionValue, box.keypoints);
         }
+        if (opts.collectPulse) opts.collectPulse(box);
       }
       promptHintEl.textContent = opts.hint;
       drawFaceGuide(box, { state: 'move', arrow: opts.arrow });
@@ -1600,6 +1601,14 @@ const PULSE_MEASURE_MS = 14000;
 // carries the liveness gate and measures longer to compensate.
 const PULSE_MEASURE_MS_REDUCED = 20000;
 const PULSE_SAMPLE_MS = 95;
+// Pulse sampling also runs in the background during the motion phases, so the
+// dedicated hold-still stage only tops up whatever window is still missing.
+// The floor keeps the server's analysis tail mostly stillness; reduced-motion
+// challenges rely on the pulse check alone so their tail is longer.
+const PULSE_TOPUP_MIN_MS = 5000;
+const PULSE_TOPUP_MIN_REDUCED_MS = 9000;
+const PULSE_BG_MIN_GAP_MS = 110;
+const PULSE_BG_MAX_SAMPLES = 300;
 const pulseCanvas = document.createElement('canvas');
 pulseCanvas.width = PULSE_ROI_W;
 pulseCanvas.height = PULSE_ROI_H;
@@ -1626,17 +1635,16 @@ function samplePulseGreen(box) {
   return g / n;
 }
 
-async function runPulseCheck(engine, measureMs = PULSE_MEASURE_MS) {
-  const t0 = performance.now();
-  const samples = [];
+async function runPulseCheck(engine, measureMs, samples, t0) {
+  const measureStart = performance.now();
   setStatus('Hold still', 'listening');
   promptNameEl.textContent = 'Hold still';
   while (faceChecking) {
-    const now = performance.now() - t0;
+    const now = performance.now() - measureStart;
     if (now > measureMs) break;
     const box = await detectStableFaceFrame(engine);
     const g = box && !box.stale ? samplePulseGreen(box) : null;
-    if (g !== null) samples.push({ g: Math.round(g * 100) / 100, t: Math.round(now) });
+    if (g !== null) samples.push({ g: Math.round(g * 100) / 100, t: Math.round(performance.now() - t0) });
     const remaining = Math.max(1, Math.ceil((measureMs - now) / 1000));
     promptHintEl.textContent = `Keep your face lit and steady — ${remaining}s left`;
     await sleep(PULSE_SAMPLE_MS);
@@ -1692,7 +1700,19 @@ async function runGuidedFaceCheck() {
   const yaws = [];
   const poses = [];
   const phaseSeries = [];
+  const pulseSeries = [];
   const startedAt = performance.now();
+  let lastPulseT = -1;
+  const collectPulse = (box) => {
+    if (!box || box.stale || pulseSeries.length >= PULSE_BG_MAX_SAMPLES) return;
+    const t = performance.now() - startedAt;
+    if (t - lastPulseT < PULSE_BG_MIN_GAP_MS) return;
+    const g = samplePulseGreen(box);
+    if (g !== null) {
+      pulseSeries.push({ g: Math.round(g * 100) / 100, t: Math.round(t) });
+      lastPulseT = t;
+    }
+  };
   const deadline = startedAt + 30000;
   recentFaceBox = null;
   recentFaceBoxAt = 0;
@@ -1724,6 +1744,7 @@ async function runGuidedFaceCheck() {
         if (centeredFrames > 0 && phaseSeries.length < 120) {
           pushFaceSeriesSample(phaseSeries, 'center_hold', startedAt, motionValue(box), box.keypoints);
         }
+        collectPulse(box);
       }
       const ok = inTarget(box);
       promptHintEl.textContent = !box
@@ -1762,6 +1783,7 @@ async function runGuidedFaceCheck() {
         phase: phaseId,
         motionValue,
         reached: phaseUi.reached,
+        collectPulse,
       });
       if (!moved) {
         throw new Error(`Face motion timed out. ${phaseUi.hint} Then try again.`);
@@ -1772,7 +1794,10 @@ async function runGuidedFaceCheck() {
     if (!faceChecking) return;
 
     promptEmojiEl.textContent = '💓';
-    const pulseSeries = await runPulseCheck(engine, flashPlan ? PULSE_MEASURE_MS : PULSE_MEASURE_MS_REDUCED);
+    const pulseTargetMs = flashPlan ? PULSE_MEASURE_MS : PULSE_MEASURE_MS_REDUCED;
+    const pulseElapsedMs = pulseSeries.length ? pulseSeries[pulseSeries.length - 1].t : 0;
+    const pulseTopUpMinMs = flashPlan ? PULSE_TOPUP_MIN_MS : PULSE_TOPUP_MIN_REDUCED_MS;
+    await runPulseCheck(engine, Math.max(pulseTopUpMinMs, pulseTargetMs - pulseElapsedMs), pulseSeries, startedAt);
     if (!faceChecking) return;
 
     let pixelSeries = null;
