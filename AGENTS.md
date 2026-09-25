@@ -88,7 +88,15 @@ Important gesture details:
 
 ### Zoe ID
 
-Zoe ID is the high-assurance repeat-use path. It is implemented as WebAuthn/passkeys in this demo. Passkey credentials are stored in memory on the session, not in durable accounts.
+Zoe ID is the high-assurance repeat-use path. It is implemented as WebAuthn/passkeys in this demo. Passkey credentials persist per session in SQLite (a `hardware_backed` flag is stored alongside the credential).
+
+Registration asks the authenticator for an attestation (`attestation: 'direct'`) and the client forwards `attestationObject` to `/api/passkey/register/verify`. The server parses the CBOR attestation object and:
+
+- `packed`/`apple` with an x5c chain that verifies to an embedded FIDO root (Apple WebAuthn Root CA, Yubico U2F/FIDO/Attestation roots) marks the credential `hardwareBacked`.
+- `fmt 'none'`, packed self-attestation, and unknown formats still register but stay software-backed; malformed attestation objects are 400s.
+- Trust anchors live in `FIDO_ROOT_PEMS` in `server.js`; `ZOE_FIDO_ROOT_PEMS` (JSON array of PEMs) replaces them — tests inject a generated root.
+
+Assurance on redeem: `hardwareBacked && userVerified` → `'strong'`; everything else → `'standard'`. A scripted software keypair can complete the whole Zoe ID lifecycle but caps at `'standard'` — the `attack:agent` scripted-Zoe-ID probe asserts exactly that.
 
 Zoe ID registration must be gated. Do not blindly create a passkey just because the user clicked register:
 

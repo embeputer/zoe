@@ -1011,6 +1011,9 @@ async function registerPasskey(registrationVerificationToken) {
     clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
     publicKey: bufferToBase64url(publicKey),
     alg,
+    attestationObject: credential.response.attestationObject
+      ? bufferToBase64url(credential.response.attestationObject)
+      : undefined,
   });
 }
 

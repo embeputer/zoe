@@ -11,7 +11,11 @@ const REQUIRE_SECRET = IS_PRODUCTION || process.env.ZOE_REQUIRE_SECRET === '1';
 const LOG_VERIFICATION_FAILURES = process.env.ZOE_LOG_VERIFICATION_FAILURES === '1';
 const RATE_LIMIT_WINDOW_MS = Number(process.env.ZOE_RATE_LIMIT_WINDOW_MS || 60_000);
 const RATE_LIMIT_MAX_PER_IP = Number(process.env.ZOE_RATE_LIMIT_MAX_PER_IP || 120);
-const RATE_LIMIT_MAX_PER_SESSION = Number(process.env.ZOE_RATE_LIMIT_MAX_PER_SESSION || 0);
+// Per-session cap on API hits per window, on top of the per-IP cap. Read
+// per-request (like the wall-clock floors) so tests and ops can toggle it.
+function rateLimitMaxPerSession() {
+  return Number(process.env.ZOE_RATE_LIMIT_MAX_PER_SESSION ?? 60);
+}
 const SESSION_IDLE_TTL_MS = Number(process.env.ZOE_SESSION_IDLE_TTL_MS || 60 * 60 * 1000);
 const SWEEP_MIN_INTERVAL_MS = Number(process.env.ZOE_SWEEP_INTERVAL_MS || 30_000);
 const DEFAULT_ALLOWED_ORIGINS = [
@@ -154,6 +158,7 @@ db.exec(`
     alg INTEGER NOT NULL,
     sign_count INTEGER NOT NULL,
     created_at INTEGER NOT NULL,
+    hardware_backed INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (session_id, id)
   );
   CREATE TABLE IF NOT EXISTS used_tokens (
@@ -161,6 +166,11 @@ db.exec(`
     used_at INTEGER NOT NULL
   );
 `);
+try {
+  db.exec('ALTER TABLE credentials ADD COLUMN hardware_backed INTEGER NOT NULL DEFAULT 0');
+} catch {
+  // Column already exists on pre-upgrade databases.
+}
 
 for (const row of db.prepare('SELECT id, created_at, last_seen_at FROM sessions').all()) {
   sessions.set(row.id, {
@@ -175,7 +185,7 @@ for (const row of db.prepare('SELECT id, created_at, last_seen_at FROM sessions'
     persisted: true,
   });
 }
-for (const row of db.prepare('SELECT session_id, id, public_key, alg, sign_count, created_at FROM credentials').all()) {
+for (const row of db.prepare('SELECT session_id, id, public_key, alg, sign_count, created_at, hardware_backed FROM credentials').all()) {
   const session = sessions.get(row.session_id);
   if (session) {
     session.credentials.set(row.id, {
@@ -184,6 +194,7 @@ for (const row of db.prepare('SELECT session_id, id, public_key, alg, sign_count
       alg: row.alg,
       signCount: row.sign_count,
       createdAt: row.created_at,
+      hardwareBacked: row.hardware_backed === 1,
     });
   }
 }
@@ -192,7 +203,7 @@ for (const row of db.prepare('SELECT digest FROM used_tokens').all()) {
 }
 
 const persistSessionStmt = db.prepare('INSERT OR REPLACE INTO sessions (id, created_at, last_seen_at) VALUES (?, ?, ?)');
-const persistCredentialStmt = db.prepare('INSERT OR REPLACE INTO credentials (session_id, id, public_key, alg, sign_count, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+const persistCredentialStmt = db.prepare('INSERT OR REPLACE INTO credentials (session_id, id, public_key, alg, sign_count, created_at, hardware_backed) VALUES (?, ?, ?, ?, ?, ?, ?)');
 const persistUsedTokenStmt = db.prepare('INSERT OR IGNORE INTO used_tokens (digest, used_at) VALUES (?, ?)');
 const deleteSessionStmt = db.prepare('DELETE FROM sessions WHERE id = ?');
 const deleteSessionCredentialsStmt = db.prepare('DELETE FROM credentials WHERE session_id = ?');
@@ -204,7 +215,7 @@ function persistSession(session) {
 }
 
 function persistCredential(sessionId, credential) {
-  persistCredentialStmt.run(sessionId, credential.id, credential.publicKey, credential.alg, credential.signCount, credential.createdAt);
+  persistCredentialStmt.run(sessionId, credential.id, credential.publicKey, credential.alg, credential.signCount, credential.createdAt, credential.hardwareBacked ? 1 : 0);
 }
 
 function persistUsedToken(digest) {
@@ -284,14 +295,15 @@ function checkRateLimit(ip, sessionId) {
     return { limited: true, scope: 'ip' };
   }
 
-  if (RATE_LIMIT_MAX_PER_SESSION > 0 && sessionId) {
+  const sessionMax = rateLimitMaxPerSession();
+  if (sessionMax > 0 && sessionId) {
     let sessionBucket = rateLimitBySession.get(sessionId);
     if (!sessionBucket || t >= sessionBucket.resetAt) {
       sessionBucket = { count: 0, resetAt: t + RATE_LIMIT_WINDOW_MS };
       rateLimitBySession.set(sessionId, sessionBucket);
     }
     sessionBucket.count += 1;
-    if (sessionBucket.count > RATE_LIMIT_MAX_PER_SESSION) {
+    if (sessionBucket.count > sessionMax) {
       return { limited: true, scope: 'session' };
     }
   }
@@ -1098,6 +1110,266 @@ function verifyPasskeySignature(credential, authenticatorData, clientDataJSON, s
   return crypto.verify(algorithm, signedData, key, signature);
 }
 
+// ---- WebAuthn attestation ----
+// Attestation is the only check that distinguishes a real hardware
+// authenticator from a generated software key. Verified packed/apple
+// attestation chains → credential can mint 'strong' tokens; everything else
+// (fmt 'none', self-attestation, unknown fmt, untrusted chain) → 'standard'.
+
+const FIDO_ROOT_PEMS = [
+  `-----BEGIN CERTIFICATE-----
+MIICEjCCAZmgAwIBAgIQaB0BbHo84wIlpQGUKEdXcTAKBggqhkjOPQQDAzBLMR8w
+HQYDVQQDDBZBcHBsZSBXZWJBdXRobiBSb290IENBMRMwEQYDVQQKDApBcHBsZSBJ
+bmMuMRMwEQYDVQQIDApDYWxpZm9ybmlhMB4XDTIwMDMxODE4MjEzMloXDTQ1MDMx
+NTAwMDAwMFowSzEfMB0GA1UEAwwWQXBwbGUgV2ViQXV0aG4gUm9vdCBDQTETMBEG
+A1UECgwKQXBwbGUgSW5jLjETMBEGA1UECAwKQ2FsaWZvcm5pYTB2MBAGByqGSM49
+AgEGBSuBBAAiA2IABCJCQ2pTVhzjl4Wo6IhHtMSAzO2cv+H9DQKev3//fG59G11k
+xu9eI0/7o6V5uShBpe1u6l6mS19S1FEh6yGljnZAJ+2GNP1mi/YK2kSXIuTHjxA/
+pcoRf7XkOtO4o1qlcaNCMEAwDwYDVR0TAQH/BAUwAwEB/zAdBgNVHQ4EFgQUJtdk
+2cV4wlpn0afeaxLQG2PxxtcwDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMDA2cA
+MGQCMFrZ+9DsJ1PW9hfNdBywZDsWDbWFp28it1d/5w2RPkRX3Bbn/UbDTNLx7Jr3
+jAGGiQIwHFj+dJZYUJR786osByBelJYsVZd2GbHQu209b5RCmGQ21gpSAk9QZW4B
+1bWeT0vT
+-----END CERTIFICATE-----`,
+  `-----BEGIN CERTIFICATE-----
+MIIDHjCCAgagAwIBAgIEG0BT9zANBgkqhkiG9w0BAQsFADAuMSwwKgYDVQQDEyNZ
+dWJpY28gVTJGIFJvb3QgQ0EgU2VyaWFsIDQ1NzIwMDYzMTAgFw0xNDA4MDEwMDAw
+MDBaGA8yMDUwMDkwNDAwMDAwMFowLjEsMCoGA1UEAxMjWXViaWNvIFUyRiBSb290
+IENBIFNlcmlhbCA0NTcyMDA2MzEwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
+AoIBAQC/jwYuhBVlqaiYWEMsrWFisgJ+PtM91eSrpI4TK7U53mwCIawSDHy8vUmk
+5N2KAj9abvT9NP5SMS1hQi3usxoYGonXQgfO6ZXyUA9a+KAkqdFnBnlyugSeCOep
+8EdZFfsaRFtMjkwz5Gcz2Py4vIYvCdMHPtwaz0bVuzneueIEz6TnQjE63Rdt2zbw
+nebwTG5ZybeWSwbzy+BJ34ZHcUhPAY89yJQXuE0IzMZFcEBbPNRbWECRKgjq//qT
+9nmDOFVlSRCt2wiqPSzluwn+v+suQEBsUjTGMEd25tKXXTkNW21wIWbxeSyUoTXw
+LvGS6xlwQSgNpk2qXYwf8iXg7VWZAgMBAAGjQjBAMB0GA1UdDgQWBBQgIvz0bNGJ
+hjgpToksyKpP9xv9oDAPBgNVHRMECDAGAQH/AgEAMA4GA1UdDwEB/wQEAwIBBjAN
+BgkqhkiG9w0BAQsFAAOCAQEAjvjuOMDSa+JXFCLyBKsycXtBVZsJ4Ue3LbaEsPY4
+MYN/hIQ5ZM5p7EjfcnMG4CtYkNsfNHc0AhBLdq45rnT87q/6O3vUEtNMafbhU6kt
+hX7Y+9XFN9NpmYxr+ekVY5xOxi8h9JDIgoMP4VB1uS0aunL1IGqrNooL9mmFnL2k
+LVVee6/VR6C5+KSTCMCWppMuJIZII2v9o4dkoZ8Y7QRjQlLfYzd3qGtKbw7xaF1U
+sG/5xUb/Btwb2X2g4InpiB/yt/3CpQXpiWX/K4mBvUKiGn05ZsqeY1gx4g0xLBqc
+U9psmyPzK+Vsgw2jeRQ5JlKDyqE0hebfC1tvFu0CCrJFcw==
+-----END CERTIFICATE-----`,
+  `-----BEGIN CERTIFICATE-----
+MIIDMzCCAhugAwIBAgIUSOEjTf//yqRfPW7Qq8qtIyCrAg8wDQYJKoZIhvcNAQEL
+BQAwLzEtMCsGA1UEAwwkWXViaWNvIEZJRE8gUm9vdCBDQSBTZXJpYWwgNDUwMjAz
+NTU2MCAXDTI0MDUwMTAwMDAwMFoYDzIwNjAwNDMwMDAwMDAwWjAvMS0wKwYDVQQD
+DCRZdWJpY28gRklETyBSb290IENBIFNlcmlhbCA0NTAyMDM1NTYwggEiMA0GCSqG
+SIb3DQEBAQUAA4IBDwAwggEKAoIBAQCdvl27w2gu1fPXeEFbIdqx0BalvVDVWrQP
+J7HqviuEtZHlxSLxSFtcXpTolvLvof8f4tMerQTkVGzcmYzm1EBT4IJuMmoEqfkE
+EhWpsADMFrjZkqlZY9EqxQzLoVEEonE5oGxSdVCxCcLIackpyR/CCXvj1Bt/hTgE
+9hTlF4pRqxMkx3plF7y8dDZlRHWs7vbnhmBCGeI0ZPEQ6nl2mCg2r74adF2u6K9r
+rLfhBC3QLE8EPrgqUsI+hkuq2tK4M2SMOp8uUVVkqUeu3h0kr3WVI0W02pkgrOgi
+FKLFNkSrbYhdjMBDj5izmqfc9xJRKoDX612qd8ZGVHpT5AYFX+1hAgMBAAGjRTBD
+MB0GA1UdDgQWBBTZyU5DiQ/a2UEgE7qBK0zhIsRNRjASBgNVHRMBAf8ECDAGAQH/
+AgEAMA4GA1UdDwEB/wQEAwIBBjANBgkqhkiG9w0BAQsFAAOCAQEAXvnB4SLuUJfY
+MSVGAhssL/SmWli3FSccgxydvKlACcidIIWKQqa3q/QSUEQzC9DgEfMgr7iC1BkT
+ZbILboV6UZ5knNsvjEZWuMeogJ8tgZs1hVvKwZizwJ+mEcmsjhIrBYuoL1T6yrOJ
+vKFg1jv+Cy4ZwA9Bpk/V3UOir1VyK8dCtyHu6vfosotAdYx8FAuR243gRTMV6Jx8
+Jdig2JDIAQMlzVeDpSUHX/K2HXRHxHwfgjbgUjjBu/72r8OfehyhzHXI3K8CFFdf
+lO+8nEOJK3y8F1ivgS5uN/8SmcYw/STQYwhrxPuwz3nP8baMum4BB2nnYmpB60sX
+3bl5k8QUSw==
+-----END CERTIFICATE-----`,
+  `-----BEGIN CERTIFICATE-----
+MIIDPjCCAiagAwIBAgIUXzeiEDJEOTt14F5n0o6Zf/bBwiUwDQYJKoZIhvcNAQEN
+BQAwJDEiMCAGA1UEAwwZWXViaWNvIEF0dGVzdGF0aW9uIFJvb3QgMTAgFw0yNDEy
+MDEwMDAwMDBaGA85OTk5MTIzMTIzNTk1OVowJDEiMCAGA1UEAwwZWXViaWNvIEF0
+dGVzdGF0aW9uIFJvb3QgMTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEB
+AMZ6/TxM8rIT+EaoPvG81ontMOo/2mQ2RBwJHS0QZcxVaNXvl12LUhBZ5LmiBScI
+Zd1Rnx1od585h+/dhK7hEm7JAALkKKts1fO53KGNLZujz5h3wGncr4hyKF0G74b/
+U3K9hE5mGND6zqYchCRAHfrYMYRDF4YL0X4D5nGdxvppAy6nkEmtWmMnwO3i0TAu
+csrbE485HvGM4r0VpgVdJpvgQjiTJCTIq+D35hwtT8QDIv+nGvpcyi5wcIfCkzyC
+imJukhYy6KoqNMKQEdpNiSOvWyDMTMt1bwCvEzpw91u+msUt4rj0efnO9s0ZOwdw
+MRDnH4xgUl5ZLwrrPkfC1/0CAwEAAaNmMGQwHQYDVR0OBBYEFNLu71oijTptXCOX
+PfKF1SbxJXuSMB8GA1UdIwQYMBaAFNLu71oijTptXCOXPfKF1SbxJXuSMBIGA1Ud
+EwEB/wQIMAYBAf8CAQMwDgYDVR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBDQUAA4IB
+AQC3IW/sgB9pZ8apJNjxuGoX+FkILks0wMNrdXL/coUvsrhzsvl6mePMrbGJByJ1
+XnquB5sgcRENFxdQFma3mio8Upf1owM1ZreXrJ0mADG2BplqbJnxiyYa+R11reIF
+TWeIhMNcZKsDZrFAyPuFjCWSQvJmNWe9mFRYFgNhXJKkXIb5H1XgEDlwiedYRM7V
+olBNlld6pRFKlX8ust6OTMOeADl2xNF0m1LThSdeuXvDyC1g9+ILfz3S6OIYgc3i
+roRcFD354g7rKfu67qFAw9gC4yi0xBTPrY95rh4/HqaUYCA/L8ldRk6H7Xk35D+W
+Vpmq2Sh/xT5HiFuhf4wJb0bK
+-----END CERTIFICATE-----`,
+];
+
+function fidoRoots() {
+  // Re-read per call so tests can inject roots via ZOE_FIDO_ROOT_PEMS (JSON array of PEMs).
+  const pems = process.env.ZOE_FIDO_ROOT_PEMS ? JSON.parse(process.env.ZOE_FIDO_ROOT_PEMS) : FIDO_ROOT_PEMS;
+  return pems.map((pem) => new crypto.X509Certificate(pem));
+}
+
+// Minimal CBOR decoder — sufficient for attestationObject/authData COSE keys.
+function cborRead(buf, pos) {
+  const ib = buf[pos];
+  const major = ib >> 5;
+  const ai = ib & 0x1f;
+  let p = pos + 1;
+  let n = ai;
+  if (ai === 24) { n = buf[p]; p += 1; }
+  else if (ai === 25) { n = buf.readUInt16BE(p); p += 2; }
+  else if (ai === 26) { n = buf.readUInt32BE(p); p += 4; }
+  else if (ai === 27) { n = Number(buf.readBigUInt64BE(p)); p += 8; }
+  else if (ai === 31 || ai > 27) throw new Error('unsupported CBOR item');
+  switch (major) {
+    case 0: return [n, p];
+    case 1: return [-1 - n, p];
+    case 2: return [buf.subarray(p, p + n), p + n];
+    case 3: return [buf.subarray(p, p + n).toString('utf8'), p + n];
+    case 4: {
+      const arr = [];
+      for (let i = 0; i < n; i++) { const [v, np] = cborRead(buf, p); arr.push(v); p = np; }
+      return [arr, p];
+    }
+    case 5: {
+      const obj = {};
+      for (let i = 0; i < n; i++) {
+        const [k, kp] = cborRead(buf, p);
+        const [v, np] = cborRead(buf, kp);
+        obj[k] = v;
+        p = np;
+      }
+      return [obj, p];
+    }
+    case 7: {
+      if (ai === 20) return [false, p];
+      if (ai === 21) return [true, p];
+      if (ai === 22 || ai === 23) return [null, p];
+      if (ai === 26) return [buf.readFloatBE(pos + 1), p];
+      if (ai === 27) return [buf.readDoubleBE(pos + 1), p];
+      return [n, p];
+    }
+    default: throw new Error('unsupported CBOR major type');
+  }
+}
+
+function cborDecode(buf) {
+  const [value] = cborRead(buf, 0);
+  return value;
+}
+
+const SPKI_EC_P256_PREFIX = Buffer.from('3059301306072a8648ce3d020106082a8648ce3d030107034200', 'hex');
+
+// COSE EC2 P-256 key → SPKI DER (base64url, matching stored credential.publicKey).
+function coseKeyToPublic(coseKey) {
+  if (coseKey[1] !== 2 || coseKey[-1] !== 1) return null;
+  const x = coseKey[-2];
+  const y = coseKey[-3];
+  if (!Buffer.isBuffer(x) || x.length !== 32 || !Buffer.isBuffer(y) || y.length !== 32) return null;
+  const der = Buffer.concat([SPKI_EC_P256_PREFIX, Buffer.from([0x04]), x, y]);
+  return { publicKey: der.toString('base64url'), alg: typeof coseKey[3] === 'number' ? coseKey[3] : -7 };
+}
+
+function certChainsToRoot(x5cDers) {
+  try {
+    const chain = x5cDers.map((der) => new crypto.X509Certificate(Buffer.isBuffer(der) ? der : Buffer.from(der)));
+    const leaf = chain[0];
+    const t = new Date();
+    if (new Date(leaf.validFrom) > t || new Date(leaf.validTo) < t) return false;
+    if (leaf.ca) return false; // attestation leaf must not be a CA
+    for (let i = 0; i < chain.length - 1; i++) {
+      if (!chain[i].checkIssued(chain[i + 1]) || !chain[i].verify(chain[i + 1].publicKey)) return false;
+    }
+    const last = chain[chain.length - 1];
+    for (const root of fidoRoots()) {
+      if (last.raw.equals(root.raw)) return true;
+      if (last.checkIssued(root) && last.verify(root.publicKey)) return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function verifyAttestationSignature(alg, signedData, publicKeySource, signature) {
+  const key = typeof publicKeySource === 'string'
+    ? crypto.createPublicKey({ key: Buffer.from(publicKeySource, 'base64url'), format: 'der', type: 'spki' })
+    : publicKeySource;
+  if (alg === -257) {
+    return crypto.verify('RSA-SHA256', signedData, key, signature);
+  }
+  return crypto.verify('SHA256', signedData, key, signature);
+}
+
+// Parses a real WebAuthn attestationObject, verifies the RP binding, and
+// decides whether the credential is hardware-attested. Returns
+// { error } on malformed input, otherwise { hardwareBacked, credentialId, publicKey, alg, fmt }.
+function verifyAttestation(attestationObjectB64, clientDataJSONBytes, origin, expectedRawId) {
+  const attBytes = decodeCredentialPart(attestationObjectB64);
+  if (!attBytes) return { error: 'Passkey attestation object was malformed.' };
+  let att;
+  try {
+    att = cborDecode(attBytes);
+  } catch {
+    return { error: 'Passkey attestation object was malformed.' };
+  }
+  const { fmt, attStmt, authData } = att || {};
+  if (typeof fmt !== 'string' || !Buffer.isBuffer(authData) || authData.length < 55) {
+    return { error: 'Passkey attestation object was malformed.' };
+  }
+
+  let rpId;
+  try {
+    rpId = new URL(origin).hostname;
+  } catch {
+    return { error: 'Passkey origin was invalid.' };
+  }
+  if (!authData.subarray(0, 32).equals(crypto.createHash('sha256').update(rpId).digest())) {
+    return { error: 'Passkey attestation RP ID hash did not verify.' };
+  }
+  const flags = authData[32];
+  if (!(flags & WEBAUTHN_FLAG_UP)) return { error: 'Passkey user presence was not verified.' };
+  if (!(flags & 0x40)) return { error: 'Passkey attestation is missing credential data.' };
+
+  const credIdLen = authData.readUInt16BE(53);
+  const credId = authData.subarray(55, 55 + credIdLen);
+  const coseBytes = authData.subarray(55 + credIdLen);
+  let credential;
+  try {
+    credential = coseKeyToPublic(cborDecode(coseBytes));
+  } catch {
+    credential = null;
+  }
+  if (!credential) return { error: 'Passkey attestation credential key was unsupported.' };
+  const credentialId = credId.toString('base64url');
+  if (expectedRawId && credentialId !== expectedRawId) {
+    return { error: 'Passkey attestation credential ID did not match.' };
+  }
+
+  const signedData = Buffer.concat([authData, crypto.createHash('sha256').update(clientDataJSONBytes).digest()]);
+  let hardwareBacked = false;
+  if (fmt === 'packed') {
+    const x5c = Array.isArray(attStmt && attStmt.x5c) ? attStmt.x5c : [];
+    const sig = attStmt && attStmt.sig;
+    if (x5c.length) {
+      if (!certChainsToRoot(x5c)) return { error: 'Passkey attestation chain is not trusted.' };
+      const leaf = new crypto.X509Certificate(x5c[0]);
+      if (!Buffer.isBuffer(sig) || !verifyAttestationSignature(attStmt.alg, signedData, leaf.publicKey, sig)) {
+        return { error: 'Passkey attestation signature did not verify.' };
+      }
+      hardwareBacked = true;
+    } else {
+      // Self attestation: proves key possession, not hardware. Stays 'standard'.
+      if (!Buffer.isBuffer(sig) || !verifyAttestationSignature(attStmt && attStmt.alg, signedData, credential.publicKey, sig)) {
+        return { error: 'Passkey attestation signature did not verify.' };
+      }
+    }
+  } else if (fmt === 'apple') {
+    const x5c = Array.isArray(attStmt && attStmt.x5c) ? attStmt.x5c : [];
+    if (!x5c.length || !certChainsToRoot(x5c)) return { error: 'Passkey attestation chain is not trusted.' };
+    hardwareBacked = true;
+  } else if (fmt !== 'none') {
+    return { error: 'Passkey attestation format is not supported.' };
+  }
+
+  return {
+    fmt,
+    hardwareBacked,
+    credentialId,
+    publicKey: credential.publicKey,
+    alg: credential.alg,
+  };
+}
+
 async function handleApi(req, res, pathname) {
   sweepExpiredState();
   const session = getSession(req, res);
@@ -1189,7 +1461,7 @@ async function handleApi(req, res, pathname) {
         { type: 'public-key', alg: -257 },
       ],
       timeout: 60000,
-      attestation: 'none',
+      attestation: 'direct',
       authenticatorSelection: {
         residentKey: 'preferred',
         userVerification: 'preferred',
@@ -1221,8 +1493,17 @@ async function handleApi(req, res, pathname) {
     if (!client) return sendJson(res, 400, { error: 'Passkey registration challenge did not verify.' });
 
     const rawId = typeof body.rawId === 'string' ? body.rawId : null;
-    const publicKey = typeof body.publicKey === 'string' ? body.publicKey : null;
-    const alg = Number(body.alg);
+    let publicKey = typeof body.publicKey === 'string' ? body.publicKey : null;
+    let alg = Number(body.alg);
+    let hardwareBacked = false;
+
+    if (typeof body.attestationObject === 'string') {
+      const att = verifyAttestation(body.attestationObject, client.bytes, client.parsed.origin, rawId);
+      if (att.error) return sendJson(res, 400, { error: att.error });
+      hardwareBacked = att.hardwareBacked === true;
+      publicKey = att.publicKey; // COSE key inside attested credential data is authoritative
+      alg = att.alg;
+    }
     if (!rawId || !publicKey || ![-7, -257].includes(alg)) {
       return sendJson(res, 400, { error: 'Browser did not provide a usable passkey public key.' });
     }
@@ -1233,6 +1514,7 @@ async function handleApi(req, res, pathname) {
       alg,
       signCount: 0,
       createdAt: now(),
+      hardwareBacked,
     });
     persistSession(session);
     persistCredential(session.id, session.credentials.get(rawId));
@@ -1286,7 +1568,10 @@ async function handleApi(req, res, pathname) {
     credential.signCount = signCount || credential.signCount;
     persistCredential(session.id, credential);
     session.passkeyAuthChallenge = null;
-    const assurance = authData.userVerified ? 'strong' : 'standard';
+    // 'strong' requires a real authenticator: verified hardware attestation at
+    // registration AND user verification on this assertion. Software keys and
+    // fmt:'none' credentials cap at 'standard'.
+    const assurance = credential.hardwareBacked && authData.userVerified ? 'strong' : 'standard';
     const token = issueVerificationToken(session, { id: `passkey:${credential.id}` }, 'passkey', assurance);
     return sendJson(res, 200, { verified: true, verificationToken: token, tokenExpiresAt: now() + TOKEN_TTL_MS });
   }
