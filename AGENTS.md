@@ -140,7 +140,7 @@ https://github.com/embeputer/zoe.git
 
 ## Design Notes
 
-The UI should stay compact and verification-first:
+The UI should stay compact and verification-first, styled like a hosted KYC widget (Persona/Veriff feel):
 
 - No landing page.
 - No marketing hero.
@@ -150,7 +150,7 @@ The UI should stay compact and verification-first:
 - Keep mobile uncluttered.
 - Keep text fitting within buttons/cards at phone widths.
 
-Use the existing palette and component style unless there is a strong reason to change it.
+The current visual language: light page (`--page`), a white bordered card (`--radius` 14px corners, `--shadow`), indigo accent (`--blue`/`--blue-deep`/`--blue-soft`), a persistent `.card-topbar` with the Zoe brand mark and segmented `.flow-steps` progress driven by `setFlowStep` inside `setCardMode` (intro→choice/id→verify→success = steps 1–4), SVG stroke icons inside `.choice-icon`/`.method-icon` chips (deterministic — do not swap back to emoji glyphs for static icons; emoji remain for dynamic stream prompts), scan-corner brackets on `.video-wrap::after`, glass status pill, and an animated `.verified-icon` success state. Keep new components consistent with this language.
 
 ## Editing Guidance
 
