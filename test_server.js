@@ -6,6 +6,7 @@ process.env.ZOE_SECRET = process.env.ZOE_SECRET || 'zoe-test-secret';
 // Wall-clock floors off for the suite; one case re-enables to assert them.
 process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '0';
 process.env.ZOE_STEP_MIN_ELAPSED_MS = '0';
+process.env.ZOE_REDUCED_MOTION_MIN_ELAPSED_MS = '0';
 const assert = require('assert');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
@@ -89,12 +90,12 @@ function samplePixelSeries(flashPlan) {
 
 // Green-channel means with a physiologic-band pulse (fundamental + harmonic +
 // drift + noise) — shaped like a real rPPG signal.
-function samplePulseSeries() {
+function samplePulseSeries(spanMs = 14000) {
   const samples = [];
   const w1 = 2 * Math.PI * 1.17;
   const w2 = 2 * Math.PI * 2.34;
   const wd = 2 * Math.PI * 0.08;
-  for (let t = 0; t <= 14000; t += 95) {
+  for (let t = 0; t <= spanMs; t += 95) {
     const s = t / 1000;
     const g = 118 + 3.5 * Math.sin(w1 * s) + 1.1 * Math.sin(w2 * s + 0.7) + 1.5 * Math.sin(wd * s + 1.2) + gaussian() * 2.2;
     samples.push({ g: Math.round(g * 100) / 100, t });
@@ -261,8 +262,9 @@ async function main() {
     }, cookie);
     assert.strictEqual(offBandRes.res.status, 400);
 
-    // Reduced motion: no flash plan is issued, pixels are not required,
-    // and the pulse check alone carries the liveness gate.
+    // Reduced motion: no flash plan is issued, pixels are not required, and
+    // the pulse check alone carries the liveness gate — so it demands a
+    // longer measurement window (>=18s span) than the flash-gated path.
     const reducedChallenge = await request(baseUrl, '/api/liveness/challenge', {
       method: 'POST',
       body: JSON.stringify({ reducedMotion: true }),
@@ -273,10 +275,25 @@ async function main() {
       method: 'POST',
       body: JSON.stringify(livenessBody(reducedChallenge.body.challengeId, reducedChallenge.body.plan, null, {
         pixelSeries: undefined,
+        pulseSeries: samplePulseSeries(20000),
       })),
     }, cookie);
     assert.strictEqual(reducedVerify.res.status, 200);
     assert.ok(reducedVerify.body.pulseBpm > 0);
+
+    // A reduced-motion pulse under the longer window must still be rejected.
+    const reducedShortChallenge = await request(baseUrl, '/api/liveness/challenge', {
+      method: 'POST',
+      body: JSON.stringify({ reducedMotion: true }),
+    }, cookie);
+    const reducedShortVerify = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(reducedShortChallenge.body.challengeId, reducedShortChallenge.body.plan, null, {
+        pixelSeries: undefined,
+        pulseSeries: samplePulseSeries(),
+      })),
+    }, cookie);
+    assert.strictEqual(reducedShortVerify.res.status, 400);
 
     // Wall-clock floor: with the minimum elapsed enforced, an instant
     // challenge-to-verify must be rejected even with valid evidence.

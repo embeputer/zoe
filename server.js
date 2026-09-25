@@ -84,6 +84,9 @@ const FLASH_DISTINCT_FRAMES_MIN = 0.6;
 const PULSE_MIN_SAMPLES = 90;
 const PULSE_MAX_SAMPLES = 400;
 const PULSE_MIN_SPAN_MS = 9000;
+// reducedMotion skips the flash gate entirely, so the pulse check alone must
+// carry more evidence: a longer measurement window is required instead.
+const PULSE_REDUCED_MIN_SPAN_MS = 18000;
 const PULSE_MIN_HZ = 0.8;
 const PULSE_MAX_HZ = 2.4;
 const PULSE_STD_MIN = 0.4;
@@ -222,6 +225,10 @@ function now() {
 // evidence cannot mint in milliseconds. Read per-request so tests can shorten.
 function livenessMinElapsedMs() {
   return Number(process.env.ZOE_LIVENESS_MIN_ELAPSED_MS ?? 14000);
+}
+// Reduced-motion challenges skip the flash stage but measure pulse longer.
+function reducedMotionMinElapsedMs() {
+  return Number(process.env.ZOE_REDUCED_MOTION_MIN_ELAPSED_MS ?? 19000);
 }
 function stepMinElapsedMs() {
   return Number(process.env.ZOE_STEP_MIN_ELAPSED_MS ?? MIN_STEP_DURATION_MS);
@@ -692,7 +699,8 @@ function validatePixelSeries(pixelSeries, flashPlan) {
 // should hold a spectral peak in the physiologic band (48-144 BPM) — strong
 // enough to be a real signal, but spread enough not to be a clean injected
 // sine wave. Returns { bpm } on success or { error } on rejection.
-function validatePulseSeries(pulseSeries) {
+function validatePulseSeries(pulseSeries, reducedMotion) {
+  const minSpanMs = reducedMotion === true ? PULSE_REDUCED_MIN_SPAN_MS : PULSE_MIN_SPAN_MS;
   if (!Array.isArray(pulseSeries) || pulseSeries.length < PULSE_MIN_SAMPLES || pulseSeries.length > PULSE_MAX_SAMPLES) {
     return { error: 'Pulse series is invalid.' };
   }
@@ -707,7 +715,7 @@ function validatePulseSeries(pulseSeries) {
     sig.push({ g, t });
   }
   const span = sig[sig.length - 1].t - sig[0].t;
-  if (span < PULSE_MIN_SPAN_MS) return { error: 'Pulse measurement was too short.' };
+  if (span < minSpanMs) return { error: 'Pulse measurement was too short.' };
 
   const mean = sig.reduce((a, s) => a + s.g, 0) / sig.length;
   const xs = sig.map((s) => s.g - mean);
@@ -1298,6 +1306,7 @@ async function handleApi(req, res, pathname) {
       id: challengeId,
       plan,
       flashPlan,
+      reducedMotion: challengeBody.reducedMotion === true,
       createdAt: created,
       expiresAt: created + LIVENESS_CHALLENGE_TTL_MS,
       consumedAt: null,
@@ -1327,7 +1336,8 @@ async function handleApi(req, res, pathname) {
     if (pending.consumedAt) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
     if (now() > pending.expiresAt) return sendJson(res, 410, { error: 'Face liveness challenge expired.' });
 
-    if (now() - pending.createdAt < livenessMinElapsedMs()) {
+    const minElapsedMs = pending.reducedMotion === true ? reducedMotionMinElapsedMs() : livenessMinElapsedMs();
+    if (now() - pending.createdAt < minElapsedMs) {
       logVerificationFailure('liveness_too_fast', pathname);
       return sendJson(res, 400, { error: 'Face check completed too quickly to be real.' });
     }
@@ -1372,7 +1382,7 @@ async function handleApi(req, res, pathname) {
       }
     }
 
-    const pulseResult = validatePulseSeries(body.pulseSeries);
+    const pulseResult = validatePulseSeries(body.pulseSeries, pending.reducedMotion);
     if (pulseResult.error) {
       logVerificationFailure('liveness_pulse_rejected', pathname);
       return sendJson(res, 400, { error: pulseResult.error });
