@@ -12,6 +12,7 @@ process.env.ZOE_REDUCED_MOTION_MIN_ELAPSED_MS = '0';
 process.env.ZOE_RATE_LIMIT_MAX_PER_SESSION = '0';
 const assert = require('assert');
 const crypto = require('crypto');
+const jpeg = require('jpeg-js');
 const { execFileSync } = require('child_process');
 const {
   createServer,
@@ -23,6 +24,7 @@ const {
   verifyAuthenticatorData,
   createFlashPlan,
   validatePixelSeries,
+  computePresentationDigest,
 } = require('./server');
 
 function request(baseUrl, path, options = {}, cookie) {
@@ -118,8 +120,33 @@ function samplePulseSeries(spanMs = 14000) {
   return samples;
 }
 
+const mediaFrameImages = Array.from({ length: 5 }, (_, frameIndex) => {
+  const width = 320;
+  const height = 240;
+  const data = Buffer.alloc(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = (y * width + x) * 4;
+      data[offset] = (x + frameIndex * 7) % 256;
+      data[offset + 1] = (y + frameIndex * 11) % 256;
+      data[offset + 2] = (x + y + frameIndex * 13) % 256;
+      data[offset + 3] = 255;
+    }
+  }
+  return jpeg.encode({ data, width, height }, 70).data.toString('base64');
+});
+
+function sampleMediaFrames() {
+  return mediaFrameImages.map((image, index) => ({
+    t: index * 700,
+    face: [0.35, 0.15, 0.3, 0.5],
+    image,
+  }));
+}
+
 function livenessBody(challengeId, plan, flashPlan, overrides = {}) {
   const motionSeries = sampleMotionSeries(plan);
+  const mediaFrames = sampleMediaFrames();
   return {
     challengeId,
     durationMs: 1200,
@@ -130,6 +157,8 @@ function livenessBody(challengeId, plan, flashPlan, overrides = {}) {
     seriesDigest: computeLivenessSeriesDigest(challengeId, motionSeries),
     pixelSeries: flashPlan ? samplePixelSeries(flashPlan) : undefined,
     pulseSeries: samplePulseSeries(),
+    mediaFrames,
+    mediaDigest: computePresentationDigest(challengeId, mediaFrames),
     ...overrides,
   };
 }
@@ -138,7 +167,13 @@ async function main() {
   const exposurePlan = createFlashPlan();
   assert.strictEqual(validatePixelSeries(samplePixelSeries(exposurePlan, 0.35), exposurePlan), null);
 
-  const server = createServer();
+  const server = createServer({
+    analyzePresentationFrames: async (frames) => ({
+      real: frames.every((frame) => frame.face[0] !== 0.36),
+      medianScore: 1,
+      longestRealRun: 5,
+    }),
+  });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -193,6 +228,37 @@ async function main() {
     }, cookie);
     assert.strictEqual(livenessVerified.res.status, 200);
     assert.ok(livenessVerified.body.verificationToken);
+
+    const missingMediaChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const missingMediaBody = livenessBody(
+      missingMediaChallenge.body.challengeId,
+      missingMediaChallenge.body.plan,
+      missingMediaChallenge.body.flashPlan,
+    );
+    delete missingMediaBody.mediaFrames;
+    delete missingMediaBody.mediaDigest;
+    const missingMedia = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(missingMediaBody),
+    }, cookie);
+    assert.strictEqual(missingMedia.res.status, 400);
+
+    const spoofMediaChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const spoofMediaFrames = sampleMediaFrames().map((frame) => ({ ...frame, face: [0.36, 0.15, 0.3, 0.5] }));
+    const spoofMedia = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(
+        spoofMediaChallenge.body.challengeId,
+        spoofMediaChallenge.body.plan,
+        spoofMediaChallenge.body.flashPlan,
+        {
+          mediaFrames: spoofMediaFrames,
+          mediaDigest: computePresentationDigest(spoofMediaChallenge.body.challengeId, spoofMediaFrames),
+        },
+      )),
+    }, cookie);
+    assert.strictEqual(spoofMedia.res.status, 400);
+    assert.match(spoofMedia.body.error, /photo or screen/);
 
     const wrongPlanPhases = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
     const issuedPlan = wrongPlanPhases.body.plan;

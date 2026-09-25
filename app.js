@@ -702,6 +702,10 @@ async function livenessSeriesDigest(challengeId, motionSeries) {
   return digestString(`${challengeId}\n${JSON.stringify(motionSeries)}`);
 }
 
+async function presentationFramesDigest(challengeId, mediaFrames) {
+  return digestString(`${challengeId}\n${JSON.stringify(mediaFrames)}`);
+}
+
 async function buildEvidence() {
   const matchedAt = performance.now();
   const durationMs = Math.round(matchedAt - stepStartedAt);
@@ -1685,10 +1689,18 @@ const PULSE_TOPUP_MIN_MS = 5000;
 const PULSE_TOPUP_MIN_REDUCED_MS = 9000;
 const PULSE_BG_MIN_GAP_MS = 110;
 const PULSE_BG_MAX_SAMPLES = 300;
+const PRESENTATION_FRAME_WIDTH = 320;
+const PRESENTATION_FRAME_HEIGHT = 240;
+const PRESENTATION_FRAME_COUNT = 5;
+const PRESENTATION_FRAME_MIN_GAP_MS = 700;
 const pulseCanvas = document.createElement('canvas');
 pulseCanvas.width = PULSE_ROI_W;
 pulseCanvas.height = PULSE_ROI_H;
 const pulseCtx = pulseCanvas.getContext('2d', { willReadFrequently: true });
+const presentationCanvas = document.createElement('canvas');
+presentationCanvas.width = PRESENTATION_FRAME_WIDTH;
+presentationCanvas.height = PRESENTATION_FRAME_HEIGHT;
+const presentationCtx = presentationCanvas.getContext('2d');
 
 // rPPG: forehead skin pixels shift green very slightly with each heartbeat.
 // ~14s of green-channel means gives the server a spectral window on a signal
@@ -1711,18 +1723,52 @@ function samplePulseGreen(box) {
   return g / n;
 }
 
-async function runPulseCheck(engine, measureMs, samples, t0) {
+function capturePresentationFrame(box, startedAt) {
+  if (!box || box.stale || !box.pixelBox || videoEl.videoWidth < 1 || videoEl.videoHeight < 1) return null;
+  const vw = videoEl.videoWidth;
+  const vh = videoEl.videoHeight;
+  const pb = box.pixelBox;
+  presentationCtx.drawImage(videoEl, 0, 0, vw, vh, 0, 0, PRESENTATION_FRAME_WIDTH, PRESENTATION_FRAME_HEIGHT);
+  const face = [
+    Math.max(0, Math.min(1, pb.x / vw)),
+    Math.max(0, Math.min(1, pb.y / vh)),
+    Math.max(0, Math.min(1, pb.w / vw)),
+    Math.max(0, Math.min(1, pb.h / vh)),
+  ].map((value) => Math.round(value * 10000) / 10000);
+  if (face[0] + face[2] > 1) face[2] = Math.round((1 - face[0]) * 10000) / 10000;
+  if (face[1] + face[3] > 1) face[3] = Math.round((1 - face[1]) * 10000) / 10000;
+  return {
+    t: Math.round(performance.now() - startedAt),
+    face,
+    image: presentationCanvas.toDataURL('image/jpeg', 0.72).split(',')[1],
+  };
+}
+
+async function runPulseCheck(engine, measureMs, samples, t0, mediaFrames) {
   const measureStart = performance.now();
-  setStatus('Hold still', 'listening');
-  promptNameEl.textContent = 'Hold still';
+  let lastMediaFrameT = -Infinity;
+  setStatus('Verifying', 'listening');
+  promptNameEl.textContent = 'Keep looking at the camera';
   while (faceChecking) {
     const now = performance.now() - measureStart;
     if (now > measureMs) break;
     const box = await detectStableFaceFrame(engine);
     const g = box && !box.stale ? samplePulseGreen(box) : null;
     if (g !== null) samples.push({ g: Math.round(g * 100) / 100, t: Math.round(performance.now() - t0) });
+    if (
+      box
+      && !box.stale
+      && mediaFrames.length < PRESENTATION_FRAME_COUNT
+      && now - lastMediaFrameT >= PRESENTATION_FRAME_MIN_GAP_MS
+    ) {
+      const frame = capturePresentationFrame(box, t0);
+      if (frame) {
+        mediaFrames.push(frame);
+        lastMediaFrameT = now;
+      }
+    }
     const remaining = Math.max(1, Math.ceil((measureMs - now) / 1000));
-    promptHintEl.textContent = `Keep your face lit and steady — ${remaining}s left`;
+    promptHintEl.textContent = `Zoe is verifying · ${remaining}s left`;
     drawFaceGuide(box, { state: box && !box.stale ? 'good' : 'neutral' });
     await sleep(PULSE_SAMPLE_MS);
   }
@@ -1779,6 +1825,7 @@ async function runGuidedFaceCheck() {
   const poses = [];
   const phaseSeries = [];
   const pulseSeries = [];
+  const mediaFrames = [];
   const startedAt = performance.now();
   let lastPulseT = -1;
   const collectPulse = (box) => {
@@ -1875,8 +1922,17 @@ async function runGuidedFaceCheck() {
     const pulseTargetMs = flashPlan ? PULSE_MEASURE_MS : PULSE_MEASURE_MS_REDUCED;
     const pulseElapsedMs = pulseSeries.length ? pulseSeries[pulseSeries.length - 1].t : 0;
     const pulseTopUpMinMs = flashPlan ? PULSE_TOPUP_MIN_MS : PULSE_TOPUP_MIN_REDUCED_MS;
-    await runPulseCheck(engine, Math.max(pulseTopUpMinMs, pulseTargetMs - pulseElapsedMs), pulseSeries, startedAt);
+    await runPulseCheck(
+      engine,
+      Math.max(pulseTopUpMinMs, pulseTargetMs - pulseElapsedMs),
+      pulseSeries,
+      startedAt,
+      mediaFrames,
+    );
     if (!faceChecking) return;
+    if (mediaFrames.length < 3) {
+      throw new Error('Zoe could not capture enough clear camera frames. Keep looking at the camera and try again.');
+    }
 
     if (centers.length < 8 || (requirePoseLiveness && yaws.length < 8)) {
       throw new Error('No face was detected. Make sure your face is lit and centered, then try again.');
@@ -1910,6 +1966,7 @@ async function runGuidedFaceCheck() {
       return entry;
     });
     const seriesDigest = await livenessSeriesDigest(livenessChallenge.challengeId, motionSeries);
+    const mediaDigest = await presentationFramesDigest(livenessChallenge.challengeId, mediaFrames);
     const verificationBody = {
       challengeId: livenessChallenge.challengeId,
       durationMs,
@@ -1919,6 +1976,8 @@ async function runGuidedFaceCheck() {
       motionSeries,
       seriesDigest,
       pulseSeries,
+      mediaFrames,
+      mediaDigest,
       legacyEngine,
     };
     let result;

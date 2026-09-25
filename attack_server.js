@@ -5,6 +5,7 @@ process.env.ZOE_DB_PATH = ':memory:';
 // has to burn real seconds per attempt, not mint instantly.
 process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = process.env.ZOE_LIVENESS_MIN_ELAPSED_MS ?? '2000';
 const crypto = require('crypto');
+const jpeg = require('jpeg-js');
 const { createServer } = require('./server');
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -31,6 +32,43 @@ function gaussian() {
 // The digest algorithm is shipped in app.js; an attacker reimplements it freely.
 function attackerSeriesDigest(challengeId, motionSeries) {
   return crypto.createHash('sha256').update(`${challengeId}\n${JSON.stringify(motionSeries)}`).digest('hex');
+}
+
+function attackerMediaDigest(challengeId, mediaFrames) {
+  return crypto.createHash('sha256').update(`${challengeId}\n${JSON.stringify(mediaFrames)}`).digest('hex');
+}
+
+function fabricatedMediaEvidence(challengeId) {
+  const width = 320;
+  const height = 240;
+  const mediaFrames = [];
+  for (let frameIndex = 0; frameIndex < 5; frameIndex += 1) {
+    const data = Buffer.alloc(width * height * 4);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const offset = (y * width + x) * 4;
+        const dx = x - 160 - frameIndex;
+        const dy = y - 116;
+        const inFace = (dx * dx) / (62 * 62) + (dy * dy) / (82 * 82) < 1;
+        const eye = ((dx + 22) ** 2 + (dy + 18) ** 2 < 45) || ((dx - 22) ** 2 + (dy + 18) ** 2 < 45);
+        const mouth = Math.abs(dy - 28) < 3 && Math.abs(dx) < 28;
+        const color = eye || mouth ? [38, 28, 24] : inFace ? [202, 154, 128] : [72, 90, 116];
+        data[offset] = color[0] + frameIndex;
+        data[offset + 1] = color[1];
+        data[offset + 2] = color[2];
+        data[offset + 3] = 255;
+      }
+    }
+    mediaFrames.push({
+      t: frameIndex * 700,
+      face: [0.3, 0.14, 0.4, 0.68],
+      image: jpeg.encode({ data, width, height }, 72).data.toString('base64'),
+    });
+  }
+  return {
+    mediaFrames,
+    mediaDigest: attackerMediaDigest(challengeId, mediaFrames),
+  };
 }
 
 function fabricatedStepEvidence() {
@@ -155,6 +193,7 @@ async function attackFabricatedLiveness(baseUrl, cookie) {
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
       pixelSeries: flashPlan ? fabricatedPixelSeries(flashPlan) : undefined,
       pulseSeries: fabricatedPulseSeries(),
+      ...fabricatedMediaEvidence(challengeId),
     }),
   }, cookie);
   const token = res.body.verificationToken;
@@ -188,6 +227,7 @@ async function attackReplayedSeries(baseUrl, cookie) {
       seriesDigest: attackerSeriesDigest(res.body.challengeId, noisy),
       pixelSeries: res.body.flashPlan ? fabricatedPixelSeries(res.body.flashPlan) : undefined,
       pulseSeries: fabricatedPulseSeries(),
+      ...fabricatedMediaEvidence(res.body.challengeId),
     }),
   }, cookie);
   return {
@@ -236,10 +276,16 @@ async function controlUncorrelatedPixels(baseUrl, cookie) {
       motionSeries,
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
       pulseSeries: flatPulse,
+      ...fabricatedMediaEvidence(challengeId),
     }),
   }, cookie);
   if (res.res.status !== 422 || !res.body.flashAvailable) {
-    return { fooled: true, note: `flash fallback was not offered cleanly: ${res.res.status}`, cookie };
+    const blockedByPad = res.res.status === 400 && /photo or screen/.test(res.body.error || '');
+    return {
+      fooled: !blockedByPad,
+      note: blockedByPad ? 'blocked earlier by server-side camera analysis' : `flash fallback was not offered cleanly: ${res.res.status}`,
+      cookie,
+    };
   }
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
@@ -253,6 +299,7 @@ async function controlUncorrelatedPixels(baseUrl, cookie) {
       pixelSeries: flatPixels,
       pulseSeries: flatPulse,
       flashFallback: true,
+      ...fabricatedMediaEvidence(challengeId),
     }),
   }, cookie);
   return { fooled: res.res.status === 200, note: `flash-ignoring pixels: ${res.res.status}`, cookie };
@@ -275,6 +322,7 @@ async function controlCrossSession(baseUrl, cookie) {
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
       pixelSeries: flashPlan ? fabricatedPixelSeries(flashPlan) : undefined,
       pulseSeries: fabricatedPulseSeries(),
+      ...fabricatedMediaEvidence(challengeId),
     }),
   }, cookie);
   const token = res.body.verificationToken;
@@ -324,9 +372,14 @@ async function main() {
     const fooled = results.filter((x) => x.fooled && !x.name.startsWith('control'));
     const controls = results.filter((x) => x.name.startsWith('control'));
     console.log(`\n${fooled.length}/3 attacks fooled the server; controls blocked: ${controls.filter((x) => !x.fooled).length}/${controls.length}`);
-    if (fooled.length) {
-      console.log('Conclusion: even pulse-checked, pixel-verified flash liveness stays forgeable by a script that');
-      console.log('synthesizes matching signals — closing the hole needs server-side media verification.');
+    const faceAttacksFooled = fooled.some((result) => (
+      result.name === 'fabricated face liveness' || result.name === 'replayed series + fresh noise'
+    ));
+    if (!faceAttacksFooled) {
+      console.log('Conclusion: server-side face detection and presentation analysis blocked both scripted face attacks.');
+    }
+    if (fooled.some((result) => result.name === 'fabricated gesture challenge')) {
+      console.log('The hand-gesture path remains forgeable because it still accepts bounded client-generated evidence.');
     }
   } finally {
     await new Promise((resolve) => server.close(resolve));

@@ -5,11 +5,16 @@
   "description": "Zoe human verification demo with server-owned challenge state.",
   "scripts": {
     "start": "node server.js",
-    "test": "node test_server.js",
+    "debug": "ZOE_DEBUG=1 PORT=3001 node server.js",
+    "test": "node test_server.js && node test_debug_metrics.js",
     "attack": "node attack_server.js",
     "attack:agent": "node attack_agent.js"
   },
   "engines": {
     "node": ">=22.5"
+  },
+  "dependencies": {
+    "jpeg-js": "0.4.4",
+    "onnxruntime-node": "1.30.0"
   }
 }
