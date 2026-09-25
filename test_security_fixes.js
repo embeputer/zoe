@@ -47,9 +47,17 @@ function decodeTokenPayload(token) {
   return JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8'));
 }
 
+// Seeded LCG keeps synthesized camera noise reproducible — spectral and
+// pixel-binding checks must not flake on an unlucky random draw.
+let rngState = 0x9d3f1a7;
+function rand() {
+  rngState = (rngState * 1664525 + 1013904223) >>> 0;
+  return rngState / 0x100000000;
+}
+
 function gaussian() {
-  const u = Math.max(Math.random(), 1e-9);
-  const v = Math.max(Math.random(), 1e-9);
+  const u = Math.max(rand(), 1e-9);
+  const v = Math.max(rand(), 1e-9);
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
