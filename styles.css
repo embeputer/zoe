@@ -134,45 +134,8 @@ body {
   letter-spacing: -0.02em;
 }
 
-.flow-progress {
-  display: grid;
-  justify-items: end;
-  gap: 6px;
-}
-
-.flow-step-label {
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--muted);
-  letter-spacing: 0.02em;
-}
-
-.flow-steps {
-  display: flex;
-  gap: 5px;
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-.flow-steps .step {
-  width: 26px;
-  height: 4px;
-  border-radius: 999px;
-  background: var(--line);
-  transition: background 0.25s ease;
-}
-
-.flow-steps .step.active {
-  background: var(--blue);
-}
-
-.flow-steps .step.done {
-  background: var(--blue-soft);
-}
-
 .zoe-hero {
-  padding: 24px 18px 8px;
+  padding: 18px 18px 8px;
 }
 
 .panel-shell {
@@ -227,27 +190,6 @@ body {
   transform: translateX(var(--panel-exit-x));
 }
 
-.intro-mark {
-  display: grid;
-  place-items: center;
-  margin: 0 auto 22px;
-}
-
-.intro-mark span {
-  width: 58px;
-  height: 58px;
-  display: grid;
-  place-items: center;
-  border-radius: 18px;
-  color: var(--blue);
-  background: var(--blue-tint);
-}
-
-.intro-mark svg {
-  width: 29px;
-  height: 29px;
-}
-
 h1 {
   margin: 0;
   color: var(--ink);
@@ -258,7 +200,7 @@ h1 {
 }
 
 .intro-card h1 {
-  text-align: center;
+  text-align: left;
   font-size: 25px;
   line-height: 1.2;
   letter-spacing: -0.025em;
@@ -266,11 +208,11 @@ h1 {
 
 .tagline {
   max-width: 300px;
-  margin: 12px auto 26px;
+  margin: 12px 0 26px;
   color: var(--muted);
   font-size: 14px;
   line-height: 1.5;
-  text-align: center;
+  text-align: left;
 }
 
 .intro-note {
@@ -472,10 +414,6 @@ h1 {
 
 .captcha-card.success-mode .verified {
   pointer-events: auto;
-}
-
-.captcha-card.success-mode .flow-progress {
-  visibility: hidden;
 }
 
 .captcha-card.success-mode footer {
@@ -907,10 +845,6 @@ footer .lock-icon {
     padding-bottom: 12px;
   }
 
-  .flow-steps .step {
-    width: 20px;
-  }
-
   .zoe-hero {
     padding: 20px 4px 4px;
   }
@@ -921,10 +855,6 @@ footer .lock-icon {
 
   .tagline {
     font-size: 14px;
-  }
-
-  .intro-mark {
-    margin-bottom: 18px;
   }
 
   .verification-head {

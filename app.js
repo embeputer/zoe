@@ -64,8 +64,6 @@ const flashOverlayEl = $('flash-overlay');
 const flashConsentEl = $('flash-consent');
 const flashConsentAcceptBtn = $('flash-consent-accept');
 const flashConsentDeclineBtn = $('flash-consent-decline');
-const flowStepsEl = $('flow-steps');
-const flowStepLabelEl = $('flow-step-label');
 const panelShellEl = $('panel-shell');
 const zoeIntroEl = $('zoe-intro');
 const zoeVerifyBtn = $('zoe-verify-btn');
@@ -383,24 +381,11 @@ const PANEL_TRANSITION_MS = 440;
 let panelTransitionTimer = null;
 let successSettleTimer = null;
 
-const FLOW_STEP_INDEX = { choice: 2, id: 2, verify: 3, success: 4 };
-
-function setFlowStep(mode) {
-  const n = FLOW_STEP_INDEX[mode] || 1;
-  if (flowStepLabelEl) flowStepLabelEl.textContent = `Step ${n} of 4`;
-  if (!flowStepsEl) return;
-  flowStepsEl.querySelectorAll('.step').forEach((el, i) => {
-    el.classList.toggle('active', i + 1 === n);
-    el.classList.toggle('done', i + 1 < n);
-  });
-}
-
 function setCardMode(mode) {
   cardEl.classList.toggle('choice-mode', mode === 'choice');
   cardEl.classList.toggle('id-mode', mode === 'id');
   cardEl.classList.toggle('verify-mode', mode === 'verify');
   cardEl.classList.toggle('success-mode', mode === 'success');
-  setFlowStep(mode);
 }
 
 function transitionToPanel(activePanel, mode, focusEl, direction = 'forward') {
