@@ -241,10 +241,12 @@ function detectorBoxes(outputs) {
       if (confidence < DETECTOR_CONFIDENCE_MIN) continue;
       const row = Math.floor(index / columns);
       const column = index % columns;
-      const x = (column + Number(bbox[index * 4])) * stride;
-      const y = (row + Number(bbox[index * 4 + 1])) * stride;
+      // YuNet predicts the box CENTER at cell + offset (per OpenCV's
+      // face_detect.cpp reference decoder), not the top-left corner.
       const width = Math.exp(Number(bbox[index * 4 + 2])) * stride;
       const height = Math.exp(Number(bbox[index * 4 + 3])) * stride;
+      const x = (column + Number(bbox[index * 4])) * stride - width / 2;
+      const y = (row + Number(bbox[index * 4 + 1])) * stride - height / 2;
       if (![x, y, width, height].every(Number.isFinite)) continue;
       const left = Math.max(0, x);
       const top = Math.max(0, y);
