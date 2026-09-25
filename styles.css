@@ -580,25 +580,6 @@ h2 {
   border: 1px solid #1a1640;
 }
 
-/* KYC-style scan frame: translucent corner brackets inside the stream. */
-.video-wrap::after {
-  content: "";
-  position: absolute;
-  inset: 14px;
-  pointer-events: none;
-  background:
-    linear-gradient(rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.75)) left top / 24px 3px,
-    linear-gradient(rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.75)) left top / 3px 24px,
-    linear-gradient(rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.75)) right top / 24px 3px,
-    linear-gradient(rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.75)) right top / 3px 24px,
-    linear-gradient(rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.75)) left bottom / 24px 3px,
-    linear-gradient(rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.75)) left bottom / 3px 24px,
-    linear-gradient(rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.75)) right bottom / 24px 3px,
-    linear-gradient(rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.75)) right bottom / 3px 24px;
-  background-repeat: no-repeat;
-  opacity: 0.5;
-}
-
 #video,
 #overlay {
   position: absolute;
