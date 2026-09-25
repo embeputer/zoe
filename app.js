@@ -83,7 +83,6 @@ const mobileIdBtn = $('mobile-id-btn');
 const cameraHelpEl = $('camera-help');
 const cameraHelpTextEl = $('camera-help-text');
 const bootLoaderEl = $('boot-loader');
-const checkEls = Array.from(document.querySelectorAll('.check'));
 
 const LM = {
   thumbTip: 4, thumbIp: 3, thumbMcp: 2, thumbCmc: 1,
@@ -284,13 +283,28 @@ async function startCamera() {
   canvasEl.height = videoEl.videoHeight || 480;
 }
 
+// Hung requests must not deadlock the UI: every call gets a hard timeout so
+// callers' error handling always runs and resets submitting/checking state.
+const API_TIMEOUT_MS = 15000;
 async function apiJson(path, body) {
-  const response = await fetch(path, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body || {}),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    throw new Error(err.name === 'AbortError'
+      ? 'The server did not respond in time. Check your connection and try again.'
+      : 'Could not reach the server. Check your connection and try again.');
+  } finally {
+    clearTimeout(timeout);
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(data.error || `Request failed (${response.status}).`);
@@ -466,12 +480,6 @@ function showSuccessPanel() {
   }, prefersReducedMotion() ? 0 : 850);
 }
 
-function showIntroPanel() {
-  zoeIdReturnTarget = 'choice';
-  zoeVerifyBtn.disabled = false;
-  transitionToPanel(zoeIntroEl, null, zoeVerifyBtn, 'back');
-}
-
 function continueFromIntro() {
   if (isMobileLayout()) {
     selectPrimaryMethod('face');
@@ -504,24 +512,6 @@ function showPrompt(step) {
   promptHintEl.textContent = step.hint;
 }
 
-function updateChecklistUI() {
-  checkEls.forEach((el, i) => {
-    el.classList.remove('active', 'done');
-    el.hidden = selectedPrimaryMethod === 'face' || i >= totalSteps;
-    if (selectedPrimaryMethod === 'face') return;
-    const label = el.querySelector('.label');
-    if (i < completedSteps) {
-      el.classList.add('done');
-      label.textContent = 'Verified';
-    } else if (currentStep && i === currentStep.index) {
-      el.classList.add('active');
-      label.textContent = currentStep.name;
-    } else {
-      label.textContent = 'Locked';
-    }
-  });
-}
-
 function selectPrimaryMethod(method) {
   selectedPrimaryMethod = method;
   const isFace = method === 'face';
@@ -537,7 +527,6 @@ function selectPrimaryMethod(method) {
     ? 'Keep your face in frame. Zoe checks motion, not identity.'
     : '';
   progressEl.style.width = '0%';
-  updateChecklistUI();
   setStatus('Idle', 'idle');
 }
 
@@ -747,15 +736,19 @@ async function submitCurrentStep() {
     if (handMotionLooksSynthetic(evidence.motionStats)) {
       throw new Error('Hand motion looked too static. Relax your wrist and try the gesture again.');
     }
+    const challengeAtSend = currentChallengeId;
+    const stepAtSend = currentStep;
     const result = await apiJson('/api/step', {
       challengeId: currentChallengeId,
       stepIndex: currentStep.index,
       gestureId: currentStep.id,
       evidence,
     });
+    // A stale response must not overwrite a newer challenge/step the user
+    // already moved on to.
+    if (currentChallengeId !== challengeAtSend || currentStep !== stepAtSend) return;
 
     completedSteps++;
-    updateChecklistUI();
 
     if (result.verified) {
       verificationToken = result.verificationToken;
@@ -767,10 +760,15 @@ async function submitCurrentStep() {
     lastAcceptedHandShape = acceptedHandShape;
     awaitingHandPoseChange = Boolean(lastAcceptedHandShape);
     cooldownUntil = performance.now() + COOLDOWN_MS;
+    // Bind the step this cooldown belongs to: if a newer flow superseded it
+    // before the timer fires, it must not wipe the new step's evidence.
+    const scheduledStep = currentStep;
+    const scheduledCooldown = cooldownUntil;
     setTimeout(() => {
-      showPrompt(currentStep);
+      if (currentStep !== scheduledStep || cooldownUntil !== scheduledCooldown) return;
+      cooldownUntil = 0;
+      showPrompt(scheduledStep);
       resetStepEvidence();
-      updateChecklistUI();
       setStatus('Listening...', 'listening');
       submittingStep = false;
     }, COOLDOWN_MS);
@@ -823,7 +821,6 @@ async function startVerification() {
 
   resetStepEvidence();
   hideCameraHelp();
-  updateChecklistUI();
   showPrompt(currentStep);
   setStatus('Listening...', 'listening');
   setStartButton('Verification in progress', true);
@@ -1276,42 +1273,8 @@ function detectionBox(detection, vw, vh) {
   return { x, y, w, h };
 }
 
-function fitBoxToKeypoints(box, keypoints, vw, vh) {
-  const points = (keypoints || [])
-    .map((point) => pointToPixel(point, vw, vh))
-    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
-  if (points.length < 3) return box;
-
-  const xs = points.map((point) => point.x);
-  const ys = points.map((point) => point.y);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
-  const w = Math.min(vw, Math.max(box.w, maxX - minX + box.w * 0.16));
-  const h = Math.min(vh, Math.max(box.h, maxY - minY + box.h * 0.16));
-  const x = Math.min(Math.max(0, (minX + maxX - w) / 2), Math.max(0, vw - w));
-  const y = Math.min(Math.max(0, (minY + maxY - h) / 2), Math.max(0, vh - h));
-  return { ...box, x, y, w, h };
-}
-
-function calibratedFaceBox(box, vw, vh, keypoints) {
-  // Blaze's raw box already tracks the face; keep it frame-clamped and let
-  // landmark fitting absorb residual detector offset instead of hard shifts.
-  return fitBoxToKeypoints({
-    x: Math.min(Math.max(0, box.x), Math.max(0, vw - box.w)),
-    y: Math.min(Math.max(0, box.y), Math.max(0, vh - box.h)),
-    w: box.w,
-    h: box.h,
-  }, keypoints, vw, vh);
-}
-
-function pointToPixel(point, vw, vh) {
-  return {
-    x: point.x <= 1 ? point.x * vw : point.x,
-    y: point.y <= 1 ? point.y * vh : point.y,
-  };
-}
+// Face-box calibration (fitBoxToKeypoints, calibratedFaceBox, pointToPixel,
+// pulseRoi) is shared with the camera lab via face_calib.js globals.
 
 function poseFromKeypoints(keypoints, vw, vh) {
   if (!keypoints || keypoints.length < 3) return null;
@@ -1374,7 +1337,7 @@ async function detectFaceFrame(engine) {
     candidates = detections
       .map((detection) => {
         const rawBox = detectionBox(detection, vw, vh);
-        const box = calibratedFaceBox(rawBox, vw, vh, detection.keypoints);
+        const box = calibratedFaceBox(rawBox, detection.keypoints, vw, vh);
         const pose = poseFromKeypoints(detection.keypoints, vw, vh);
         if (keypointSpanOutsideBox(detection.keypoints, rawBox, vw, vh)) return null;
         return {
@@ -1722,12 +1685,9 @@ function samplePulseGreen(box) {
   const vw = Math.max(1, videoEl.videoWidth || 640);
   const vh = Math.max(1, videoEl.videoHeight || 480);
   const pb = box.pixelBox;
-  const w = Math.min(pb.w * 0.44, vw);
-  const h = Math.min(pb.h * 0.16, vh);
-  const x = Math.max(0, Math.min(pb.x + pb.w / 2 - w / 2, vw - w));
-  const y = Math.max(0, Math.min(pb.y + pb.h * 0.05, vh - h));
-  if (w < 6 || h < 4) return null;
-  pulseCtx.drawImage(videoEl, x, y, w, h, 0, 0, PULSE_ROI_W, PULSE_ROI_H);
+  const roi = pulseRoi(pb, vw, vh);
+  if (roi.w < 6 || roi.h < 4) return null;
+  pulseCtx.drawImage(videoEl, roi.x, roi.y, roi.w, roi.h, 0, 0, PULSE_ROI_W, PULSE_ROI_H);
   const data = pulseCtx.getImageData(0, 0, PULSE_ROI_W, PULSE_ROI_H).data;
   let g = 0;
   const n = data.length / 4;

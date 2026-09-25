@@ -97,5 +97,22 @@
     };
   }
 
-  return { pulseMetrics, flashMetrics };
+  // Gates server.js applies to the same quantities this lab reports:
+  // - pulse: spectral peak power ≥3× the 0.5–3.2 Hz band mean, and 45–97% of
+  //   band power in the peak's main lobe. The server integrates the lobe over
+  //   ±5 bins (±0.125 Hz); this lab uses ±2 bins, so lab lobe values run
+  //   slightly lower than the server's on the same signal.
+  // - flash: chroma-delta direction cosine ≥0.6 and delta magnitude ratio
+  //   within 0.025–2×.
+  // Keep these in sync with server.js.
+  const SERVER_THRESHOLDS = {
+    pulsePeakRatioMin: 3,
+    pulseLobeFractionMin: 0.45,
+    pulseLobeFractionMax: 0.97,
+    flashChromaCosineMin: 0.6,
+    flashChromaRatioMin: 0.025,
+    flashChromaRatioMax: 2,
+  };
+
+  return { pulseMetrics, flashMetrics, SERVER_THRESHOLDS };
 }));
