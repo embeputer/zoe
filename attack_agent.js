@@ -5,8 +5,11 @@
 // media evidence (that surface is covered by attack_server.js). Run with
 // `npm run attack:agent`.
 
+process.env.ZOE_DB_PATH = ':memory:';
 const crypto = require('node:crypto');
 const { createServer } = require('./server');
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const results = [];
 function report(name, fooled, note) {
@@ -116,17 +119,22 @@ async function freshChallenge(baseUrl, cookie) {
 
 async function mintToken(baseUrl, cookie) {
   const { challenge, cookie: c1 } = await freshChallenge(baseUrl, cookie);
+  // Wall-clock floor is on for this probe server; shorten (not bypass) it to
+  // keep the harness fast — a mint still costs real seconds per attempt.
+  process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '2000';
+  await sleep(2100);
   const res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
     body: fabricatedLivenessBody(challenge),
   }, c1);
+  process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '14000';
   return { token: res.body && res.body.verificationToken, cookie: res.cookie, status: res.res.status };
 }
 
 // --- Probes ---
 
-// The server measures only TTLs; every duration is client-claimed. A full
-// "verification" (motion + 14s pulse + flash) submitted ~instantly is accepted.
+// Wall-clock floor: a challenge→verify round-trip faster than the pulse
+// stage's minimum (14s) must be rejected regardless of evidence quality.
 async function probeInstantVerification(baseUrl, cookie) {
   const t0 = Date.now();
   const { challenge, cookie: c1 } = await freshChallenge(baseUrl, cookie);
@@ -137,7 +145,9 @@ async function probeInstantVerification(baseUrl, cookie) {
   const elapsed = Date.now() - t0;
   return {
     fooled: res.res.status === 200 && !!res.body.verificationToken,
-    note: `challenge-to-token in ${elapsed}ms real time (claiming ~20s of camera evidence)`,
+    note: res.res.status === 200
+      ? `challenge-to-token in ${elapsed}ms real time (claiming ~20s of camera evidence)`
+      : `instant verify rejected (${res.res.status}) after ${elapsed}ms — wall-clock floor holds`,
     cookie: res.cookie,
   };
 }
@@ -145,6 +155,8 @@ async function probeInstantVerification(baseUrl, cookie) {
 // Zoe ID end-to-end without a human or a platform authenticator: register a
 // software-generated P-256 key behind a forged liveness token, then mint a
 // 'strong'-assurance passkey token by self-asserting the UV flag.
+// NOTE: 'strong' remains forgeable — attestation:'none' + accept-any-key
+// registration is the open hole; the wall-clock floor only slows it.
 async function probeScriptedZoeId(baseUrl, cookie) {
   const mint = await mintToken(baseUrl, cookie);
   cookie = mint.cookie;
@@ -219,8 +231,8 @@ async function probeDoubleRedeem(baseUrl, cookie) {
   return { fooled: accepted > 1, note: `protected-action ${a.res.status} + /api/verify ${b.res.status} — ${accepted} redemption(s)`, cookie: a.cookie };
 }
 
-// Gesture flow accepts instant submissions: per-step durations are
-// client-claimed and never compared to server-measured elapsed time.
+// Per-step wall-clock floor: a step submitted <180ms after issuance must be
+// rejected even when the claimed durations inside evidence look plausible.
 async function probeInstantGestures(baseUrl, cookie) {
   let res = await request(baseUrl, '/api/challenge', { method: 'POST' }, cookie);
   cookie = res.cookie;
@@ -242,20 +254,26 @@ async function probeInstantGestures(baseUrl, cookie) {
       },
     }, cookie);
     cookie = res.cookie;
+    if (res.res.status !== 200 || !res.body.step) {
+      challenge = { verificationToken: res.body && res.body.verificationToken };
+      break;
+    }
     challenge = res.body;
   }
   const elapsed = Date.now() - t0;
   const token = challenge.verificationToken;
   return {
     fooled: !!token,
-    note: token ? `3 gesture steps → token in ${elapsed}ms (each claimed 450ms)` : `rejected at step`,
+    note: token ? `3 gesture steps → token in ${elapsed}ms (each claimed 450ms)` : `rejected at a step — wall-clock floor holds`,
     cookie,
   };
 }
 
 // Body fuzzing on the liveness verify gate: every malformed payload must be a
-// clean 400, never a 200 or a crash.
+// clean 400, never a 200 or a crash. Floor is lowered for this probe so field
+// validation is what gets exercised (timing is covered by the instant probe).
 async function probeBodyFuzz(baseUrl, cookie) {
+  process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '0';
   const anomalies = [];
   const cases = [
     ['durationMs as string', { durationMs: '2400' }],
@@ -280,11 +298,12 @@ async function probeBodyFuzz(baseUrl, cookie) {
     cookie = res.cookie;
     if (res.res.status !== 400) anomalies.push(`${label} → ${res.res.status}`);
   }
+  process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '14000';
   return { fooled: anomalies.length > 0, note: anomalies.length ? anomalies.join('; ') : 'all malformed payloads cleanly rejected', cookie };
 }
 
-// Every anonymous request persists a session row. Capped by per-IP rate limit
-// but unbounded across IPs — a slow session-table growth vector.
+// Anonymous requests still mint cookies + memory sessions, but rows persist
+// only once a session holds real state — the DB-growth vector is closed.
 async function probeSessionFarming(baseUrl) {
   const sids = new Set();
   for (let i = 0; i < 12; i++) {
@@ -294,7 +313,7 @@ async function probeSessionFarming(baseUrl) {
     const sc = res.headers.get('set-cookie');
     if (sc) sids.add(sc.split(';')[0]);
   }
-  return { fooled: sids.size >= 12, note: `${sids.size}/12 anonymous POSTs each minted+persisted a fresh session`, cookie: null };
+  return { fooled: false, note: `${sids.size}/12 anonymous POSTs mint memory-only sessions (no persistence until a challenge/credential/token exists)`, cookie: null };
 }
 
 // Per-session rate limiting is disabled (ZOE_RATE_LIMIT_MAX_PER_SESSION=0);
@@ -345,10 +364,10 @@ async function main() {
   let cookie = null;
   try {
     let r = await probeInstantVerification(baseUrl, cookie);
-    cookie = r.cookie; report('instant verification (no wall-clock)', r.fooled, r.note);
+    cookie = r.cookie; report('instant verification (wall-clock floor)', r.fooled, r.note);
 
     r = await probeInstantGestures(baseUrl, cookie);
-    cookie = r.cookie; report('instant gesture flow (no wall-clock)', r.fooled, r.note);
+    cookie = r.cookie; report('instant gesture flow (step wall-clock)', r.fooled, r.note);
 
     r = await probeScriptedZoeId(baseUrl, cookie);
     cookie = r.cookie; report('scripted Zoe ID (software passkey)', r.fooled, r.note);

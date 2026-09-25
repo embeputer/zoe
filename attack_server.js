@@ -1,8 +1,13 @@
 // Adversarial harness: measures which server checks a fully scripted client can
 // pass without a camera, a face, a hand, or MediaPipe. Run with `npm run attack`.
 process.env.ZOE_DB_PATH = ':memory:';
+// Wall-clock floors stay on but are shortened for runtime — the harness still
+// has to burn real seconds per attempt, not mint instantly.
+process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = process.env.ZOE_LIVENESS_MIN_ELAPSED_MS ?? '2000';
 const crypto = require('crypto');
 const { createServer } = require('./server');
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function request(baseUrl, path, options = {}, cookie) {
   const headers = { ...(options.headers || {}) };
@@ -108,6 +113,7 @@ async function attackFabricatedGestures(baseUrl, cookie) {
   cookie = res.cookie;
   let challenge = res.body;
   for (let i = 0; i < 3; i++) {
+    await sleep(200); // step floor: >=180ms between gesture steps
     res = await request(baseUrl, '/api/step', {
       method: 'POST',
       body: JSON.stringify({
@@ -137,6 +143,7 @@ async function attackFabricatedLiveness(baseUrl, cookie) {
   cookie = res.cookie;
   const { challengeId, plan, flashPlan } = res.body;
   const motionSeries = fabricatedMotionSeries(plan);
+  await sleep(2100); // wall-clock floor: >=2s (shortened from the 14s default)
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
     body: JSON.stringify({
@@ -169,6 +176,7 @@ async function attackReplayedSeries(baseUrl, cookie) {
   cookie = res.cookie;
   const template = fabricatedMotionSeries(res.body.plan);
   const noisy = template.map((s) => ({ ...s, v: s.v + gaussian() * 0.0004 }));
+  await sleep(2100);
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
     body: JSON.stringify({
@@ -215,6 +223,7 @@ async function controlUncorrelatedPixels(baseUrl, cookie) {
     ...s,
     f: Buffer.alloc(324).fill(40).toString('base64'),
   }));
+  await sleep(2100);
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
     body: JSON.stringify({
@@ -236,6 +245,7 @@ async function controlCrossSession(baseUrl, cookie) {
   cookie = res.cookie;
   const { challengeId, plan, flashPlan } = res.body;
   const motionSeries = fabricatedMotionSeries(plan);
+  await sleep(2100); // wall-clock floor: >=2s (shortened from the 14s default)
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
     body: JSON.stringify({

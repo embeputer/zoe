@@ -169,6 +169,7 @@ for (const row of db.prepare('SELECT id, created_at, last_seen_at FROM sessions'
     passkeyRegisterChallenge: null,
     passkeyAuthChallenge: null,
     livenessChallenge: null,
+    persisted: true,
   });
 }
 for (const row of db.prepare('SELECT session_id, id, public_key, alg, sign_count, created_at FROM credentials').all()) {
@@ -196,6 +197,7 @@ const pruneUsedTokensStmt = db.prepare('DELETE FROM used_tokens WHERE used_at < 
 
 function persistSession(session) {
   persistSessionStmt.run(session.id, session.createdAt, session.lastSeenAt);
+  session.persisted = true;
 }
 
 function persistCredential(sessionId, credential) {
@@ -213,6 +215,16 @@ function deletePersistedSession(sessionId) {
 
 function now() {
   return Date.now();
+}
+
+// Wall-clock floors: the pulse stage always takes >=14s of real time and each
+// gesture step takes >=180ms, so a verification that claims seconds of camera
+// evidence cannot mint in milliseconds. Read per-request so tests can shorten.
+function livenessMinElapsedMs() {
+  return Number(process.env.ZOE_LIVENESS_MIN_ELAPSED_MS ?? 14000);
+}
+function stepMinElapsedMs() {
+  return Number(process.env.ZOE_STEP_MIN_ELAPSED_MS ?? MIN_STEP_DURATION_MS);
 }
 
 function clientIp(req) {
@@ -403,13 +415,15 @@ function getSession(req, res) {
       passkeyRegisterChallenge: null,
       passkeyAuthChallenge: null,
       livenessChallenge: null,
+      persisted: false,
     });
     res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`);
-    persistSession(sessions.get(sid));
   } else {
     const session = sessions.get(sid);
     session.lastSeenAt = now();
-    persistSession(session);
+    // Anonymous hits create memory-only sessions; a row is written only once
+    // the session stores real state (challenge, credential, token).
+    if (session.persisted) persistSession(session);
   }
   return sessions.get(sid);
 }
@@ -487,6 +501,7 @@ function createChallenge(session) {
     evidenceDigests: new Set(),
   };
   challenges.set(challenge.id, challenge);
+  persistSession(session);
   return challenge;
 }
 
@@ -498,17 +513,17 @@ function validateEvidence(challenge, body) {
   const expectedGesture = challenge.steps[challenge.currentStep].id;
   if (body.gestureId !== expectedGesture) return 'Gesture does not match this challenge step.';
 
-  const frameCount = Number(evidence.frameCount);
-  const holdFrames = Number(evidence.holdFrames);
-  const durationMs = Number(evidence.durationMs);
-  const matchedAt = Number(evidence.matchedAt);
-  const startedAt = Number(evidence.startedAt);
-  if (!Number.isFinite(frameCount) || frameCount < MIN_HOLD_FRAMES) return 'Too few processed frames.';
-  if (!Number.isFinite(holdFrames) || holdFrames < MIN_HOLD_FRAMES) return 'Gesture was not held long enough.';
-  if (!Number.isFinite(durationMs) || durationMs < MIN_STEP_DURATION_MS || durationMs > MAX_STEP_DURATION_MS) {
+  const frameCount = evidence.frameCount;
+  const holdFrames = evidence.holdFrames;
+  const durationMs = evidence.durationMs;
+  const matchedAt = evidence.matchedAt;
+  const startedAt = evidence.startedAt;
+  if (typeof frameCount !== 'number' || !Number.isFinite(frameCount) || frameCount < MIN_HOLD_FRAMES) return 'Too few processed frames.';
+  if (typeof holdFrames !== 'number' || !Number.isFinite(holdFrames) || holdFrames < MIN_HOLD_FRAMES) return 'Gesture was not held long enough.';
+  if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < MIN_STEP_DURATION_MS || durationMs > MAX_STEP_DURATION_MS) {
     return 'Step timing is outside the allowed range.';
   }
-  if (!Number.isFinite(startedAt) || !Number.isFinite(matchedAt) || matchedAt <= startedAt) return 'Invalid evidence timing.';
+  if (typeof startedAt !== 'number' || typeof matchedAt !== 'number' || !Number.isFinite(startedAt) || !Number.isFinite(matchedAt) || matchedAt <= startedAt) return 'Invalid evidence timing.';
 
   const digest = crypto.createHash('sha256').update(JSON.stringify({
     challengeId: body.challengeId,
@@ -970,6 +985,7 @@ function validateLivenessPhases(phases, plan, { legacy = false } = {}) {
 }
 
 function issueVerificationToken(session, source, method = 'gesture', assurance = 'standard') {
+  persistSession(session);
   const iat = now();
   const payload = {
     type: 'zoe.verification',
@@ -1102,6 +1118,10 @@ async function handleApi(req, res, pathname) {
     if (challenge.consumedAt) return sendJson(res, 409, { error: 'Challenge was already consumed.' });
     if (now() > challenge.expiresAt) return sendJson(res, 410, { error: 'Challenge expired.' });
 
+    if (now() - challenge.stepStartedAt < stepMinElapsedMs()) {
+      return sendJson(res, 400, { error: 'Gesture step completed too quickly to be real.' });
+    }
+
     const evidenceError = validateEvidence(challenge, body);
     if (evidenceError) {
       logVerificationFailure('gesture_step_rejected', pathname);
@@ -1147,6 +1167,7 @@ async function handleApi(req, res, pathname) {
 
     const challenge = randomId(32);
     session.passkeyRegisterChallenge = { challenge, createdAt: now(), verifiedBy: gate.payload.method };
+    persistSession(session);
     return sendJson(res, 200, {
       challenge,
       rp: { name: APP_NAME },
@@ -1205,6 +1226,7 @@ async function handleApi(req, res, pathname) {
       signCount: 0,
       createdAt: now(),
     });
+    persistSession(session);
     persistCredential(session.id, session.credentials.get(rawId));
     session.passkeyRegisterChallenge = null;
     return sendJson(res, 201, { ok: true, credentialId: rawId });
@@ -1214,6 +1236,7 @@ async function handleApi(req, res, pathname) {
     if (!session.credentials.size) return sendJson(res, 409, { error: 'No passkey is registered in this session yet.' });
     const challenge = randomId(32);
     session.passkeyAuthChallenge = { challenge, createdAt: now() };
+    persistSession(session);
     return sendJson(res, 200, {
       challenge,
       timeout: 60000,
@@ -1280,6 +1303,7 @@ async function handleApi(req, res, pathname) {
       consumedAt: null,
       seriesDigests: new Set(),
     };
+    persistSession(session);
     return sendJson(res, 201, {
       challengeId,
       plan,
@@ -1303,16 +1327,21 @@ async function handleApi(req, res, pathname) {
     if (pending.consumedAt) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
     if (now() > pending.expiresAt) return sendJson(res, 410, { error: 'Face liveness challenge expired.' });
 
-    const durationMs = Number(body.durationMs);
-    const faceFrames = Number(body.faceFrames);
-    const motionScore = Number(body.motionScore);
+    if (now() - pending.createdAt < livenessMinElapsedMs()) {
+      logVerificationFailure('liveness_too_fast', pathname);
+      return sendJson(res, 400, { error: 'Face check completed too quickly to be real.' });
+    }
+
+    const durationMs = body.durationMs;
+    const faceFrames = body.faceFrames;
+    const motionScore = body.motionScore;
     const seriesDigest = typeof body.seriesDigest === 'string' ? body.seriesDigest : '';
     const legacy = body.legacyEngine === true;
-    if (!Number.isFinite(durationMs) || durationMs < 900 || durationMs > 15000) {
+    if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < 900 || durationMs > 15000) {
       return sendJson(res, 400, { error: 'Face check timing is outside the allowed range.' });
     }
-    if (!Number.isFinite(faceFrames) || faceFrames < 8) return sendJson(res, 400, { error: 'Face was not visible for long enough.' });
-    if (!Number.isFinite(motionScore) || motionScore < 0.08) return sendJson(res, 400, { error: 'Face motion was too small to count as liveness.' });
+    if (typeof faceFrames !== 'number' || !Number.isFinite(faceFrames) || faceFrames < 8) return sendJson(res, 400, { error: 'Face was not visible for long enough.' });
+    if (typeof motionScore !== 'number' || !Number.isFinite(motionScore) || motionScore < 0.08) return sendJson(res, 400, { error: 'Face motion was too small to count as liveness.' });
     if (!/^[a-f0-9]{64}$/.test(seriesDigest)) return sendJson(res, 400, { error: 'Face motion digest is invalid.' });
 
     const motionSeries = body.motionSeries;

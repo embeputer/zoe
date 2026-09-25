@@ -13,7 +13,7 @@ This is a plain Node/static app:
 - `test_server.js` is the regression/security test suite.
 - `attack_server.js` is the adversarial harness: it submits fully fabricated evidence and reports which server checks a scripted client fools.
 
-Sessions, passkey credentials, and consumed token digests persist in SQLite (`node:sqlite`, file `zoe-data.sqlite3`, override with `ZOE_DB_PATH`; tests use `:memory:` or a temp file). Short-lived challenge state stays in memory. Relying parties redeem tokens via `POST /api/verify` (signature + expiry + one-use; no session cookie required).
+Sessions, passkey credentials, and consumed token digests persist in SQLite (`node:sqlite`, file `zoe-data.sqlite3`, override with `ZOE_DB_PATH`; tests use `:memory:` or a temp file). Session rows persist lazily — a cookie-only anonymous hit stays memory-only until the session gains real state (challenge, credential, token). Short-lived challenge state stays in memory. Verification enforces wall-clock floors server-side (`ZOE_LIVENESS_MIN_ELAPSED_MS`, `ZOE_STEP_MIN_ELAPSED_MS`; tests shorten them via env). Relying parties redeem tokens via `POST /api/verify` (signature + expiry + one-use; no session cookie required).
 
 ## Run And Test
 

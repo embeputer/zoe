@@ -79,10 +79,10 @@ npm run attack:agent
 
 `attack_agent.js` probes the API-level surface an autonomous agent sees — no media fabrication needed, just protocol abuse. Measured results:
 
-- **FOOLED — no wall-clock anywhere.** Every duration (`durationMs`, `pulseSeries.t`, `pixelSeries.t`, step `startedAt`/`matchedAt`) is client-claimed; the server only ever enforces TTL ceilings. A complete "20-second" liveness verification mints a token in ~40ms; the gesture flow in ~6ms. The cheapest meaningful fix is comparing `now() - challenge.createdAt` to claimed durations, which would also cap attempt rate to ~1 per real flow duration.
-- **FOOLED — Zoe ID is fully scriptable.** `attestation: 'none'` + register accepting any SPKI key means a generated P-256 keypair registers behind a forged liveness token, then authenticates with self-asserted UP|UV flags and mints a `'strong'`-assurance token. The highest-assurance path needs no human at all — closing it needs real attestation (packed/fido-u2f + AAGUID allowlist), not more statistics.
-- **FOOLED (nit) — type coercion.** `Number(body.durationMs)` accepts `"2400"` as a string; payload field types are never asserted, only coerced.
-- **INFO — session farming.** Every anonymous POST persists a session row in SQLite; capped by the per-IP limit but unbounded across IPs.
+- **BLOCKED — instant verification.** The server now compares `now() - challenge.createdAt` to a wall-clock floor (`ZOE_LIVENESS_MIN_ELAPSED_MS`, default 14s — the pulse stage's real duration; `ZOE_STEP_MIN_ELAPSED_MS`, default 180ms per gesture step). A "20-second" verification submitted in ~40ms is rejected, which also caps attempt rate at ~1 per real flow duration.
+- **FOOLED — Zoe ID is still scriptable, just slower.** `attestation: 'none'` + register accepting any SPKI key means a generated P-256 keypair registers behind a forged liveness token and mints `'strong'` assurance with self-asserted UP|UV flags — the floor only makes each attempt cost ≥14s. Closing it needs real attestation (packed/fido-u2f + AAGUID allowlist), not more statistics.
+- **BLOCKED — type coercion.** Payload field types are asserted (`typeof === 'number'`), not coerced — `"2400"` as a string is now a 400.
+- **INFO — session farming closed.** Anonymous requests mint memory-only sessions; a row is persisted only when the session gains real state (challenge, credential, token).
 - **BLOCKED — token double-redeem** across `/api/protected-action` + `/api/verify` (one wins, one 409s).
 - **BLOCKED — challenge binding.** Liveness challenges live in a per-session slot with unguessable ids; cross-session use and id guessing both 400.
 - **BLOCKED — rate limit.** First 429 lands at the 120/min IP cap; cookie rotation gains nothing, but distributed IPs bypass it and the per-session limiter ships disabled (`ZOE_RATE_LIMIT_MAX_PER_SESSION=0`).

@@ -3,6 +3,9 @@ const fs = require('fs');
 const os = require('os');
 process.env.ZOE_DB_PATH = path.join(os.tmpdir(), `zoe-test-${process.pid}.sqlite3`);
 process.env.ZOE_SECRET = process.env.ZOE_SECRET || 'zoe-test-secret';
+// Wall-clock floors off for the suite; one case re-enables to assert them.
+process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '0';
+process.env.ZOE_STEP_MIN_ELAPSED_MS = '0';
 const assert = require('assert');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
@@ -274,6 +277,17 @@ async function main() {
     }, cookie);
     assert.strictEqual(reducedVerify.res.status, 200);
     assert.ok(reducedVerify.body.pulseBpm > 0);
+
+    // Wall-clock floor: with the minimum elapsed enforced, an instant
+    // challenge-to-verify must be rejected even with valid evidence.
+    process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '60000';
+    const fastChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const tooFast = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(fastChallenge.body.challengeId, fastChallenge.body.plan, fastChallenge.body.flashPlan)),
+    }, cookie);
+    assert.strictEqual(tooFast.res.status, 400);
+    process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '0';
 
     const noPasskey = await request(baseUrl, '/api/passkey/auth/options', { method: 'POST' }, cookie);
     assert.strictEqual(noPasskey.res.status, 409);
