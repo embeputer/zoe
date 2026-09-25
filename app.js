@@ -1279,7 +1279,31 @@ function detectionBox(detection, vw, vh) {
   return { x, y, w, h };
 }
 
-function calibratedFaceBox(box, vw, vh) {
+function fitBoxToKeypoints(box, keypoints, vw, vh) {
+  const points = (keypoints || [])
+    .map((point) => pointToPixel(point, vw, vh))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (points.length < 3) return box;
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const marginX = box.w * 0.08;
+  const marginY = box.h * 0.08;
+  const minX = Math.max(...xs) - box.w + marginX;
+  const maxX = Math.min(...xs) - marginX;
+  const minY = Math.max(...ys) - box.h + marginY;
+  const maxY = Math.min(...ys) - marginY;
+  const x = minX <= maxX ? Math.min(Math.max(box.x, minX), maxX) : box.x;
+  const y = minY <= maxY ? Math.min(Math.max(box.y, minY), maxY) : box.y;
+
+  return {
+    ...box,
+    x: Math.min(Math.max(0, x), Math.max(0, vw - box.w)),
+    y: Math.min(Math.max(0, y), Math.max(0, vh - box.h)),
+  };
+}
+
+function calibratedFaceBox(box, vw, vh, keypoints) {
   // In this camera/model setup Blaze's raw box tracks the face pattern but is
   // consistently displaced down/right on the displayed frame. Keep all detector
   // calibration centralized here so drawing and motion checks share one box.
@@ -1287,12 +1311,12 @@ function calibratedFaceBox(box, vw, vh) {
   const h = box.h * FACE_BOX_HEIGHT_SCALE;
   const x = box.x + box.w * FACE_BOX_SHIFT_X;
   const y = box.y + box.h * FACE_BOX_SHIFT_Y;
-  return {
+  return fitBoxToKeypoints({
     x: Math.min(Math.max(0, x), Math.max(0, vw - w)),
     y: Math.min(Math.max(0, y), Math.max(0, vh - h)),
     w,
     h,
-  };
+  }, keypoints, vw, vh);
 }
 
 function pointToPixel(point, vw, vh) {
@@ -1363,7 +1387,7 @@ async function detectFaceFrame(engine) {
     candidates = detections
       .map((detection) => {
         const rawBox = detectionBox(detection, vw, vh);
-        const box = calibratedFaceBox(rawBox, vw, vh);
+        const box = calibratedFaceBox(rawBox, vw, vh, detection.keypoints);
         const pose = poseFromKeypoints(detection.keypoints, vw, vh);
         return {
           ...box,

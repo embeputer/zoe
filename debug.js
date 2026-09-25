@@ -49,20 +49,51 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function calibratedFaceBox(box) {
+function pointToPixel(point, width, height) {
+  return {
+    x: point.x <= 1 ? point.x * width : point.x,
+    y: point.y <= 1 ? point.y * height : point.y,
+  };
+}
+
+function fitBoxToKeypoints(box, keypoints, frameWidth, frameHeight) {
+  const points = (keypoints || [])
+    .map((point) => pointToPixel(point, frameWidth, frameHeight))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (points.length < 3) return box;
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const marginX = box.width * 0.08;
+  const marginY = box.height * 0.08;
+  const minX = Math.max(...xs) - box.width + marginX;
+  const maxX = Math.min(...xs) - marginX;
+  const minY = Math.max(...ys) - box.height + marginY;
+  const maxY = Math.min(...ys) - marginY;
+  const x = minX <= maxX ? Math.min(Math.max(box.x, minX), maxX) : box.x;
+  const y = minY <= maxY ? Math.min(Math.max(box.y, minY), maxY) : box.y;
+
+  return {
+    ...box,
+    x: Math.min(Math.max(0, x), Math.max(0, frameWidth - box.width)),
+    y: Math.min(Math.max(0, y), Math.max(0, frameHeight - box.height)),
+  };
+}
+
+function calibratedFaceBox(box, keypoints) {
   const frameWidth = video.videoWidth;
   const frameHeight = video.videoHeight;
   const width = box.width;
   const height = box.height * FACE_BOX_HEIGHT_SCALE;
   const x = box.x + box.width * FACE_BOX_SHIFT_X;
   const y = box.y + box.height * FACE_BOX_SHIFT_Y;
-  return {
+  return fitBoxToKeypoints({
     x: Math.min(Math.max(0, x), Math.max(0, frameWidth - width)),
     y: Math.min(Math.max(0, y), Math.max(0, frameHeight - height)),
     width,
     height,
     score: box.score,
-  };
+  }, keypoints, frameWidth, frameHeight);
 }
 
 async function initDetector() {
@@ -92,7 +123,7 @@ function bestFace() {
       height: box.height,
       score,
     };
-    if (!best || candidate.score > best.score) best = calibratedFaceBox(candidate);
+    if (!best || candidate.score > best.score) best = calibratedFaceBox(candidate, detection.keypoints);
   }
   currentFace = best;
   return best;
