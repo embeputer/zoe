@@ -38,10 +38,7 @@ body {
 }
 
 body {
-  background:
-    radial-gradient(70% 45% at 50% 0%, #e9eafa 0%, transparent 70%),
-    var(--page);
-  background-attachment: fixed;
+  background: var(--page);
   color: var(--ink);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
@@ -479,16 +476,6 @@ h1 {
   justify-content: space-between;
   gap: 12px;
   margin-bottom: 14px;
-}
-
-.verification-eyebrow {
-  display: block;
-  color: var(--blue);
-  font-size: 11px;
-  font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: 0.09em;
-  margin-bottom: 4px;
 }
 
 h2 {
