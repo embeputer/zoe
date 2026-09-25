@@ -28,9 +28,12 @@ const FLASH_CHROMA_RATIO_MAX = 2;
 const SAMPLE_INTERVAL_MS = 100;
 const PULSE_WINDOW_MS = 12000;
 const FLASH_COLORS = [
-  { name: 'Red', className: 'flash-red', rgb: [255, 72, 72] },
-  { name: 'Green', className: 'flash-green', rgb: [72, 255, 124] },
-  { name: 'Blue', className: 'flash-blue', rgb: [72, 120, 255] },
+  { name: 'Red', rgb: [255, 64, 64] },
+  { name: 'Blue', rgb: [64, 160, 255] },
+  { name: 'Green', rgb: [72, 220, 120] },
+  { name: 'Amber', rgb: [255, 190, 60] },
+  { name: 'Purple', rgb: [190, 110, 255] },
+  { name: 'Cyan', rgb: [60, 220, 220] },
 ];
 
 let detector = null;
@@ -239,11 +242,13 @@ async function runFlashTest() {
   const results = [];
   for (const color of FLASH_COLORS) {
     flashButton.textContent = `Testing ${color.name.toLowerCase()}`;
-    flashOverlay.className = color.className;
+    flashOverlay.style.background = `rgb(${color.rgb.join(',')})`;
+    flashOverlay.style.opacity = '0.85';
     flashOverlay.hidden = false;
     await sleep(150);
     const samples = await collectWindow(650);
     flashOverlay.hidden = true;
+    flashOverlay.style.opacity = '0';
     await sleep(450);
     results.push({ color, sampleCount: samples.length, result: metrics.flashMetrics(baselineSamples, samples, color.rgb) });
   }
@@ -251,7 +256,8 @@ async function runFlashTest() {
     const row = document.createElement('div');
     row.className = 'flash-row';
     const swatch = document.createElement('span');
-    swatch.className = `swatch ${color.className}`;
+    swatch.className = 'swatch';
+    swatch.style.background = `rgb(${color.rgb.join(',')})`;
     const name = document.createElement('span');
     name.textContent = `${color.name} (${sampleCount} samples)`;
     const value = document.createElement('strong');
