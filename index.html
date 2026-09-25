@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Zoe — Prove You're Human</title>
   <link rel="stylesheet" href="styles.css" />
-  <!-- MediaPipe Hands (client-side hand landmark detection) -->
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3.1675466862/camera_utils.js" crossorigin="anonymous"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js" crossorigin="anonymous"></script>
+  <!-- MediaPipe Hands (client-side hand landmark detection), vendored under vendor/mediapipe/ -->
+  <script src="vendor/mediapipe/hands/hands.js"></script>
+  <script src="vendor/mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="vendor/mediapipe/drawing_utils/drawing_utils.js"></script>
 </head>
 <body>
   <div id="boot-loader" class="boot-loader" aria-hidden="true">

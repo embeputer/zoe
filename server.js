@@ -461,7 +461,7 @@ function securityHeaders(res) {
   res.setHeader('Permissions-Policy', 'camera=(self), microphone=()');
   res.setHeader(
     'Content-Security-Policy',
-    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://cdn.jsdelivr.net; media-src 'self' blob:; worker-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
   );
 }
 
@@ -1815,8 +1815,9 @@ function contentType(filePath) {
   const ext = path.extname(filePath);
   if (ext === '.html') return 'text/html; charset=utf-8';
   if (ext === '.css') return 'text/css; charset=utf-8';
-  if (ext === '.js') return 'application/javascript; charset=utf-8';
+  if (ext === '.js' || ext === '.mjs') return 'application/javascript; charset=utf-8';
   if (ext === '.json') return 'application/json; charset=utf-8';
+  if (ext === '.wasm') return 'application/wasm';
   if (ext === '.tflite' || ext === '.task') return 'application/octet-stream';
   if (ext === '.png') return 'image/png';
   return 'application/octet-stream';
@@ -1833,7 +1834,7 @@ function serveStatic(req, res, pathname) {
     return res.end('Not found');
   }
   const filePath = path.resolve(__dirname, `.${requested}`);
-  if (!filePath.startsWith(__dirname) || !['.html', '.css', '.js', '.tflite', '.task', '.png'].includes(path.extname(filePath))) {
+  if (!filePath.startsWith(__dirname) || !['.html', '.css', '.js', '.mjs', '.wasm', '.data', '.binarypb', '.tflite', '.task', '.png'].includes(path.extname(filePath))) {
     securityHeaders(res);
     res.writeHead(404);
     return res.end('Not found');

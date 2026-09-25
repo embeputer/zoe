@@ -6,7 +6,8 @@ Zoe is a small human-presence verification demo. The browser can run hand gestur
 
 - Node.js 22.5 or newer (uses `node:sqlite` for durable state)
 - A browser with camera support
-- Network access to `cdn.jsdelivr.net` for MediaPipe assets
+
+MediaPipe assets are vendored under `vendor/mediapipe/` and served from the same origin — no CDN access is required.
 
 ## Run Locally
 
@@ -130,7 +131,7 @@ Relying parties can redeem a token without the user's session cookie via `POST /
 The UI gives camera guidance when detection struggles. Users can choose a different primary method before verification:
 
 - **Zoe ID**: strongest repeat-use path. Approved users verify with a passkey through WebAuthn, and the server verifies the signed assertion. At registration the server also verifies the authenticator's attestation: credentials whose packed/apple x5c chain reaches an embedded FIDO root are marked hardware-backed, and only those (with a user-verified assertion) mint `assurance: 'strong'` tokens — everything else caps at `'standard'`.
-- **Face motion**: primary local face-motion check using MediaPipe Tasks Vision FaceDetector (cross-browser; works in Chrome, Safari, and Firefox under a strict CSP). The compatible short-range detector model is served locally from `models/`, and the browser verifies confidence, face-sized bounds, target-oval position, and eye/nose keypoint yaw before counting server-prompted head turns (`center_hold`, then left-first or right-first). The server issues the phase plan, validates phase order/metrics, and checks a `challengeId`-bound `seriesDigest` over the submitted `motionSeries`. Standard motion checks also include loose micro-jitter and path-tortuosity heuristics on hold and between-pose samples (not virtual-camera protection). It falls back to the browser `FaceDetector` API only when the MediaPipe runtime cannot load, using box motion because that fallback has no keypoints. It checks liveness-style motion, not identity.
+- **Face motion**: primary local face-motion check using MediaPipe Tasks Vision FaceDetector (cross-browser; works in Chrome, Safari, and Firefox under a strict CSP). The Tasks Vision runtime and WASM files are served locally from `vendor/mediapipe/tasks-vision/`, and the compatible short-range detector model is served locally from `models/`, and the browser verifies confidence, face-sized bounds, target-oval position, and eye/nose keypoint yaw before counting server-prompted head turns (`center_hold`, then left-first or right-first). The server issues the phase plan, validates phase order/metrics, and checks a `challengeId`-bound `seriesDigest` over the submitted `motionSeries`. Standard motion checks also include loose micro-jitter and path-tortuosity heuristics on hold and between-pose samples (not virtual-camera protection). It falls back to the browser `FaceDetector` API only when the MediaPipe runtime cannot load, using box motion because that fallback has no keypoints. It checks liveness-style motion, not identity.
 
 There is no emergency text/audio verification path. When camera detection takes a bit, Zoe shows passive camera guidance while the user keeps trying the selected method.
 

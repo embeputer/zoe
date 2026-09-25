@@ -218,7 +218,7 @@ function detectWave(lm) {
 
 async function initMediaPipe() {
   handsModel = new Hands({
-    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
+    locateFile: (file) => `/vendor/mediapipe/hands/${file}`,
   });
   handsModel.setOptions({
     maxNumHands: 2,
@@ -230,10 +230,10 @@ async function initMediaPipe() {
 }
 
 // MediaPipe Tasks Vision: cross-browser face detection that runs under a strict
-// CSP (only needs 'wasm-unsafe-eval'). The WASM runtime loads from the CDN; the
-// model is vendored locally so no extra connect-src origin is required.
-const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
-const TASKS_VISION_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
+// CSP (only needs 'wasm-unsafe-eval'). The runtime and WASM files are vendored
+// locally, and so is the model, so no extra connect-src origin is required.
+const TASKS_VISION_URL = '/vendor/mediapipe/tasks-vision/vision_bundle.mjs';
+const TASKS_VISION_WASM = '/vendor/mediapipe/tasks-vision/wasm';
 const FACE_DETECTOR_MODEL_URL = '/models/blaze_face_short_range.tflite';
 
 // Use the dedicated FaceDetector as the acceptance gate because it exposes a
