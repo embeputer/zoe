@@ -1251,6 +1251,8 @@ const FACE_BOX_HEIGHT_SCALE = 1.02;
 const FACE_CENTER_GATE_X = 0.75;
 const FACE_CENTER_GATE_Y = 0.75;
 const FACE_MOTION_GATE_X = 0.45; // Legacy FaceDetector fallback only.
+const FACE_CENTER_TIMEOUT_MS = 20000;
+const FACE_TURN_TIMEOUT_MS = 15000;
 const YAW_CENTER_MAX = 0.25;
 const YAW_TURN_MIN = 0.45;
 const YAW_MOTION_RANGE_MIN = 0.35;
@@ -1465,7 +1467,11 @@ function drawFaceGuide(box, opts = {}) {
 
   ctx.clearRect(0, 0, W, H);
 
+  ctx.save();
+  ctx.translate(W, 0);
+  ctx.scale(-1, 1);
   ctx.drawImage(videoEl, transform.dx, transform.dy, transform.drawWidth, transform.drawHeight);
+  ctx.restore();
 
   // Spotlight: dim everything except the face-center oval. The even-odd fill
   // paints the region outside the ellipse, leaving the oval interior bright.
@@ -1487,9 +1493,9 @@ function drawFaceGuide(box, opts = {}) {
   ctx.stroke();
   ctx.restore();
 
-  // Live face box in the same unmirrored coordinate space as the camera frame.
   if (SHOW_FACE_DEBUG_BOX && box) {
     const mappedBox = mapVideoBoxToCanvas(box.pixelBox, transform);
+    mappedBox.x = W - mappedBox.x - mappedBox.w;
     ctx.save();
     ctx.strokeStyle = 'rgba(91,140,255,0.9)';
     ctx.lineWidth = 2;
@@ -1528,7 +1534,7 @@ function faceMotionPhaseConfig(phaseId, requirePoseLiveness) {
     center_to_left: {
       label: 'Turn this way',
       hint: 'Slowly turn toward the arrow.',
-      arrow: requirePoseLiveness ? 'right' : 'left',
+      arrow: requirePoseLiveness ? 'left' : 'right',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'left'
         : displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
@@ -1536,7 +1542,7 @@ function faceMotionPhaseConfig(phaseId, requirePoseLiveness) {
     center_to_right: {
       label: 'Turn this way',
       hint: 'Slowly turn toward the arrow.',
-      arrow: requirePoseLiveness ? 'left' : 'right',
+      arrow: requirePoseLiveness ? 'right' : 'left',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'right'
         : displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
@@ -1544,7 +1550,7 @@ function faceMotionPhaseConfig(phaseId, requirePoseLiveness) {
     left_to_right: {
       label: 'Now the other way',
       hint: 'Slowly turn toward the arrow.',
-      arrow: requirePoseLiveness ? 'left' : 'right',
+      arrow: requirePoseLiveness ? 'right' : 'left',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'right'
         : displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
@@ -1552,7 +1558,7 @@ function faceMotionPhaseConfig(phaseId, requirePoseLiveness) {
     right_to_left: {
       label: 'Now the other way',
       hint: 'Slowly turn toward the arrow.',
-      arrow: requirePoseLiveness ? 'right' : 'left',
+      arrow: requirePoseLiveness ? 'left' : 'right',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'left'
         : displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
@@ -1798,7 +1804,6 @@ async function runGuidedFaceCheck() {
       lastPulseT = t;
     }
   };
-  const deadline = startedAt + 30000;
   recentFaceBox = null;
   recentFaceBoxAt = 0;
 
@@ -1817,7 +1822,8 @@ async function runGuidedFaceCheck() {
     promptNameEl.textContent = 'Center your face';
     promptHintEl.textContent = 'Fit your face inside the oval and hold still.';
     let centeredFrames = 0;
-    while (faceChecking && performance.now() < deadline) {
+    const centerDeadline = performance.now() + FACE_CENTER_TIMEOUT_MS;
+    while (faceChecking && performance.now() < centerDeadline) {
       const box = await detectStableFaceFrame(engine);
       if (box && !box.stale) {
         centers.push(box.cx);
@@ -1863,7 +1869,7 @@ async function runGuidedFaceCheck() {
         label: phaseUi.label,
         hint: phaseUi.hint,
         arrow: phaseUi.arrow,
-        deadline,
+        deadline: performance.now() + FACE_TURN_TIMEOUT_MS,
         flowStartedAt: startedAt,
         phase: phaseId,
         motionValue,
