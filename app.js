@@ -1287,20 +1287,15 @@ function fitBoxToKeypoints(box, keypoints, vw, vh) {
 
   const xs = points.map((point) => point.x);
   const ys = points.map((point) => point.y);
-  const marginX = box.w * 0.08;
-  const marginY = box.h * 0.08;
-  const minX = Math.max(...xs) - box.w + marginX;
-  const maxX = Math.min(...xs) - marginX;
-  const minY = Math.max(...ys) - box.h + marginY;
-  const maxY = Math.min(...ys) - marginY;
-  const x = minX <= maxX ? Math.min(Math.max(box.x, minX), maxX) : box.x;
-  const y = minY <= maxY ? Math.min(Math.max(box.y, minY), maxY) : box.y;
-
-  return {
-    ...box,
-    x: Math.min(Math.max(0, x), Math.max(0, vw - box.w)),
-    y: Math.min(Math.max(0, y), Math.max(0, vh - box.h)),
-  };
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const w = Math.min(vw, Math.max(box.w, maxX - minX + box.w * 0.16));
+  const h = Math.min(vh, Math.max(box.h, maxY - minY + box.h * 0.16));
+  const x = Math.min(Math.max(0, (minX + maxX - w) / 2), Math.max(0, vw - w));
+  const y = Math.min(Math.max(0, (minY + maxY - h) / 2), Math.max(0, vh - h));
+  return { ...box, x, y, w, h };
 }
 
 function calibratedFaceBox(box, vw, vh, keypoints) {
