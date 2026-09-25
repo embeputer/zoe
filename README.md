@@ -101,7 +101,7 @@ npm run attack
 
 `npm run attack` runs both harness stages fail-fast (`attack:server` then `attack:agent`; each is also runnable on its own). Every probe reports tri-state — `FOOLED` when the attack worked, `BLOCKED at <stage>` when the probed check genuinely rejected it, or `NOT-PROBED` when an earlier gate killed the request — so a dead probe can never masquerade as a passed check.
 
-`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera or MediaPipe — including a procedural face, synthesized pulse, and pixels that match the issued flash sequence. Server-side face detection plus presentation analysis blocks the harness's fabricated and replayed-summary face attacks. The hand-gesture route remains forgeable because it still accepts client-generated landmark evidence, and face PAD does not prove camera provenance or defeat a sufficiently realistic injected/replayed feed.
+`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera or MediaPipe — including a procedural face, synthesized pulse, and pixels that match the issued flash sequence. Server-side face detection plus presentation analysis blocks the harness's fabricated and replayed-summary face attacks. The hand-gesture route still accepts client-generated landmark claims — geometry checks now require plausible per-gesture landmarks, but they do not prove a camera produced them. Face PAD likewise does not prove camera provenance or defeat a sufficiently realistic injected/replayed feed.
 
 ```sh
 npm run attack:agent

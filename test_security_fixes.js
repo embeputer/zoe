@@ -76,16 +76,22 @@ function samplePixelSeries(flashPlan, flashExposureGain = 1) {
   return samples;
 }
 
+// Shared rPPG carrier (fundamental + harmonic + drift) — pulse claims and the
+// synthetic camera frames both derive from it so the pixel binding holds.
+const PULSE_W1 = 2 * Math.PI * 1.17;
+const PULSE_W2 = 2 * Math.PI * 2.34;
+const PULSE_WD = 2 * Math.PI * 0.08;
+function pulseCarrier(tMs) {
+  const s = tMs / 1000;
+  return 118 + 3.5 * Math.sin(PULSE_W1 * s) + 1.1 * Math.sin(PULSE_W2 * s + 0.7) + 1.5 * Math.sin(PULSE_WD * s + 1.2);
+}
+
 // Green-channel means with a physiologic-band pulse (fundamental + harmonic +
 // drift + noise) — shaped like a real rPPG signal.
 function samplePulseSeries(spanMs = 14000) {
   const samples = [];
-  const w1 = 2 * Math.PI * 1.17;
-  const w2 = 2 * Math.PI * 2.34;
-  const wd = 2 * Math.PI * 0.08;
   for (let t = 0; t <= spanMs; t += 95) {
-    const s = t / 1000;
-    const g = 118 + 3.5 * Math.sin(w1 * s) + 1.1 * Math.sin(w2 * s + 0.7) + 1.5 * Math.sin(wd * s + 1.2) + gaussian() * 2.2;
+    const g = pulseCarrier(t) + gaussian() * 2.2;
     samples.push({ g: Math.round(g * 100) / 100, t });
   }
   return samples;
@@ -109,15 +115,19 @@ function sampleMotionSeries(plan) {
 }
 
 const jpeg = require('jpeg-js');
+// Green channel carries the same pulse carrier the series claims, so the
+// server recomputation over the face region tracks the submitted samples.
 const mediaFrameImages = Array.from({ length: 5 }, (_, frameIndex) => {
   const width = 320;
   const height = 240;
+  const t = frameIndex * 700;
+  const green = Math.round(pulseCarrier(t));
   const data = Buffer.alloc(width * height * 4);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const offset = (y * width + x) * 4;
       data[offset] = (x + frameIndex * 7) % 256;
-      data[offset + 1] = (y + frameIndex * 11) % 256;
+      data[offset + 1] = Math.max(0, Math.min(255, green + ((x % 7) - 3)));
       data[offset + 2] = (x + y + frameIndex * 13) % 256;
       data[offset + 3] = 255;
     }
@@ -135,6 +145,7 @@ function sampleMediaFrames() {
 
 function livenessBody(challengeId, plan, flashPlan) {
   const motionSeries = sampleMotionSeries(plan);
+  const pulseSeries = samplePulseSeries();
   const mediaFrames = sampleMediaFrames();
   return {
     challengeId,
@@ -143,9 +154,9 @@ function livenessBody(challengeId, plan, flashPlan) {
     motionScore: 0.12,
     phases: validLivenessPhases(plan),
     motionSeries,
-    seriesDigest: computeLivenessSeriesDigest(challengeId, motionSeries),
+    seriesDigest: computeLivenessSeriesDigest(challengeId, motionSeries, pulseSeries),
     pixelSeries: flashPlan ? samplePixelSeries(flashPlan) : undefined,
-    pulseSeries: samplePulseSeries(),
+    pulseSeries,
     mediaFrames,
     mediaDigest: computePresentationDigest(challengeId, mediaFrames),
   };

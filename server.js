@@ -634,11 +634,8 @@ function validateEvidence(challenge, body) {
     }
   }
 
-  const landmarkSamples = evidence.landmarkSamples;
-  if (landmarkSamples !== undefined) {
-    const geometryError = validateHandLandmarkGeometry(expectedGesture, landmarkSamples);
-    if (geometryError) return geometryError;
-  }
+  const geometryError = validateHandLandmarkGeometry(expectedGesture, evidence.landmarkSamples);
+  if (geometryError) return geometryError;
 
   challenge.evidenceDigests.add(digest);
   return null;
@@ -1054,14 +1051,32 @@ function thumbExtendedPacked(hand) {
   return sideExtent && tipNotFolded && ipAboveBase;
 }
 
-function handMatchesThree(hand) {
-  if (!Array.isArray(hand) || hand.length < HAND_EVIDENCE_LM_COUNT) return false;
-  const index = fingerExtendedPacked(hand, H.indexTip, H.indexPip);
-  const middle = fingerExtendedPacked(hand, H.middleTip, H.middlePip);
-  const ring = fingerExtendedPacked(hand, H.ringTip, H.ringPip);
-  const pinky = fingerExtendedPacked(hand, H.pinkyTip, H.pinkyPip);
-  const thumb = thumbExtendedPacked(hand);
-  return !thumb && index && middle && ring && !pinky;
+function handFingerState(hand) {
+  return {
+    thumb: thumbExtendedPacked(hand),
+    index: fingerExtendedPacked(hand, H.indexTip, H.indexPip),
+    middle: fingerExtendedPacked(hand, H.middleTip, H.middlePip),
+    ring: fingerExtendedPacked(hand, H.ringTip, H.ringPip),
+    pinky: fingerExtendedPacked(hand, H.pinkyTip, H.pinkyPip),
+  };
+}
+
+// Per-gesture finger-extension expectations; thumb is ignored where the pose
+// leaves it ambiguous. `ok` and `ily` have dedicated matchers below.
+const SINGLE_HAND_GESTURE_MATCHERS = {
+  wave: (f) => f.thumb && f.index && f.middle && f.ring && f.pinky,
+  fist: (f) => !f.thumb && !f.index && !f.middle && !f.ring && !f.pinky,
+  open_palm: (f) => f.thumb && f.index && f.middle && f.ring && f.pinky,
+  peace: (f) => f.index && f.middle && !f.ring && !f.pinky,
+  point: (f) => f.index && !f.middle && !f.ring && !f.pinky,
+  three: (f) => !f.thumb && f.index && f.middle && f.ring && !f.pinky,
+  rock: (f) => f.index && f.pinky && !f.middle && !f.ring,
+  call_me: (f) => f.thumb && f.pinky && !f.index && !f.middle && !f.ring,
+};
+
+function handMatchesOk(f, hand) {
+  const tipsTouch = dist3dLandmark(hand[H.thumbTip], hand[H.indexTip]) < 0.08;
+  return tipsTouch && f.middle && f.ring && f.pinky;
 }
 
 function handsMatchHeart(hands) {
@@ -1143,19 +1158,22 @@ function validateMotionSeriesCoverage(motionSeries, plan) {
 }
 
 function validateHandLandmarkGeometry(gestureId, samples) {
-  if (!Array.isArray(samples)) return 'Landmark evidence is invalid.';
+  if (!Array.isArray(samples) || !samples.length) return 'Hand landmark evidence is required.';
   if (samples.length > MAX_LANDMARK_SAMPLES) return 'Landmark evidence is too large.';
-  if (!samples.length) return null;
 
   const relevant = samples.filter((sample) => sample && Array.isArray(sample.hands) && sample.hands.length);
-  if (!relevant.length) return null;
+  if (!relevant.length) return 'Hand landmark evidence is required.';
 
-  if (gestureId === 'three') {
-    const ok = relevant.some((sample) => sample.hands[0] && handMatchesThree(sample.hands[0]));
-    if (!ok) return 'Hand geometry does not match the requested gesture.';
-  }
   if (gestureId === 'ily') {
     const ok = relevant.some((sample) => handsMatchHeart(sample.hands));
+    if (!ok) return 'Hand geometry does not match the requested gesture.';
+    return null;
+  }
+  const matcher = gestureId === 'ok' ? handMatchesOk : SINGLE_HAND_GESTURE_MATCHERS[gestureId];
+  if (matcher) {
+    const ok = relevant.some((sample) => sample.hands.some((hand) => (
+      Array.isArray(hand) && hand.length >= HAND_EVIDENCE_LM_COUNT && matcher(handFingerState(hand), hand)
+    )));
     if (!ok) return 'Hand geometry does not match the requested gesture.';
   }
   return null;

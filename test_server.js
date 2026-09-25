@@ -60,6 +60,52 @@ function evidence(overrides = {}) {
   };
 }
 
+// Synthesized packed-hand fixtures (server's 12-point HAND_EVIDENCE_LM layout)
+// so step evidence can carry landmarks matching the issued gesture.
+function packedHandFixture(state = {}) {
+  const finger = (pipX, extended) => [[pipX, 0.62, 0], [pipX, extended ? 0.48 : 0.7, 0]];
+  const hand = [
+    [0.5, 0.75, 0],
+    [0.42, 0.72, 0],
+    [0.48, 0.68, 0],
+    state.thumb ? [0.3, 0.65, 0] : [0.45, 0.71, 0],
+  ];
+  for (const [pipX, extended] of [[0.48, state.index], [0.52, state.middle], [0.56, state.ring], [0.6, state.pinky]]) {
+    hand.push(...finger(pipX, extended));
+  }
+  return hand;
+}
+
+const GESTURE_LANDMARK_STATES = {
+  wave: { thumb: true, index: true, middle: true, ring: true, pinky: true },
+  fist: {},
+  open_palm: { thumb: true, index: true, middle: true, ring: true, pinky: true },
+  peace: { index: true, middle: true },
+  point: { index: true },
+  three: { index: true, middle: true, ring: true },
+  rock: { index: true, pinky: true },
+  call_me: { thumb: true, pinky: true },
+};
+
+function landmarkSamplesFor(gestureId) {
+  if (gestureId === 'ily') {
+    const openHand = { index: true, middle: true, ring: true, pinky: true };
+    const left = packedHandFixture(openHand);
+    left[0] = [0.4, 0.75, 0];
+    left[3] = [0.5, 0.5, 0];
+    left[5] = [0.5, 0.42, 0];
+    const right = left.map(([x, y, z]) => [1 - x, y, z]);
+    return [{ hands: [left, right] }];
+  }
+  if (gestureId === 'ok') {
+    const hand = packedHandFixture({ index: true, middle: true, ring: true, pinky: true });
+    hand[3] = [0.46, 0.5, 0];
+    hand[5] = [0.48, 0.51, 0];
+    return [{ hands: [hand] }];
+  }
+  return [{ hands: [packedHandFixture(GESTURE_LANDMARK_STATES[gestureId] || {})] }];
+}
+
 function validLivenessPhases(plan) {
   const motion = plan.slice(1);
   return [
@@ -709,6 +755,10 @@ async function main() {
     assert.strictEqual(passkeyReset.res.status, 200);
     assert.strictEqual(passkeyReset.body.ok, true);
 
+    // Earlier probes already consumed the shared IP bucket; the attestation
+    // section mints a liveness token per fixture and must not trip it.
+    resetRateLimitState();
+
     // ---- Attestation assurance gates ----
     // Minimal CBOR encoder for building attestationObject fixtures.
     const cborEncodeLen = (major, n) => {
@@ -1043,7 +1093,7 @@ async function main() {
           challengeId: challenge.challengeId,
           stepIndex: step.index,
           gestureId: step.id,
-          evidence: evidence({ landmarkDigest: `step-${i}` }),
+          evidence: evidence({ landmarkDigest: `step-${i}`, landmarkSamples: landmarkSamplesFor(step.id) }),
         }),
       }, cookie);
       assert.strictEqual(stepResponse.res.status, 200);
@@ -1076,7 +1126,7 @@ async function main() {
           challengeId: geometryStepChallenge.challengeId,
           stepIndex: geometryStepChallenge.step.index,
           gestureId: geometryStepChallenge.step.id,
-          evidence: evidence({ landmarkDigest: `skip-${geometryStepChallenge.step.id}` }),
+          evidence: evidence({ landmarkDigest: `skip-${geometryStepChallenge.step.id}`, landmarkSamples: landmarkSamplesFor(geometryStepChallenge.step.id) }),
         }),
       }, cookie);
       assert.strictEqual(skip.res.status, 200);

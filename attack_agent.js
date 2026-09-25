@@ -235,7 +235,53 @@ function fabricatedLivenessBody(challenge, overrides = {}) {
   };
 }
 
-function fabricatedStepEvidence() {
+// Packed-hand fixtures (server's 12-point layout) synthesized per gesture —
+// valid geometry by construction; probes whether fabricated landmark claims
+// pass the required geometry gate.
+function packedHandFixture(state = {}) {
+  const finger = (pipX, extended) => [[pipX, 0.62, 0], [pipX, extended ? 0.48 : 0.7, 0]];
+  const hand = [
+    [0.5, 0.75, 0],
+    [0.42, 0.72, 0],
+    [0.48, 0.68, 0],
+    state.thumb ? [0.3, 0.65, 0] : [0.45, 0.71, 0],
+  ];
+  for (const [pipX, extended] of [[0.48, state.index], [0.52, state.middle], [0.56, state.ring], [0.6, state.pinky]]) {
+    hand.push(...finger(pipX, extended));
+  }
+  return hand;
+}
+
+const FABRICATED_GESTURE_STATES = {
+  wave: { thumb: true, index: true, middle: true, ring: true, pinky: true },
+  fist: {},
+  open_palm: { thumb: true, index: true, middle: true, ring: true, pinky: true },
+  peace: { index: true, middle: true },
+  point: { index: true },
+  three: { index: true, middle: true, ring: true },
+  rock: { index: true, pinky: true },
+  call_me: { thumb: true, pinky: true },
+};
+
+function fabricatedLandmarkSamples(gestureId) {
+  if (gestureId === 'ily') {
+    const left = packedHandFixture({ index: true, middle: true, ring: true, pinky: true });
+    left[0] = [0.4, 0.75, 0];
+    left[3] = [0.5, 0.5, 0];
+    left[5] = [0.5, 0.42, 0];
+    const right = left.map(([x, y, z]) => [1 - x, y, z]);
+    return [{ hands: [left, right] }];
+  }
+  if (gestureId === 'ok') {
+    const hand = packedHandFixture({ index: true, middle: true, ring: true, pinky: true });
+    hand[3] = [0.46, 0.5, 0];
+    hand[5] = [0.48, 0.51, 0];
+    return [{ hands: [hand] }];
+  }
+  return [{ hands: [packedHandFixture(FABRICATED_GESTURE_STATES[gestureId] || {})] }];
+}
+
+function fabricatedStepEvidence(gestureId) {
   return {
     startedAt: 1000,
     matchedAt: 1450,
@@ -244,8 +290,7 @@ function fabricatedStepEvidence() {
     holdFrames: 8,
     landmarkDigest: crypto.randomBytes(8).toString('hex'),
     motionDigest: crypto.randomBytes(8).toString('hex'),
-    // landmarkSamples intentionally omitted: server-side hand geometry only
-    // runs when present.
+    landmarkSamples: fabricatedLandmarkSamples(gestureId),
     motionStats: { holdJitterRms: 0.003, formingMotion: 0.002 },
   };
 }
@@ -273,7 +318,7 @@ async function mintGestureToken(baseUrl, cookie) {
         challengeId: body.challengeId,
         stepIndex: body.step.index,
         gestureId: body.step.id,
-        evidence: fabricatedStepEvidence(),
+        evidence: fabricatedStepEvidence(body.step.id),
       },
     }, cookie);
     cookie = res.cookie;
@@ -443,7 +488,7 @@ async function probeInstantGestures(baseUrl, cookie) {
         challengeId: challenge.challengeId,
         stepIndex: challenge.step.index,
         gestureId: challenge.step.id,
-        evidence: fabricatedStepEvidence(),
+        evidence: fabricatedStepEvidence(challenge.step.id),
       },
     }, cookie);
     cookie = res.cookie;

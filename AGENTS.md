@@ -88,7 +88,7 @@ Important gesture details:
 - `three` means index, middle, and ring fingers up; thumb and pinky folded.
 - `Hand Hearts` requires both hands. It is not a pinch.
 - MediaPipe is configured with `maxNumHands: 2` because hand hearts need two hands.
-- Hand step evidence may include bounded `landmarkSamples`; the server applies cheap geometry checks for gestures like `three` and `ily` when samples are present.
+- Hand step evidence must include bounded `landmarkSamples` with at least one detected hand; the server applies cheap geometry checks for every gesture (`ok` uses tip contact, `ily` uses a two-hand heart shape, the rest use finger-extension patterns).
 
 ### Zoe ID
 
