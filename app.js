@@ -55,6 +55,8 @@ const verificationTitleEl = $('verification-title');
 const startBtn = $('start-btn');
 const cardEl = $('captcha-card');
 const flashOverlayEl = $('flash-overlay');
+const flowStepsEl = $('flow-steps');
+const flowStepLabelEl = $('flow-step-label');
 const panelShellEl = $('panel-shell');
 const zoeIntroEl = $('zoe-intro');
 const zoeVerifyBtn = $('zoe-verify-btn');
@@ -73,6 +75,7 @@ const verifiedEl = $('verified');
 const mobileIdBtn = $('mobile-id-btn');
 const cameraHelpEl = $('camera-help');
 const cameraHelpTextEl = $('camera-help-text');
+const bootLoaderEl = $('boot-loader');
 const checkEls = Array.from(document.querySelectorAll('.check'));
 
 const LM = {
@@ -327,11 +330,24 @@ function isMobileLayout() {
 const PANEL_TRANSITION_MS = 440;
 let panelTransitionTimer = null;
 
+const FLOW_STEP_INDEX = { choice: 2, id: 2, verify: 3, success: 4 };
+
+function setFlowStep(mode) {
+  const n = FLOW_STEP_INDEX[mode] || 1;
+  if (flowStepLabelEl) flowStepLabelEl.textContent = `Step ${n} of 4`;
+  if (!flowStepsEl) return;
+  flowStepsEl.querySelectorAll('.step').forEach((el, i) => {
+    el.classList.toggle('active', i + 1 === n);
+    el.classList.toggle('done', i + 1 < n);
+  });
+}
+
 function setCardMode(mode) {
   cardEl.classList.toggle('choice-mode', mode === 'choice');
   cardEl.classList.toggle('id-mode', mode === 'id');
   cardEl.classList.toggle('verify-mode', mode === 'verify');
   cardEl.classList.toggle('success-mode', mode === 'success');
+  setFlowStep(mode);
 }
 
 function transitionToPanel(activePanel, mode, focusEl, direction = 'forward') {
@@ -1574,6 +1590,58 @@ function sampleFlashPixels(box) {
 // Full-screen color flashes light the user's face; the camera samples face and
 // background pixels on the flash clock so the server can check the reflected
 // light actually tracked a sequence only it issued.
+const PULSE_ROI_W = 8;
+const PULSE_ROI_H = 4;
+const PULSE_MEASURE_MS = 14000;
+const PULSE_SAMPLE_MS = 95;
+const pulseCanvas = document.createElement('canvas');
+pulseCanvas.width = PULSE_ROI_W;
+pulseCanvas.height = PULSE_ROI_H;
+const pulseCtx = pulseCanvas.getContext('2d', { willReadFrequently: true });
+
+// rPPG: forehead skin pixels shift green very slightly with each heartbeat.
+// ~14s of green-channel means gives the server a spectral window on a signal
+// only living skin produces — no screen flashing needed.
+function samplePulseGreen(box) {
+  if (!box || !box.pixelBox) return null;
+  const vw = Math.max(1, videoEl.videoWidth || 640);
+  const vh = Math.max(1, videoEl.videoHeight || 480);
+  const pb = box.pixelBox;
+  const w = Math.min(pb.w * 0.44, vw);
+  const h = Math.min(pb.h * 0.16, vh);
+  const x = Math.max(0, Math.min(pb.x + pb.w / 2 - w / 2, vw - w));
+  const y = Math.max(0, Math.min(pb.y + pb.h * 0.05, vh - h));
+  if (w < 6 || h < 4) return null;
+  pulseCtx.drawImage(videoEl, x, y, w, h, 0, 0, PULSE_ROI_W, PULSE_ROI_H);
+  const data = pulseCtx.getImageData(0, 0, PULSE_ROI_W, PULSE_ROI_H).data;
+  let g = 0;
+  const n = data.length / 4;
+  for (let i = 1; i < data.length; i += 4) g += data[i];
+  return g / n;
+}
+
+async function runPulseCheck(engine) {
+  const t0 = performance.now();
+  const samples = [];
+  setStatus('Hold still', 'listening');
+  promptNameEl.textContent = 'Hold still';
+  while (faceChecking) {
+    const now = performance.now() - t0;
+    if (now > PULSE_MEASURE_MS) break;
+    const box = await detectStableFaceFrame(engine);
+    const g = box && !box.stale ? samplePulseGreen(box) : null;
+    if (g !== null) samples.push({ g: Math.round(g * 100) / 100, t: Math.round(now) });
+    const remaining = Math.max(1, Math.ceil((PULSE_MEASURE_MS - now) / 1000));
+    promptHintEl.textContent = `Keep your face lit and steady — ${remaining}s left`;
+    await sleep(PULSE_SAMPLE_MS);
+  }
+  return samples;
+}
+
+function prefersReducedMotion() {
+  return typeof matchMedia === 'function' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
 async function runFlashPixelCheck(engine, flashPlan) {
   const t0 = performance.now();
   const last = flashPlan[flashPlan.length - 1];
@@ -1603,7 +1671,7 @@ async function runGuidedFaceCheck() {
   const legacyEngine = !requirePoseLiveness;
   const motionValue = (box) => (requirePoseLiveness && box.pose ? box.pose.yaw : box.cx);
 
-  const livenessChallenge = await apiJson('/api/liveness/challenge');
+  const livenessChallenge = await apiJson('/api/liveness/challenge', { reducedMotion: prefersReducedMotion() });
   const motionPlan = Array.isArray(livenessChallenge.plan) && livenessChallenge.plan.length >= 3
     ? livenessChallenge.plan
     : ['center_hold', 'center_to_left', 'left_to_right'];
@@ -1697,6 +1765,10 @@ async function runGuidedFaceCheck() {
 
     if (!faceChecking) return;
 
+    promptEmojiEl.textContent = '💓';
+    const pulseSeries = await runPulseCheck(engine);
+    if (!faceChecking) return;
+
     let pixelSeries = null;
     if (flashPlan && flashPlan.length) {
       promptEmojiEl.textContent = '💡';
@@ -1746,6 +1818,7 @@ async function runGuidedFaceCheck() {
       motionSeries,
       seriesDigest,
       pixelSeries,
+      pulseSeries,
       legacyEngine,
     });
     verificationToken = result.verificationToken;
@@ -1800,6 +1873,33 @@ function fitCardToViewport() {
 }
 window.addEventListener('resize', fitCardToViewport);
 window.addEventListener('orientationchange', fitCardToViewport);
+
+// Boot splash: cover first paint with the Zoe mark while the page and the
+// face model warm up; reveal the card once ready (or after a hard cap).
+(function bootSplash() {
+  if (!bootLoaderEl) return;
+  const MIN_MS = 750;
+  const HARD_CAP_MS = 5000;
+  const start = performance.now();
+  const warmModel = fetch('models/blaze_face_short_range.tflite', { cache: 'force-cache' })
+    .then((r) => r.ok ? r.arrayBuffer() : null)
+    .catch(() => null);
+  const pageLoad = new Promise((resolve) => {
+    if (document.readyState === 'complete') resolve();
+    else window.addEventListener('load', resolve, { once: true });
+  });
+  const minTime = new Promise((resolve) => setTimeout(resolve, MIN_MS));
+  const cap = new Promise((resolve) => setTimeout(resolve, HARD_CAP_MS));
+  let revealed = false;
+  const reveal = () => {
+    if (revealed || !bootLoaderEl.isConnected) return;
+    revealed = true;
+    bootLoaderEl.classList.add('done');
+    bootLoaderEl.addEventListener('transitionend', () => bootLoaderEl.remove(), { once: true });
+    setTimeout(() => bootLoaderEl.isConnected && bootLoaderEl.remove(), 1000);
+  };
+  Promise.race([Promise.all([pageLoad, warmModel, minTime]), cap]).then(reveal);
+})();
 // Recompute when the card's own size changes (panel switches, camera turning on).
 if (typeof ResizeObserver !== 'undefined') {
   new ResizeObserver(fitCardToViewport).observe(cardEl);

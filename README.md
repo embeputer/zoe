@@ -71,7 +71,21 @@ npm test
 npm run attack
 ```
 
-`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera, no MediaPipe — including synthesized pixel streams that match the issued flash sequence. It reports which checks a scripted client fools and documents the honest ceiling of client-side evidence: even pixel-verified flash liveness stays forgeable by a script that synthesizes matching pixels. Closing that hole needs server-side media verification (e.g. a PAD model on uploaded frames) or hardware attestation.
+`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera, no MediaPipe — including synthesized pixel streams that match the issued flash sequence and pulse series with a physiologic-band spectral peak. It reports which checks a scripted client fools and documents the honest ceiling of client-side evidence: even pulse-checked, pixel-verified flash liveness stays forgeable by a script that synthesizes matching signals. Closing that hole needs server-side media verification (e.g. a PAD model on uploaded frames) or hardware attestation.
+
+```sh
+npm run attack:agent
+```
+
+`attack_agent.js` probes the API-level surface an autonomous agent sees — no media fabrication needed, just protocol abuse. Measured results:
+
+- **BLOCKED — instant verification.** The server now compares `now() - challenge.createdAt` to a wall-clock floor (`ZOE_LIVENESS_MIN_ELAPSED_MS`, default 14s — the pulse stage's real duration; `ZOE_STEP_MIN_ELAPSED_MS`, default 180ms per gesture step). A "20-second" verification submitted in ~40ms is rejected, which also caps attempt rate at ~1 per real flow duration.
+- **FOOLED — Zoe ID is still scriptable, just slower.** `attestation: 'none'` + register accepting any SPKI key means a generated P-256 keypair registers behind a forged liveness token and mints `'strong'` assurance with self-asserted UP|UV flags — the floor only makes each attempt cost ≥14s. Closing it needs real attestation (packed/fido-u2f + AAGUID allowlist), not more statistics.
+- **BLOCKED — type coercion.** Payload field types are asserted (`typeof === 'number'`), not coerced — `"2400"` as a string is now a 400.
+- **INFO — session farming closed.** Anonymous requests mint memory-only sessions; a row is persisted only when the session gains real state (challenge, credential, token).
+- **BLOCKED — token double-redeem** across `/api/protected-action` + `/api/verify` (one wins, one 409s).
+- **BLOCKED — challenge binding.** Liveness challenges live in a per-session slot with unguessable ids; cross-session use and id guessing both 400.
+- **BLOCKED — rate limit.** First 429 lands at the 120/min IP cap; cookie rotation gains nothing, but distributed IPs bypass it and the per-session limiter ships disabled (`ZOE_RATE_LIMIT_MAX_PER_SESSION=0`).
 
 The regression test starts a temporary local HTTP server and checks that:
 
@@ -87,8 +101,8 @@ The regression test starts a temporary local HTTP server and checks that:
 1. The browser asks the server for a challenge.
 2. The user chooses a primary verification method, such as hand gestures or face motion.
 3. The browser performs the local check and submits bounded evidence for that step.
-4. Face verification ends with a flash challenge: the server issues a random color sequence, the screen flashes it, and the client uploads timestamped face-region pixel bursts the server checks for correlation, coverage, and sensor noise.
-5. The server validates order, timing, replay state, pixel evidence, and session binding.
+4. Face verification ends with two server-side liveness checks: an rPPG pulse stage (the client samples green-channel means over a forehead ROI for ~14s; the server runs spectral analysis for a physiologic-band heartbeat, 48–144 BPM, rejecting flat and clean-sine signals) followed by a flash challenge (the server issues a random color sequence, the screen flashes it, and the client uploads timestamped face-region pixel bursts the server checks for correlation, coverage, and sensor noise). The flash plan is slowed to ~1 flash/second for photosensitivity, and `prefers-reduced-motion` clients skip it entirely — the pulse check alone then carries the liveness gate.
+5. The server validates order, timing, replay state, pulse + pixel evidence, and session binding.
 6. After all steps pass, the server issues a short-lived signed token.
 7. The protected action accepts only that server-issued token, once.
 
