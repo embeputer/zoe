@@ -1835,7 +1835,6 @@ const VENDOR_FILES = new Set([
   '/vendor/mediapipe/hands/hands_solution_packed_assets.data',
   '/vendor/mediapipe/hands/hands_solution_simd_wasm_bin.js',
   '/vendor/mediapipe/hands/hands_solution_simd_wasm_bin.wasm',
-  '/vendor/mediapipe/hands/hands_solution_simd_wasm_bin.data',
   '/vendor/mediapipe/hands/hands_solution_wasm_bin.js',
   '/vendor/mediapipe/hands/hands_solution_wasm_bin.wasm',
   '/vendor/mediapipe/hands/hand_landmark_full.tflite',
