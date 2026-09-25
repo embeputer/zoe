@@ -1675,18 +1675,27 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 400, { error: phaseError });
     }
 
-    if (pending.flashPlan) {
+    const pulseResult = validatePulseSeries(body.pulseSeries, pending.reducedMotion);
+    if (pulseResult.error) {
+      logVerificationFailure('liveness_pulse_rejected', pathname);
+      if (!pending.flashPlan) {
+        return sendJson(res, 400, { error: pulseResult.error });
+      }
+      if (body.flashFallback !== true) {
+        pending.flashOfferedAt = now();
+        return sendJson(res, 422, {
+          error: 'We could not confirm your presence from the pulse scan.',
+          flashAvailable: true,
+        });
+      }
+      if (!pending.flashOfferedAt) {
+        return sendJson(res, 400, { error: 'Flash fallback was not offered for this attempt.' });
+      }
       const pixelError = validatePixelSeries(body.pixelSeries, pending.flashPlan);
       if (pixelError) {
         logVerificationFailure('liveness_pixels_rejected', pathname);
         return sendJson(res, 400, { error: pixelError });
       }
-    }
-
-    const pulseResult = validatePulseSeries(body.pulseSeries, pending.reducedMotion);
-    if (pulseResult.error) {
-      logVerificationFailure('liveness_pulse_rejected', pathname);
-      return sendJson(res, 400, { error: pulseResult.error });
     }
 
     if (pending.seriesDigests.has(seriesDigest)) {
@@ -1701,7 +1710,8 @@ async function handleApi(req, res, pathname) {
       verified: true,
       verificationToken: token,
       tokenExpiresAt: now() + TOKEN_TTL_MS,
-      pulseBpm: pulseResult.bpm,
+      pulseBpm: pulseResult.bpm || null,
+      usedFlashFallback: Boolean(pulseResult.error),
     });
   }
 

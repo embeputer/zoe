@@ -55,6 +55,9 @@ const verificationTitleEl = $('verification-title');
 const startBtn = $('start-btn');
 const cardEl = $('captcha-card');
 const flashOverlayEl = $('flash-overlay');
+const flashConsentEl = $('flash-consent');
+const flashConsentAcceptBtn = $('flash-consent-accept');
+const flashConsentDeclineBtn = $('flash-consent-decline');
 const flowStepsEl = $('flow-steps');
 const flowStepLabelEl = $('flow-step-label');
 const panelShellEl = $('panel-shell');
@@ -264,8 +267,30 @@ async function apiJson(path, body) {
     body: JSON.stringify(body || {}),
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`);
+  if (!response.ok) {
+    const error = new Error(data.error || `Request failed (${response.status}).`);
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
   return data;
+}
+
+function askForFlashFallback() {
+  return new Promise((resolve) => {
+    const finish = (accepted) => {
+      flashConsentEl.hidden = true;
+      flashConsentAcceptBtn.removeEventListener('click', accept);
+      flashConsentDeclineBtn.removeEventListener('click', decline);
+      resolve(accepted);
+    };
+    const accept = () => finish(true);
+    const decline = () => finish(false);
+    flashConsentAcceptBtn.addEventListener('click', accept);
+    flashConsentDeclineBtn.addEventListener('click', decline);
+    flashConsentEl.hidden = false;
+    flashConsentDeclineBtn.focus();
+  });
 }
 
 function base64urlToBuffer(value) {
@@ -1800,14 +1825,6 @@ async function runGuidedFaceCheck() {
     await runPulseCheck(engine, Math.max(pulseTopUpMinMs, pulseTargetMs - pulseElapsedMs), pulseSeries, startedAt);
     if (!faceChecking) return;
 
-    let pixelSeries = null;
-    if (flashPlan && flashPlan.length) {
-      promptEmojiEl.textContent = '💡';
-      progressEl.style.width = '100%';
-      pixelSeries = await runFlashPixelCheck(engine, flashPlan);
-      if (!faceChecking) return;
-    }
-
     if (centers.length < 8 || (requirePoseLiveness && yaws.length < 8)) {
       throw new Error('No face was detected. Make sure your face is lit and centered, then try again.');
     }
@@ -1840,7 +1857,7 @@ async function runGuidedFaceCheck() {
       return entry;
     });
     const seriesDigest = await livenessSeriesDigest(livenessChallenge.challengeId, motionSeries);
-    const result = await apiJson('/api/liveness/verify', {
+    const verificationBody = {
       challengeId: livenessChallenge.challengeId,
       durationMs,
       faceFrames: centers.length,
@@ -1848,10 +1865,33 @@ async function runGuidedFaceCheck() {
       phases,
       motionSeries,
       seriesDigest,
-      pixelSeries,
       pulseSeries,
       legacyEngine,
-    });
+    };
+    let result;
+    try {
+      result = await apiJson('/api/liveness/verify', verificationBody);
+    } catch (error) {
+      if (!error.data?.flashAvailable || !flashPlan?.length) throw error;
+      const accepted = await askForFlashFallback();
+      if (!accepted) {
+        stopCamera();
+        showChoicePanel('back');
+        return;
+      }
+      promptEmojiEl.textContent = '💡';
+      progressEl.style.width = '100%';
+      const pixelSeries = await runFlashPixelCheck(engine, flashPlan);
+      if (!faceChecking) return;
+      setStatus('Checking…', 'listening');
+      promptNameEl.textContent = 'Checking…';
+      promptHintEl.textContent = 'Confirming the backup liveness check.';
+      result = await apiJson('/api/liveness/verify', {
+        ...verificationBody,
+        flashFallback: true,
+        pixelSeries,
+      });
+    }
     verificationToken = result.verificationToken;
     await confirmProtectedAction();
   } finally {

@@ -102,8 +102,9 @@ The regression test starts a temporary local HTTP server and checks that:
 1. The browser asks the server for a challenge.
 2. The user chooses a primary verification method, such as hand gestures or face motion.
 3. The browser performs the local check and submits bounded evidence for that step.
-4. Face verification ends with two server-side liveness checks: an rPPG pulse stage (the client samples green-channel means over a forehead ROI for ~14s; the server runs spectral analysis for a physiologic-band heartbeat, 48–144 BPM, rejecting flat and clean-sine signals) followed by a flash challenge (the server issues a random color sequence, the screen flashes it, and the client uploads timestamped face-region pixel bursts the server checks for correlation, coverage, and sensor noise). The flash plan is slowed to ~1 flash/second for photosensitivity, and `prefers-reduced-motion` clients skip it entirely — the pulse check alone then carries the liveness gate.
-5. The server validates order, timing, replay state, pulse + pixel evidence, and session binding.
+4. Face verification uses rPPG as its default media gate: the client samples green-channel means over a forehead ROI in the background during centering and head turns, then adds a short hold-still top-up. The server analyzes the stillness tail for a physiologic-band heartbeat (48–144 BPM, rejecting flat and clean-sine signals).
+5. If the pulse signal is inconclusive, Zoe keeps the challenge open and explicitly offers a flash-reflection fallback. Flash never auto-starts: the user must accept a photosensitivity warning that also calls out poor-lighting and skin-tone accuracy limits. The server then checks timestamped face pixels against its random color plan for correlation, coverage, and sensor noise. `prefers-reduced-motion` clients are never offered this fallback.
+6. The server validates order, timing, replay state, pulse or explicitly accepted flash evidence, and session binding.
 6. After all steps pass, the server issues a short-lived signed token.
 7. The protected action accepts only that server-issued token, once.
 

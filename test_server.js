@@ -213,8 +213,33 @@ async function main() {
     }, cookie);
     assert.strictEqual(smoothStub.res.status, 400);
 
-    // Pixels that ignore the issued flash sequence must be rejected.
+    // Flash is a fallback only: valid pulse evidence succeeds without pixels.
+    const pulseOnlyChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const pulseOnly = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(pulseOnlyChallenge.body.challengeId, pulseOnlyChallenge.body.plan, pulseOnlyChallenge.body.flashPlan, {
+        pixelSeries: undefined,
+      })),
+    }, cookie);
+    assert.strictEqual(pulseOnly.res.status, 200);
+    assert.strictEqual(pulseOnly.body.usedFlashFallback, false);
+
+    // If pulse is inconclusive, the challenge stays open and advertises the
+    // explicit flash fallback rather than starting it automatically.
     const darkChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const flatPulse = samplePulseSeries().map((s) => ({ ...s, g: 118 }));
+    const flashOffer = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(darkChallenge.body.challengeId, darkChallenge.body.plan, darkChallenge.body.flashPlan, {
+        pixelSeries: undefined,
+        pulseSeries: flatPulse,
+      })),
+    }, cookie);
+    assert.strictEqual(flashOffer.res.status, 422);
+    assert.strictEqual(flashOffer.body.flashAvailable, true);
+
+    // Pixels that ignore the issued flash sequence must be rejected after the
+    // user opts into the fallback.
     const darkPixels = samplePixelSeries(darkChallenge.body.flashPlan).map((s) => ({
       ...s,
       f: Buffer.alloc(324).fill(40).toString('base64'),
@@ -223,21 +248,51 @@ async function main() {
       method: 'POST',
       body: JSON.stringify(livenessBody(darkChallenge.body.challengeId, darkChallenge.body.plan, darkChallenge.body.flashPlan, {
         pixelSeries: darkPixels,
+        pulseSeries: flatPulse,
+        flashFallback: true,
       })),
     }, cookie);
     assert.strictEqual(noFlash.res.status, 400);
 
+    // A valid flash fallback can verify the still-open challenge.
+    const flashSuccessChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const flashWithoutOffer = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(flashSuccessChallenge.body.challengeId, flashSuccessChallenge.body.plan, flashSuccessChallenge.body.flashPlan, {
+        pulseSeries: flatPulse,
+        flashFallback: true,
+      })),
+    }, cookie);
+    assert.strictEqual(flashWithoutOffer.res.status, 400);
+    const flashSuccessOffer = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(flashSuccessChallenge.body.challengeId, flashSuccessChallenge.body.plan, flashSuccessChallenge.body.flashPlan, {
+        pixelSeries: undefined,
+        pulseSeries: flatPulse,
+      })),
+    }, cookie);
+    assert.strictEqual(flashSuccessOffer.res.status, 422);
+    const flashSuccess = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(flashSuccessChallenge.body.challengeId, flashSuccessChallenge.body.plan, flashSuccessChallenge.body.flashPlan, {
+        pulseSeries: flatPulse,
+        flashFallback: true,
+      })),
+    }, cookie);
+    assert.strictEqual(flashSuccess.res.status, 200);
+    assert.strictEqual(flashSuccess.body.usedFlashFallback, true);
+    assert.strictEqual(flashSuccess.body.pulseBpm, null);
+
     // Pulse gates: flat signal, clean injected sine, and out-of-band
-    // frequencies must all be rejected.
+    // frequencies must all offer the flash fallback when one is available.
     const flatPulseChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
-    const flatPulse = samplePulseSeries().map((s) => ({ ...s, g: 118 }));
     const flatPulseRes = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
       body: JSON.stringify(livenessBody(flatPulseChallenge.body.challengeId, flatPulseChallenge.body.plan, flatPulseChallenge.body.flashPlan, {
         pulseSeries: flatPulse,
       })),
     }, cookie);
-    assert.strictEqual(flatPulseRes.res.status, 400);
+    assert.strictEqual(flatPulseRes.res.status, 422);
 
     const sinePulseChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
     const sinePulse = [];
@@ -250,7 +305,7 @@ async function main() {
         pulseSeries: sinePulse,
       })),
     }, cookie);
-    assert.strictEqual(sinePulseRes.res.status, 400);
+    assert.strictEqual(sinePulseRes.res.status, 422);
 
     const offBandChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
     const offBandPulse = [];
@@ -263,7 +318,7 @@ async function main() {
         pulseSeries: offBandPulse,
       })),
     }, cookie);
-    assert.strictEqual(offBandRes.res.status, 400);
+    assert.strictEqual(offBandRes.res.status, 422);
 
     // Reduced motion: no flash plan is issued, pixels are not required, and
     // the pulse check alone carries the liveness gate — so it demands a

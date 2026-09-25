@@ -15,6 +15,23 @@
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 4v16"/><path d="M4.9 8.1l14.2 7.8"/><path d="M19.1 8.1 4.9 15.9"/></svg>
   </div>
   <div id="flash-overlay" hidden aria-hidden="true"></div>
+  <div id="flash-consent" class="fallback-backdrop" hidden>
+    <section class="fallback-dialog" role="dialog" aria-modal="true" aria-labelledby="flash-consent-title" aria-describedby="flash-consent-copy">
+      <span class="fallback-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 2.8 19h18.4L12 3Z"/><path d="M12 9v4.5"/><path d="M12 17h.01"/></svg>
+      </span>
+      <h2 id="flash-consent-title">Try flashing lights?</h2>
+      <p id="flash-consent-copy">We couldn't confirm that you're here from the pulse scan. Flashing the screen may help, but it can be less accurate in poor lighting or for some skin tones.</p>
+      <div class="fallback-warning">
+        <strong>Photosensitivity warning</strong>
+        <span>Do not continue if you have photosensitive epilepsy or are sensitive to flashing lights.</span>
+      </div>
+      <div class="fallback-actions">
+        <button id="flash-consent-accept" class="primary" type="button">Try flashing lights</button>
+        <button id="flash-consent-decline" class="secondary" type="button">Use another method</button>
+      </div>
+    </section>
+  </div>
   <main id="captcha-card" class="captcha-card" aria-label="Zoe verification">
     <div class="card-topbar">
       <div class="brand-lockup" aria-hidden="true">
