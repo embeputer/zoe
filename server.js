@@ -1336,7 +1336,7 @@ async function handleApi(req, res, pathname) {
     if (pending.consumedAt) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
     if (now() > pending.expiresAt) return sendJson(res, 410, { error: 'Face liveness challenge expired.' });
 
-    const minElapsedMs = pending.reducedMotion === true ? reducedMotionMinElapsedMs() : livenessMinElapsedMs();
+    const minElapsedMs = pending.reducedMotion === true ? Math.max(livenessMinElapsedMs(), reducedMotionMinElapsedMs()) : livenessMinElapsedMs();
     if (now() - pending.createdAt < minElapsedMs) {
       logVerificationFailure('liveness_too_fast', pathname);
       return sendJson(res, 400, { error: 'Face check completed too quickly to be real.' });
