@@ -173,9 +173,12 @@ body {
 
 .zoe-hero {
   overflow: hidden;
-  background: var(--hero);
+  background:
+    radial-gradient(circle at 50% 13%, rgba(122, 105, 255, 0.22), transparent 34%),
+    linear-gradient(155deg, #f8f7ff 0%, #f2f1ff 54%, #f9f9ff 100%);
+  border: 1px solid rgba(70, 55, 232, 0.1);
   border-radius: 20px;
-  padding: 30px 28px 0;
+  padding: 26px 28px 24px;
 }
 
 .panel-shell {
@@ -230,23 +233,125 @@ body {
   transform: translateX(var(--panel-exit-x));
 }
 
-/* Persona-style dashed scan ring holding the faceless figure render. */
-.zoe-icon {
-  width: 108px;
-  height: 108px;
-  border-radius: 50%;
-  color: var(--blue);
-  border: 2px dashed rgba(70, 55, 232, 0.5);
-  background: rgba(255, 255, 255, 0.55);
-  margin-bottom: 20px;
-  overflow: hidden;
+.presence-visual {
+  position: relative;
+  width: 148px;
+  height: 126px;
+  margin: 0 auto 18px;
 }
 
-.zoe-icon img {
-  display: block;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
+.presence-ring,
+.presence-orbit,
+.presence-core {
+  position: absolute;
+  left: 50%;
+  top: 47%;
+  border-radius: 50%;
+}
+
+.presence-ring {
+  border: 1px solid rgba(70, 55, 232, 0.16);
+  transform: translate(-50%, -50%);
+  animation: presence-breathe 2.8s ease-in-out infinite;
+}
+
+.presence-ring.ring-one {
+  width: 102px;
+  height: 102px;
+}
+
+.presence-ring.ring-two {
+  width: 132px;
+  height: 132px;
+  animation-delay: -1.4s;
+}
+
+.presence-orbit {
+  width: 116px;
+  height: 116px;
+  border: 1px dashed rgba(70, 55, 232, 0.28);
+  transform: translate(-50%, -50%);
+  animation: presence-orbit 14s linear infinite;
+}
+
+.presence-orbit i {
+  position: absolute;
+  left: 13px;
+  top: 9px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--blue-soft);
+  box-shadow: 0 0 0 5px rgba(109, 99, 242, 0.12);
+}
+
+.presence-core {
+  width: 72px;
+  height: 72px;
+  display: grid;
+  place-items: center;
+  color: #fff;
+  background: linear-gradient(145deg, #6152f4, #3424bd);
+  box-shadow: 0 14px 34px rgba(70, 55, 232, 0.3), inset 0 1px rgba(255, 255, 255, 0.3);
+  transform: translate(-50%, -50%);
+}
+
+.presence-core svg {
+  width: 34px;
+  height: 34px;
+}
+
+.presence-wave {
+  position: absolute;
+  left: -6px;
+  bottom: 0;
+  width: 160px;
+  height: 28px;
+  overflow: visible;
+}
+
+.presence-wave path {
+  stroke: var(--blue);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: presence-draw 1.25s 0.25s var(--screen-ease) forwards;
+}
+
+@keyframes presence-breathe {
+  0%, 100% { opacity: 0.45; scale: 0.94; }
+  50% { opacity: 1; scale: 1.03; }
+}
+
+@keyframes presence-orbit {
+  to { transform: translate(-50%, -50%) rotate(360deg); }
+}
+
+@keyframes presence-draw {
+  to { stroke-dashoffset: 0; }
+}
+
+.intro-kicker {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  margin: 0 0 10px;
+  color: var(--blue-deep);
+  font-size: 11.5px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.intro-kicker span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--success);
+  box-shadow: 0 0 0 4px rgba(21, 138, 84, 0.1);
 }
 
 h1 {
@@ -258,87 +363,106 @@ h1 {
   letter-spacing: -0.015em;
 }
 
-.dot { color: var(--blue); }
+.intro-card h1 {
+  text-align: center;
+  font-size: 27px;
+  line-height: 1.14;
+  letter-spacing: -0.035em;
+}
+
+.intro-card h1 span {
+  color: var(--blue);
+}
 
 .tagline {
-  margin: 12px 0 20px;
+  max-width: 330px;
+  margin: 13px auto 21px;
   color: var(--muted);
   font-size: 14.5px;
   line-height: 1.5;
-  letter-spacing: 0;
+  text-align: center;
 }
 
-.claim-row {
-  display: flex;
+.proof-summary {
+  display: grid;
+  grid-template-columns: 38px 1fr;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
+  padding: 14px 15px;
+  border: 1px solid rgba(70, 55, 232, 0.12);
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.62);
+  box-shadow: inset 0 1px rgba(255, 255, 255, 0.8);
   color: var(--ink);
-  font-size: 14.5px;
-  font-weight: 650;
-  margin-bottom: 24px;
 }
 
-.claim-icon {
-  width: 26px;
-  height: 26px;
-  border-radius: 8px;
-  background: rgba(255, 255, 255, 0.7);
+.proof-icon {
+  width: 38px;
+  height: 38px;
+  border-radius: 12px;
+  background: var(--blue-tint);
   color: var(--blue);
   display: grid;
   place-items: center;
 }
 
-.claim-icon svg {
-  width: 15px;
-  height: 15px;
+.proof-icon svg {
+  width: 21px;
+  height: 21px;
 }
 
-.privacy-panel {
-  margin: 0 -28px;
-  background: #171242;
-  color: #cfcdf3;
-  padding: 22px 28px;
+.proof-summary > span:last-child {
   display: grid;
-  gap: 14px;
+  gap: 3px;
 }
 
-.privacy-panel div {
+.proof-summary strong {
+  font-size: 14px;
+  font-weight: 750;
+}
+
+.proof-summary small {
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 1.35;
+}
+
+.privacy-list {
   display: grid;
-  grid-template-columns: 30px 1fr;
-  gap: 13px;
-  align-items: start;
+  gap: 9px;
+  margin: 16px 2px 20px;
+  padding: 0;
+  list-style: none;
+  color: var(--muted);
+  font-size: 12.5px;
 }
 
-.privacy-panel p {
-  margin: 0;
-  font-size: 14.5px;
-  line-height: 1.4;
+.privacy-list li {
+  display: flex;
+  align-items: center;
+  gap: 9px;
 }
 
-.privacy-icon {
-  display: grid;
-  place-items: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.09);
-  color: #a9a3f2;
-  font-size: 16px;
-  line-height: 1;
+.privacy-list li > span {
+  width: 16px;
+  height: 16px;
+  border: 1.5px solid rgba(70, 55, 232, 0.38);
+  border-radius: 50%;
+  background: radial-gradient(circle, var(--blue) 0 2px, transparent 2.5px);
+  flex: 0 0 auto;
 }
 
-.privacy-icon svg {
-  width: 17px;
-  height: 17px;
-}
-
-/* Persona pattern: CTA lives on the white card below the navy panel. */
 .intro-actions {
-  margin: 0 -28px;
-  padding: 18px 28px 24px;
-  background: var(--phone);
+  margin: 0;
+  padding: 0;
+  background: transparent;
   display: grid;
   gap: 12px;
+}
+
+.intro-verify {
+  background: linear-gradient(135deg, #17181f, #30237d);
+  box-shadow: 0 10px 22px rgba(38, 29, 110, 0.2);
 }
 
 .legal-line {
@@ -944,29 +1068,24 @@ footer .lock-icon {
 
   .zoe-hero {
     border-radius: 18px;
-    padding: 24px 22px 0;
+    padding: 22px 20px 20px;
   }
 
-  h1 {
-    font-size: 21px;
+  .presence-visual {
+    margin-bottom: 14px;
   }
 
-  .tagline {
+  .intro-card h1 {
+    font-size: 24px;
+  }
+
+  .tagline,
+  .proof-summary strong {
     font-size: 14px;
   }
 
-  .privacy-panel {
-    margin: 0 -22px;
-    padding: 20px 22px;
-  }
-
-  .privacy-panel p {
-    font-size: 14px;
-  }
-
-  .intro-actions {
-    margin: 0 -22px;
-    padding: 16px 22px 20px;
+  .proof-summary {
+    padding: 13px;
   }
 
   .verification-head {
@@ -1009,6 +1128,16 @@ footer .lock-icon {
 
   .verified-icon path {
     animation: none;
+    stroke-dashoffset: 0;
+  }
+
+  .presence-ring,
+  .presence-orbit,
+  .presence-wave path {
+    animation: none;
+  }
+
+  .presence-wave path {
     stroke-dashoffset: 0;
   }
 }
