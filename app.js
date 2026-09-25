@@ -547,7 +547,7 @@ function selectPrimaryMethod(method) {
 
   verificationTitleEl.textContent = isFace ? 'Face verification' : 'Hand verification';
   promptEmojiEl.textContent = isFace ? '🙂' : '-';
-  promptNameEl.textContent = isFace ? 'Turn gently left and right' : 'Click "Start" to begin';
+  promptNameEl.textContent = isFace ? 'Follow the on-screen arrows' : 'Click "Start" to begin';
   promptHintEl.textContent = isFace
     ? 'Keep your face in frame. Zoe checks motion, not identity.'
     : '';
@@ -1448,9 +1448,9 @@ function drawGuideArrow(direction, color) {
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   ctx.beginPath();
-  ctx.moveTo(x + dir * size * 0.5, cy - size);
-  ctx.lineTo(x - dir * size * 0.5, cy);
-  ctx.lineTo(x + dir * size * 0.5, cy + size);
+  ctx.moveTo(x - dir * size * 0.5, cy - size);
+  ctx.lineTo(x + dir * size * 0.5, cy);
+  ctx.lineTo(x - dir * size * 0.5, cy + size);
   ctx.stroke();
   ctx.restore();
 }
@@ -1526,33 +1526,33 @@ function pushFaceSeriesSample(phaseSeries, phase, flowStartedAt, motionValue, ke
 function faceMotionPhaseConfig(phaseId, requirePoseLiveness) {
   const configs = {
     center_to_left: {
-      label: 'Turn left',
-      hint: 'Slowly turn your head to the left.',
-      arrow: 'left',
+      label: 'Turn this way',
+      hint: 'Slowly turn toward the arrow.',
+      arrow: requirePoseLiveness ? 'right' : 'left',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'left'
         : displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
     },
     center_to_right: {
-      label: 'Turn right',
-      hint: 'Slowly turn your head to the right.',
-      arrow: 'right',
+      label: 'Turn this way',
+      hint: 'Slowly turn toward the arrow.',
+      arrow: requirePoseLiveness ? 'left' : 'right',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'right'
         : displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
     },
     left_to_right: {
-      label: 'Turn right',
-      hint: 'Now slowly turn your head to the right.',
-      arrow: 'right',
+      label: 'Now the other way',
+      hint: 'Slowly turn toward the arrow.',
+      arrow: requirePoseLiveness ? 'left' : 'right',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'right'
         : displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
     },
     right_to_left: {
-      label: 'Turn left',
-      hint: 'Now slowly turn your head to the left.',
-      arrow: 'left',
+      label: 'Now the other way',
+      hint: 'Slowly turn toward the arrow.',
+      arrow: requirePoseLiveness ? 'right' : 'left',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'left'
         : displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
@@ -1565,6 +1565,7 @@ function faceMotionPhaseConfig(phaseId, requirePoseLiveness) {
 // shows the requested head pose. Records sampled box/yaw evidence.
 async function runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeries, opts) {
   setStatus(opts.label, 'listening');
+  promptEmojiEl.textContent = opts.arrow === 'left' ? '←' : '→';
   promptNameEl.textContent = opts.label;
   promptHintEl.textContent = opts.hint;
   let hits = 0;
