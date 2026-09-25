@@ -22,6 +22,9 @@ const FACE_MODEL_URL = '/models/blaze_face_short_range.tflite';
 const FACE_BOX_SHIFT_X = -0.75;
 const FACE_BOX_SHIFT_Y = -0.55;
 const FACE_BOX_HEIGHT_SCALE = 1.02;
+const FLASH_CHROMA_COSINE_MIN = 0.6;
+const FLASH_CHROMA_RATIO_MIN = 0.025;
+const FLASH_CHROMA_RATIO_MAX = 2;
 const SAMPLE_INTERVAL_MS = 100;
 const PULSE_WINDOW_MS = 12000;
 const FLASH_COLORS = [
@@ -113,7 +116,7 @@ function drawFace(face) {
   }
 }
 
-function faceRegionMean(face) {
+function cameraRegionMeans(face) {
   const width = video.videoWidth;
   const height = video.videoHeight;
   if (!width || !height || !face) return null;
@@ -122,20 +125,30 @@ function faceRegionMean(face) {
     sampleCanvas.height = height;
   }
   sampleContext.drawImage(video, 0, 0, width, height);
-  const x = Math.max(0, Math.round(face.x + face.width * 0.3));
-  const y = Math.max(0, Math.round(face.y + face.height * 0.12));
-  const roiWidth = Math.max(8, Math.min(width - x, Math.round(face.width * 0.4)));
-  const roiHeight = Math.max(8, Math.min(height - y, Math.round(face.height * 0.18)));
-  const pixels = sampleContext.getImageData(x, y, roiWidth, roiHeight).data;
-  const totals = [0, 0, 0];
-  let count = 0;
-  for (let index = 0; index < pixels.length; index += 16) {
-    totals[0] += pixels[index];
-    totals[1] += pixels[index + 1];
-    totals[2] += pixels[index + 2];
-    count += 1;
-  }
-  return totals.map((total) => total / Math.max(1, count));
+  const regionMean = (x, y, regionWidth, regionHeight) => {
+    const pixels = sampleContext.getImageData(x, y, regionWidth, regionHeight).data;
+    const totals = [0, 0, 0];
+    let count = 0;
+    for (let index = 0; index < pixels.length; index += 16) {
+      totals[0] += pixels[index];
+      totals[1] += pixels[index + 1];
+      totals[2] += pixels[index + 2];
+      count += 1;
+    }
+    return totals.map((total) => total / Math.max(1, count));
+  };
+  const pulseX = Math.max(0, Math.round(face.x + face.width * 0.3));
+  const pulseY = Math.max(0, Math.round(face.y + face.height * 0.12));
+  const pulseWidth = Math.max(8, Math.min(width - pulseX, Math.round(face.width * 0.4)));
+  const pulseHeight = Math.max(8, Math.min(height - pulseY, Math.round(face.height * 0.18)));
+  const flashWidth = Math.max(8, Math.min(width, Math.round(face.width * 1.2)));
+  const flashHeight = Math.max(8, Math.min(height, Math.round(face.height * 1.2)));
+  const flashX = Math.max(0, Math.min(Math.round(face.x + (face.width - flashWidth) / 2), width - flashWidth));
+  const flashY = Math.max(0, Math.min(Math.round(face.y + (face.height - flashHeight) / 2), height - flashHeight));
+  return {
+    pulse: regionMean(pulseX, pulseY, pulseWidth, pulseHeight),
+    flash: regionMean(flashX, flashY, flashWidth, flashHeight),
+  };
 }
 
 function renderPulse(now) {
@@ -164,10 +177,10 @@ function frame(now) {
   drawFace(face);
   faceStatus.textContent = face ? `${Math.round(face.score * 100)}% confidence` : 'No face found';
   if (face && now - lastSampleAt >= SAMPLE_INTERVAL_MS) {
-    const rgb = faceRegionMean(face);
-    if (rgb) {
-      pulseSamples.push({ t: now, g: rgb[1] });
-      if (currentFlashSamples) currentFlashSamples.push(rgb);
+    const regions = cameraRegionMeans(face);
+    if (regions) {
+      pulseSamples.push({ t: now, g: regions.pulse[1] });
+      if (currentFlashSamples) currentFlashSamples.push(regions.flash);
       lastSampleAt = now;
       renderPulse(now);
     }
@@ -242,9 +255,14 @@ async function runFlashTest() {
     const name = document.createElement('span');
     name.textContent = `${color.name} (${sampleCount} samples)`;
     const value = document.createElement('strong');
-    value.textContent = result
-      ? `${Math.round(result.cosine * 100)}% direction / ${result.strength.toFixed(2)}× strength`
-      : 'No usable response';
+    if (result) {
+      const passes = result.cosine >= FLASH_CHROMA_COSINE_MIN
+        && result.strength >= FLASH_CHROMA_RATIO_MIN
+        && result.strength <= FLASH_CHROMA_RATIO_MAX;
+      value.textContent = `${passes ? 'Pass' : 'Below Zoe threshold'} · ${Math.round(result.cosine * 100)}% direction / ${result.strength.toFixed(2)}× strength`;
+    } else {
+      value.textContent = 'No usable response';
+    }
     row.append(swatch, name, value);
     return row;
   }));
