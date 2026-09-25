@@ -547,7 +547,7 @@ function selectPrimaryMethod(method) {
 
   verificationTitleEl.textContent = isFace ? 'Face verification' : 'Hand verification';
   promptEmojiEl.textContent = isFace ? '🙂' : '-';
-  promptNameEl.textContent = isFace ? 'Turn gently left and right' : 'Click "Start" to begin';
+  promptNameEl.textContent = isFace ? 'Follow the on-screen arrows' : 'Click "Start" to begin';
   promptHintEl.textContent = isFace
     ? 'Keep your face in frame. Zoe checks motion, not identity.'
     : '';
@@ -1251,6 +1251,8 @@ const FACE_BOX_HEIGHT_SCALE = 1.02;
 const FACE_CENTER_GATE_X = 0.75;
 const FACE_CENTER_GATE_Y = 0.75;
 const FACE_MOTION_GATE_X = 0.45; // Legacy FaceDetector fallback only.
+const FACE_CENTER_TIMEOUT_MS = 20000;
+const FACE_TURN_TIMEOUT_MS = 15000;
 const YAW_CENTER_MAX = 0.25;
 const YAW_TURN_MIN = 0.45;
 const YAW_MOTION_RANGE_MIN = 0.35;
@@ -1448,9 +1450,9 @@ function drawGuideArrow(direction, color) {
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
   ctx.beginPath();
-  ctx.moveTo(x + dir * size * 0.5, cy - size);
-  ctx.lineTo(x - dir * size * 0.5, cy);
-  ctx.lineTo(x + dir * size * 0.5, cy + size);
+  ctx.moveTo(x - dir * size * 0.5, cy - size);
+  ctx.lineTo(x + dir * size * 0.5, cy);
+  ctx.lineTo(x - dir * size * 0.5, cy + size);
   ctx.stroke();
   ctx.restore();
 }
@@ -1465,7 +1467,11 @@ function drawFaceGuide(box, opts = {}) {
 
   ctx.clearRect(0, 0, W, H);
 
+  ctx.save();
+  ctx.translate(W, 0);
+  ctx.scale(-1, 1);
   ctx.drawImage(videoEl, transform.dx, transform.dy, transform.drawWidth, transform.drawHeight);
+  ctx.restore();
 
   // Spotlight: dim everything except the face-center oval. The even-odd fill
   // paints the region outside the ellipse, leaving the oval interior bright.
@@ -1487,9 +1493,9 @@ function drawFaceGuide(box, opts = {}) {
   ctx.stroke();
   ctx.restore();
 
-  // Live face box in the same unmirrored coordinate space as the camera frame.
   if (SHOW_FACE_DEBUG_BOX && box) {
     const mappedBox = mapVideoBoxToCanvas(box.pixelBox, transform);
+    mappedBox.x = W - mappedBox.x - mappedBox.w;
     ctx.save();
     ctx.strokeStyle = 'rgba(91,140,255,0.9)';
     ctx.lineWidth = 2;
@@ -1526,33 +1532,33 @@ function pushFaceSeriesSample(phaseSeries, phase, flowStartedAt, motionValue, ke
 function faceMotionPhaseConfig(phaseId, requirePoseLiveness) {
   const configs = {
     center_to_left: {
-      label: 'Turn left',
-      hint: 'Slowly turn your head to the left.',
-      arrow: 'left',
+      label: 'Turn this way',
+      hint: 'Slowly turn toward the arrow.',
+      arrow: requirePoseLiveness ? 'left' : 'right',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'left'
         : displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
     },
     center_to_right: {
-      label: 'Turn right',
-      hint: 'Slowly turn your head to the right.',
-      arrow: 'right',
+      label: 'Turn this way',
+      hint: 'Slowly turn toward the arrow.',
+      arrow: requirePoseLiveness ? 'right' : 'left',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'right'
         : displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
     },
     left_to_right: {
-      label: 'Turn right',
-      hint: 'Now slowly turn your head to the right.',
-      arrow: 'right',
+      label: 'Now the other way',
+      hint: 'Slowly turn toward the arrow.',
+      arrow: requirePoseLiveness ? 'right' : 'left',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'right'
         : displayed >= FACE_TARGET.cx + box.w * FACE_MOTION_GATE_X,
     },
     right_to_left: {
-      label: 'Turn left',
-      hint: 'Now slowly turn your head to the left.',
-      arrow: 'left',
+      label: 'Now the other way',
+      hint: 'Slowly turn toward the arrow.',
+      arrow: requirePoseLiveness ? 'left' : 'right',
       reached: (pose, box, displayed) => requirePoseLiveness
         ? pose && pose.pose === 'left'
         : displayed <= FACE_TARGET.cx - box.w * FACE_MOTION_GATE_X,
@@ -1565,6 +1571,7 @@ function faceMotionPhaseConfig(phaseId, requirePoseLiveness) {
 // shows the requested head pose. Records sampled box/yaw evidence.
 async function runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeries, opts) {
   setStatus(opts.label, 'listening');
+  promptEmojiEl.textContent = opts.arrow === 'left' ? '←' : '→';
   promptNameEl.textContent = opts.label;
   promptHintEl.textContent = opts.hint;
   let hits = 0;
@@ -1797,7 +1804,6 @@ async function runGuidedFaceCheck() {
       lastPulseT = t;
     }
   };
-  const deadline = startedAt + 30000;
   recentFaceBox = null;
   recentFaceBoxAt = 0;
 
@@ -1816,7 +1822,8 @@ async function runGuidedFaceCheck() {
     promptNameEl.textContent = 'Center your face';
     promptHintEl.textContent = 'Fit your face inside the oval and hold still.';
     let centeredFrames = 0;
-    while (faceChecking && performance.now() < deadline) {
+    const centerDeadline = performance.now() + FACE_CENTER_TIMEOUT_MS;
+    while (faceChecking && performance.now() < centerDeadline) {
       const box = await detectStableFaceFrame(engine);
       if (box && !box.stale) {
         centers.push(box.cx);
@@ -1862,7 +1869,7 @@ async function runGuidedFaceCheck() {
         label: phaseUi.label,
         hint: phaseUi.hint,
         arrow: phaseUi.arrow,
-        deadline,
+        deadline: performance.now() + FACE_TURN_TIMEOUT_MS,
         flowStartedAt: startedAt,
         phase: phaseId,
         motionValue,
