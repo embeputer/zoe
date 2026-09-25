@@ -465,7 +465,7 @@ function showZoeIdPanel(returnTarget = 'choice', direction = 'forward') {
 
 function showVerificationPanel(direction = 'forward') {
   if (pendingZoeIdRegistration) {
-    showCameraHelp('Zoe ID registration requires a face or hand check first.');
+    showCameraHelp('Zoe ID registration starts with a face check.');
   }
   zoeVerifyBtn.disabled = true;
   transitionToPanel(dialogEl, 'verify', startBtn, direction);
@@ -1130,8 +1130,8 @@ async function createFreshPasskey(resultEl = idResultEl) {
   if (!verificationToken) {
     pendingZoeIdRegistration = true;
     pendingZoeIdResultEl = resultEl;
-    resultEl.textContent = 'First complete a face or hand check. Then Zoe will save your passkey.';
-    selectPrimaryMethod(isMobileLayout() ? 'face' : selectedPrimaryMethod);
+    resultEl.textContent = 'First complete a face check. Then Zoe will save your passkey.';
+    selectPrimaryMethod('face');
     showVerificationPanel();
     autoStartVerification();
     return;
