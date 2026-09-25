@@ -13,7 +13,7 @@ This is a plain Node/static app:
 - `test_server.js` is the regression/security test suite.
 - `attack_server.js` is the adversarial harness: it submits fully fabricated evidence and reports which server checks a scripted client fools.
 
-Sessions, passkey credentials, and consumed token digests persist in SQLite (`node:sqlite`, file `zoe-data.sqlite3`, override with `ZOE_DB_PATH`; tests use `:memory:` or a temp file). Short-lived challenge state stays in memory. Relying parties redeem tokens via `POST /api/verify` (signature + expiry + one-use; no session cookie required).
+Sessions, passkey credentials, and consumed token digests persist in SQLite (`node:sqlite`, file `zoe-data.sqlite3`, override with `ZOE_DB_PATH`; tests use `:memory:` or a temp file). Session rows persist lazily — a cookie-only anonymous hit stays memory-only until the session gains real state (challenge, credential, token). Short-lived challenge state stays in memory. Verification enforces wall-clock floors server-side (`ZOE_LIVENESS_MIN_ELAPSED_MS`, `ZOE_STEP_MIN_ELAPSED_MS`; tests shorten them via env). Relying parties redeem tokens via `POST /api/verify` (signature + expiry + one-use; no session cookie required).
 
 ## Run And Test
 
@@ -63,7 +63,7 @@ Do not reintroduce a fake phone frame. The design is inspired by the card inside
 
 Face motion is the default on mobile. It runs cross-browser using MediaPipe Tasks Vision (`@mediapipe/tasks-vision`), imported dynamically in `app.js`. The WASM runtime loads from `cdn.jsdelivr.net`, and the active compatible short-range FaceDetector model is vendored locally at `models/blaze_face_short_range.tflite` and served from the same origin. The Tasks Vision FaceDetector is the active gate because it exposes confidence scores, a conventional bounding box, and face keypoints; the browser validates confidence, size/aspect, target-oval position, and eye/nose keypoint yaw before counting prompted head turns. The older `@mediapipe/face_detection` Solutions build is intentionally avoided because it evaluates strings as JavaScript and would require loosening the CSP. The browser's non-standard `FaceDetector` API is used only as an opportunistic fallback when the MediaPipe runtime cannot load; it has no keypoints, so only that fallback uses box-motion gates. It is a liveness-style motion check, not identity verification.
 
-The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval on the overlay canvas, follows the server-issued liveness plan from `POST /api/liveness/challenge` (always `center_hold`, then either `center_to_left` → `left_to_right` or `center_to_right` → `right_to_left`), then runs `runFlashPixelCheck` — a full-screen random color-flash sequence (`#flash-overlay`) while timestamped face-region pixel bursts are uploaded as `pixelSeries`. The server verifies reflected light tracks the issued `flashPlan` (per-flash color-delta cosine + magnitude, baseline sensor noise, coverage). This raises attack cost but stays forgeable — see `attack_server.js`. The app counts keypoint yaw poses (`center`, `left`, `right`) instead of only box translation, then submits yaw-range motion evidence plus phase-tagged micro-jitter/tortuosity summaries, a bounded `motionSeries`, and a `seriesDigest` bound to `challengeId`. Optional quantized mouth/ear span samples may be included when Blaze keypoints are available.
+The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval on the overlay canvas, follows the server-issued liveness plan from `POST /api/liveness/challenge` (always `center_hold`, then either `center_to_left` → `left_to_right` or `center_to_right` → `right_to_left`), then runs `runPulseCheck` — a ~14s rPPG stage where green-channel means sampled over a forehead ROI go up as `pulseSeries` and the server looks for a physiologic-band heartbeat (48–144 BPM, flat/clean-sine rejected) — then `runFlashPixelCheck` — a full-screen random color-flash sequence (`#flash-overlay`) while timestamped face-region pixel bursts are uploaded as `pixelSeries`. The server verifies reflected light tracks the issued `flashPlan` (per-flash color-delta cosine + magnitude, baseline sensor noise, coverage). The flash plan stays under ~1.2 flashes/second for photosensitivity; clients sending `reducedMotion: true` on the challenge get `flashPlan: null` and skip the pixel gate, so the pulse check alone carries liveness there. These raise attack cost but stay forgeable — see `attack_server.js`. The app counts keypoint yaw poses (`center`, `left`, `right`) instead of only box translation, then submits yaw-range motion evidence plus phase-tagged micro-jitter/tortuosity summaries, a bounded `motionSeries`, and a `seriesDigest` bound to `challengeId`. Optional quantized mouth/ear span samples may be included when Blaze keypoints are available.
 
 Known face-detector findings:
 
@@ -140,7 +140,7 @@ https://github.com/embeputer/zoe.git
 
 ## Design Notes
 
-The UI should stay compact and verification-first:
+The UI should stay compact and verification-first, styled like a hosted KYC widget (Persona/Veriff feel):
 
 - No landing page.
 - No marketing hero.
@@ -150,7 +150,7 @@ The UI should stay compact and verification-first:
 - Keep mobile uncluttered.
 - Keep text fitting within buttons/cards at phone widths.
 
-Use the existing palette and component style unless there is a strong reason to change it.
+The current visual language (matched to Persona Relay / K-ID reference UIs, researched live in-browser): light page (`--page`), a white bordered card with large `--radius` 28px corners (`--shadow`), indigo used sparingly as an accent (`--blue`/`--blue-soft`), a persistent `.card-topbar` with the asterisk brand mark + lowercase `zoe` wordmark and segmented `.flow-steps` progress driven by `setFlowStep` inside `setCardMode` (intro→choice/id→verify→success = steps 1–4). Intro: lavender `--hero` hero with a Persona-style dashed-circle `.zoe-icon` face glyph, claim row with icon chip, navy `.privacy-panel` with SVG icon chips, then a near-black `--cta` primary `.intro-verify` button on the white card plus a `.legal-line` with linked Terms/Privacy. Choice rows: K-ID-style `.choice-card`s with `--chip` lavender icon chips, bold title, desc, `.choice-badge` outline pill, and `›` chevron. Primary buttons are near-black (`--cta`), secondaries are light-gray `--quiet` pills, ghosts are quiet text. SVG stroke icons inside `.choice-icon`/`.method-icon`/`.claim-icon`/`.privacy-icon` chips (deterministic — do not swap back to emoji glyphs for static icons; emoji remain for dynamic stream prompts), scan-corner brackets on `.video-wrap::after`, glass status pill, and an animated `.verified-icon` success state. `#flash-overlay` is a direct child of `<body>` (not inside the transformed `.captcha-card`) so `position:fixed` covers the real viewport. Keep new components consistent with this language.
 
 ## Editing Guidance
 

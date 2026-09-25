@@ -11,60 +11,80 @@
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js" crossorigin="anonymous"></script>
 </head>
 <body>
+  <div id="boot-loader" class="boot-loader" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 4v16"/><path d="M4.9 8.1l14.2 7.8"/><path d="M19.1 8.1 4.9 15.9"/></svg>
+  </div>
+  <div id="flash-overlay" hidden aria-hidden="true"></div>
   <main id="captcha-card" class="captcha-card" aria-label="Zoe verification">
+    <div class="card-topbar">
+      <div class="brand-lockup" aria-hidden="true">
+        <svg class="brand-mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 4v16"/><path d="M4.9 8.1l14.2 7.8"/><path d="M19.1 8.1 4.9 15.9"/></svg>
+        <span class="brand-name">zoe</span>
+      </div>
+      <div class="flow-progress">
+        <span class="flow-step-label" id="flow-step-label">Step 1 of 4</span>
+        <ol class="flow-steps" id="flow-steps" aria-hidden="true">
+          <li class="step active"></li>
+          <li class="step"></li>
+          <li class="step"></li>
+          <li class="step"></li>
+        </ol>
+      </div>
+    </div>
     <div id="panel-shell" class="panel-shell">
     <header id="zoe-intro" class="zoe-hero intro-card panel-screen">
       <div class="zoe-icon" aria-hidden="true">
-        <span>Z</span>
+        <img src="assets/zoe-figure.png" alt="" width="92" height="92" />
       </div>
 
-      <h1>Confirm that you're a real person with Zoe.</h1>
-      <p class="tagline">The website will only receive the following information to check if you meet its requirements:</p>
+      <h1>Prove you're actually here.</h1>
+      <p class="tagline">This site only learns one thing about you:</p>
 
       <div class="claim-row">
-        <span class="claim-icon" aria-hidden="true">✓</span>
-        <span>Is human</span>
+        <span class="claim-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 12h4l2-5 4 10 2.5-6.5 1.5 1.5h3"/></svg></span>
+        <span>Has a heartbeat</span>
       </div>
 
       <div class="privacy-panel">
         <div>
-          <span class="privacy-icon" aria-hidden="true">◌</span>
+          <span class="privacy-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.4-2.9 8.2-7 9.8-4.1-1.6-7-5.4-7-9.8V6z"/><path d="M9.5 12l2 2 3.5-3.8"/></svg></span>
           <p>Zoe isolates verification from website activity, so they can't be linked.</p>
         </div>
         <div>
-          <span class="privacy-icon" aria-hidden="true">⌫</span>
+          <span class="privacy-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="3.5" width="10" height="17" rx="2.5"/><path d="M10.5 6h3"/></svg></span>
           <p>Video stays on this device. The site receives a one-use verification result.</p>
         </div>
-        <div class="intro-actions">
-          <button id="zoe-verify-btn" class="primary intro-verify" type="button" aria-controls="dialog">Verify now</button>
-        </div>
+      </div>
+
+      <div class="intro-actions">
+        <button id="zoe-verify-btn" class="primary intro-verify" type="button" aria-controls="dialog">Verify now</button>
+        <p class="legal-line">By verifying, you agree to Zoe's <a href="#">Terms of Use</a> and <a href="#">Privacy Policy</a>.</p>
       </div>
     </header>
 
     <section id="method-choice" class="choice-panel panel-screen" hidden aria-label="Choose verification method">
       <div class="choice-head">
-        <span class="verification-eyebrow">Zoe</span>
         <h2>Choose how to verify</h2>
       </div>
 
       <div class="choice-grid">
         <button id="choice-id-btn" class="choice-card" type="button">
-          <span class="choice-icon">⌘</span>
+          <span class="choice-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="16" r="4.5"/><path d="M11.2 12.8 20.5 3.5"/><path d="m16.5 7.5 3 3"/><path d="m19.5 4.5 2 2"/></svg></span>
           <span>
-            <strong>Zoe ID</strong>
+            <strong>Zoe ID <em class="choice-badge">Reusable</em></strong>
             <small>Use your Zoe ID passkey.</small>
           </span>
         </button>
         <div class="choice-or"><span>or</span></div>
         <button id="choice-face-btn" class="choice-card" type="button">
-          <span class="choice-icon">🙂</span>
+          <span class="choice-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M9.5 15a3.5 3.5 0 0 0 5 0"/></svg></span>
           <span>
             <strong>Face motion</strong>
             <small>Fastest check. Best for most people.</small>
           </span>
         </button>
         <button id="choice-hand-btn" class="choice-card" type="button">
-          <span class="choice-icon">🖐️</span>
+          <span class="choice-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12.5V5.8a1.3 1.3 0 0 1 2.6 0v4.7"/><path d="M10.6 10.5V4.3a1.3 1.3 0 0 1 2.6 0v6.2"/><path d="M13.2 10.8V5.8a1.3 1.3 0 0 1 2.6 0v6"/><path d="M15.8 12V8.8a1.3 1.3 0 0 1 2.6 0v6a7.2 7.2 0 0 1-7.2 7.2h-.4c-2.5 0-4.1-1.2-5.3-3.2L3 15a1.35 1.35 0 0 1 2.2-1.5l2.3 2.8"/></svg></span>
           <span>
             <strong>Hand gestures</strong>
             <small>Use if face motion is not available.</small>
@@ -76,7 +96,6 @@
 
     <section id="zoe-id-panel" class="id-panel panel-screen" hidden aria-label="Zoe ID verification">
       <div class="choice-head">
-        <span class="verification-eyebrow">Zoe ID</span>
         <h2>Do you have a Zoe ID?</h2>
       </div>
 
@@ -95,7 +114,6 @@
     <div id="dialog" class="verification-panel panel-screen" hidden>
       <section class="verification-head">
         <div>
-          <span class="verification-eyebrow">Zoe</span>
           <h2 id="verification-title">Choose how to verify</h2>
         </div>
         <button id="mobile-id-btn" class="secondary mobile-id-btn" type="button">Use Zoe ID</button>
@@ -103,14 +121,14 @@
 
       <section class="method-picker" aria-label="Verification method">
         <button id="method-hand-btn" class="method-card active" type="button" aria-pressed="true">
-          <span class="method-icon">🖐️</span>
+          <span class="method-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M8 12.5V5.8a1.3 1.3 0 0 1 2.6 0v4.7"/><path d="M10.6 10.5V4.3a1.3 1.3 0 0 1 2.6 0v6.2"/><path d="M13.2 10.8V5.8a1.3 1.3 0 0 1 2.6 0v6"/><path d="M15.8 12V8.8a1.3 1.3 0 0 1 2.6 0v6a7.2 7.2 0 0 1-7.2 7.2h-.4c-2.5 0-4.1-1.2-5.3-3.2L3 15a1.35 1.35 0 0 1 2.2-1.5l2.3 2.8"/></svg></span>
           <span>
             <strong>Hand gestures</strong>
             <small>Complete 3 quick poses</small>
           </span>
         </button>
         <button id="method-face-btn" class="method-card" type="button" aria-pressed="false">
-          <span class="method-icon">🙂</span>
+          <span class="method-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M9.5 15a3.5 3.5 0 0 0 5 0"/></svg></span>
           <span>
             <strong>Face motion</strong>
             <small>Turn gently left and right</small>
@@ -148,18 +166,19 @@
 
     <!-- Compact server-verified panel: replaces #dialog after success -->
     <section id="verified" class="verified panel-screen" hidden>
-      <div class="verified-icon">✓</div>
+      <div class="verified-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12.5l5.5 5.5L20 6.5"/></svg>
+      </div>
       <div class="verified-text">
-        <strong>You have been verified as a real person!</strong>
-        <span>Getting you back to where you were...</span>
+        <strong>Verification complete</strong>
+        <span>You're verified as a real person — getting you back to where you were.</span>
       </div>
     </section>
     </div>
 
     <footer>
-      <small>Secured by Zoe</small>
+      <small><svg class="lock-icon" viewBox="0 0 16 16" width="11" height="11" aria-hidden="true"><path d="M4.5 7V5a3.5 3.5 0 1 1 7 0v2h.75c.69 0 1.25.56 1.25 1.25v5.5c0 .69-.56 1.25-1.25 1.25H3.75C3.06 15 2.5 14.44 2.5 13.75v-5.5C2.5 7.56 3.06 7 3.75 7h.75zm1.5 0h4V5a2 2 0 1 0-4 0v2z" fill="currentColor"/></svg> Processed on this device.</small>
     </footer>
-    <div id="flash-overlay" hidden aria-hidden="true"></div>
   </main>
 
   <script src="app.js"></script>
