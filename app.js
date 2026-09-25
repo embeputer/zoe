@@ -75,6 +75,7 @@ const verifiedEl = $('verified');
 const mobileIdBtn = $('mobile-id-btn');
 const cameraHelpEl = $('camera-help');
 const cameraHelpTextEl = $('camera-help-text');
+const bootLoaderEl = $('boot-loader');
 const checkEls = Array.from(document.querySelectorAll('.check'));
 
 const LM = {
@@ -1815,6 +1816,33 @@ function fitCardToViewport() {
 }
 window.addEventListener('resize', fitCardToViewport);
 window.addEventListener('orientationchange', fitCardToViewport);
+
+// Boot splash: cover first paint with the Zoe mark while the page and the
+// face model warm up; reveal the card once ready (or after a hard cap).
+(function bootSplash() {
+  if (!bootLoaderEl) return;
+  const MIN_MS = 750;
+  const HARD_CAP_MS = 5000;
+  const start = performance.now();
+  const warmModel = fetch('models/blaze_face_short_range.tflite', { cache: 'force-cache' })
+    .then((r) => r.ok ? r.arrayBuffer() : null)
+    .catch(() => null);
+  const pageLoad = new Promise((resolve) => {
+    if (document.readyState === 'complete') resolve();
+    else window.addEventListener('load', resolve, { once: true });
+  });
+  const minTime = new Promise((resolve) => setTimeout(resolve, MIN_MS));
+  const cap = new Promise((resolve) => setTimeout(resolve, HARD_CAP_MS));
+  let revealed = false;
+  const reveal = () => {
+    if (revealed || !bootLoaderEl.isConnected) return;
+    revealed = true;
+    bootLoaderEl.classList.add('done');
+    bootLoaderEl.addEventListener('transitionend', () => bootLoaderEl.remove(), { once: true });
+    setTimeout(() => bootLoaderEl.isConnected && bootLoaderEl.remove(), 1000);
+  };
+  Promise.race([Promise.all([pageLoad, warmModel, minTime]), cap]).then(reveal);
+})();
 // Recompute when the card's own size changes (panel switches, camera turning on).
 if (typeof ResizeObserver !== 'undefined') {
   new ResizeObserver(fitCardToViewport).observe(cardEl);

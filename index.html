@@ -11,6 +11,9 @@
   <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3.1675466124/drawing_utils.js" crossorigin="anonymous"></script>
 </head>
 <body>
+  <div id="boot-loader" class="boot-loader" aria-hidden="true">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><path d="M12 4v16"/><path d="M4.9 8.1l14.2 7.8"/><path d="M19.1 8.1 4.9 15.9"/></svg>
+  </div>
   <div id="flash-overlay" hidden aria-hidden="true"></div>
   <main id="captcha-card" class="captcha-card" aria-label="Zoe verification">
     <div class="card-topbar">
@@ -31,10 +34,10 @@
     <div id="panel-shell" class="panel-shell">
     <header id="zoe-intro" class="zoe-hero intro-card panel-screen">
       <div class="zoe-icon" aria-hidden="true">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8V6a2 2 0 0 1 2-2h2"/><path d="M16 4h2a2 2 0 0 1 2 2v2"/><path d="M20 16v2a2 2 0 0 1-2 2h-2"/><path d="M8 20H6a2 2 0 0 1-2-2v-2"/><path d="M9 10h.01"/><path d="M15 10h.01"/><path d="M9.5 15a3.5 3.5 0 0 0 5 0"/></svg>
+        <img src="assets/zoe-figure.png" alt="" width="92" height="92" />
       </div>
 
-      <h1>Confirm that you're a real person with Zoe.</h1>
+      <h1>This website wants to verify you're a human using Zoe.</h1>
       <p class="tagline">The website will only receive the following information to check if you meet its requirements:</p>
 
       <div class="claim-row">

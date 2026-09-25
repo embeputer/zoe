@@ -1316,13 +1316,14 @@ function contentType(filePath) {
   if (ext === '.js') return 'application/javascript; charset=utf-8';
   if (ext === '.json') return 'application/json; charset=utf-8';
   if (ext === '.tflite' || ext === '.task') return 'application/octet-stream';
+  if (ext === '.png') return 'image/png';
   return 'application/octet-stream';
 }
 
 function serveStatic(req, res, pathname) {
   const requested = pathname === '/' ? '/index.html' : pathname;
   const filePath = path.resolve(__dirname, `.${requested}`);
-  if (!filePath.startsWith(__dirname) || !['.html', '.css', '.js', '.tflite', '.task'].includes(path.extname(filePath))) {
+  if (!filePath.startsWith(__dirname) || !['.html', '.css', '.js', '.tflite', '.task', '.png'].includes(path.extname(filePath))) {
     securityHeaders(res);
     res.writeHead(404);
     return res.end('Not found');
