@@ -30,9 +30,9 @@ const PULSE_WINDOW_MS = 12000;
 const FLASH_COLORS = [
   { name: 'Red', rgb: [255, 64, 64] },
   { name: 'Blue', rgb: [64, 160, 255] },
-  { name: 'Green', rgb: [72, 220, 120] },
+  { name: 'Green', rgb: [60, 220, 60] },
   { name: 'Amber', rgb: [255, 190, 60] },
-  { name: 'Purple', rgb: [190, 110, 255] },
+  { name: 'Purple', rgb: [180, 60, 255] },
   { name: 'Cyan', rgb: [60, 220, 220] },
 ];
 
