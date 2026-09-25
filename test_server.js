@@ -727,8 +727,11 @@ async function main() {
         // (a stapled attestation) must not count as hardware-backed.
         const cred4 = newCred();
         const authData4 = attAuthData(Buffer.from(cred4.rawId, 'base64url'), spkiToCose(cred4.spki));
-        const { verify: appleWrongKey } = await registerWith(cred4.rawId, cred4.spki, () => ({
-          attestationObject: attestationObjectFor('apple', cborEncode({ x5c: [leafDer] }), authData4),
+        const { verify: appleWrongKey } = await registerWith(cred4.rawId, cred4.spki, (clientDataJSON) => ({
+          attestationObject: attestationObjectFor('apple', cborEncode({
+            sig: crypto.sign('SHA256', Buffer.concat([authData4, crypto.createHash('sha256').update(clientDataJSON).digest()]), leafKey),
+            x5c: [leafDer],
+          }), authData4),
         }));
         assert.strictEqual(appleWrongKey.res.status, 201);
         const { redeem: appleWrongKeyRedeem } = await authAssurance(cred4.rawId, cred4.privateKey);
@@ -741,8 +744,11 @@ async function main() {
         run(['req', '-new', '-key', 'cred.key', '-out', 'cred.csr', '-subj', '/CN=Zoe Test Apple Leaf']);
         run(['x509', '-req', '-in', 'cred.csr', '-CA', 'root.pem', '-CAkey', 'root.key', '-CAcreateserial', '-out', 'credleaf.pem', '-days', '2', '-sha256']);
         const credleafDer = execFileSync('openssl', ['x509', '-in', 'credleaf.pem', '-outform', 'DER'], { cwd: dir });
-        const { verify: appleNoNonce } = await registerWith(cred5.rawId, cred5.spki, () => ({
-          attestationObject: attestationObjectFor('apple', cborEncode({ x5c: [credleafDer] }), authData5),
+        const { verify: appleNoNonce } = await registerWith(cred5.rawId, cred5.spki, (clientDataJSON) => ({
+          attestationObject: attestationObjectFor('apple', cborEncode({
+            sig: crypto.sign('SHA256', Buffer.concat([authData5, crypto.createHash('sha256').update(clientDataJSON).digest()]), cred5.privateKey),
+            x5c: [credleafDer],
+          }), authData5),
         }));
         assert.strictEqual(appleNoNonce.res.status, 201);
         const { redeem: appleNoNonceRedeem } = await authAssurance(cred5.rawId, cred5.privateKey);
@@ -760,7 +766,10 @@ async function main() {
           run(['x509', '-req', '-in', 'cred6.csr', '-CA', 'root.pem', '-CAkey', 'root.key', '-CAcreateserial', '-out', 'appleleaf.pem', '-days', '2', '-sha256', '-extfile', 'apple.ext.cnf']);
           const appleDer = execFileSync('openssl', ['x509', '-in', 'appleleaf.pem', '-outform', 'DER'], { cwd: dir });
           return {
-            attestationObject: attestationObjectFor('apple', cborEncode({ x5c: [appleDer] }), authData6),
+            attestationObject: attestationObjectFor('apple', cborEncode({
+              sig: crypto.sign('SHA256', Buffer.concat([authData6, crypto.createHash('sha256').update(clientDataJSON).digest()]), cred6.privateKey),
+              x5c: [appleDer],
+            }), authData6),
           };
         });
         assert.strictEqual(appleOk.res.status, 201);
