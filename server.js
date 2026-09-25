@@ -43,7 +43,7 @@ const CHALLENGE_TTL_MS = 90 * 1000;
 const MIN_STEP_DURATION_MS = 180;
 const MAX_STEP_DURATION_MS = 12 * 1000;
 const MIN_HOLD_FRAMES = 8;
-const LIVENESS_CHALLENGE_TTL_MS = 90 * 1000;
+const LIVENESS_CHALLENGE_TTL_MS = 150 * 1000;
 const LIVENESS_TRANSITION_MS_MIN = 150;
 const LIVENESS_TRANSITION_MS_MAX = 14 * 1000;
 const LIVENESS_HOLD_JITTER_MIN = 0.00035;
@@ -63,10 +63,13 @@ const FLASH_BG_PIXEL_BYTES = 4 * 1 * 3;
 const MAX_PIXEL_SAMPLES = 140;
 const FLASH_COUNT = 4;
 const FLASH_LEAD_MS = 400;
-const FLASH_DURATION_MIN_MS = 220;
-const FLASH_DURATION_SPAN_MS = 120;
-const FLASH_GAP_MIN_MS = 250;
-const FLASH_GAP_SPAN_MS = 350;
+// Photosensitivity safety (WCAG-style): a flash cycle is at least ~860ms, so
+// the sequence stays under ~1.2 flashes/second — well clear of the >3/second
+// risk band — and reduced-motion users skip the plan entirely.
+const FLASH_DURATION_MIN_MS = 480;
+const FLASH_DURATION_SPAN_MS = 160;
+const FLASH_GAP_MIN_MS = 380;
+const FLASH_GAP_SPAN_MS = 220;
 const FLASH_BASELINE_LEAD_MS = 60;
 const FLASH_LAG_SLACK_MS = 120;
 const FLASH_MIN_BASELINE_SAMPLES = 3;
@@ -77,6 +80,20 @@ const FLASH_DELTA_RATIO_MAX = 1.6;
 const FLASH_NOISE_L1_MIN = 0.3;
 const FLASH_NOISE_L1_MAX = 90;
 const FLASH_DISTINCT_FRAMES_MIN = 0.6;
+
+const PULSE_MIN_SAMPLES = 90;
+const PULSE_MAX_SAMPLES = 400;
+const PULSE_MIN_SPAN_MS = 9000;
+const PULSE_MIN_HZ = 0.8;
+const PULSE_MAX_HZ = 2.4;
+const PULSE_STD_MIN = 0.4;
+const PULSE_PEAK_RATIO_MIN = 3;
+const PULSE_LOBE_BINS = 5;
+// A real pulse concentrates a solid share of band power in the peak's main
+// lobe (±5 bins ≈ ±0.125Hz) but not all of it: white noise spreads too thin,
+// a clean injected sine concentrates ~everything. Both bounds reject fakes.
+const PULSE_LOBE_FRACTION_MIN = 0.45;
+const PULSE_LOBE_FRACTION_MAX = 0.97;
 const PASSKEY_CHALLENGE_TTL_MS = 2 * 60 * 1000;
 const APP_NAME = 'Zoe';
 const COOKIE_NAME = 'zoe_sid';
@@ -152,6 +169,7 @@ for (const row of db.prepare('SELECT id, created_at, last_seen_at FROM sessions'
     passkeyRegisterChallenge: null,
     passkeyAuthChallenge: null,
     livenessChallenge: null,
+    persisted: true,
   });
 }
 for (const row of db.prepare('SELECT session_id, id, public_key, alg, sign_count, created_at FROM credentials').all()) {
@@ -179,6 +197,7 @@ const pruneUsedTokensStmt = db.prepare('DELETE FROM used_tokens WHERE used_at < 
 
 function persistSession(session) {
   persistSessionStmt.run(session.id, session.createdAt, session.lastSeenAt);
+  session.persisted = true;
 }
 
 function persistCredential(sessionId, credential) {
@@ -196,6 +215,16 @@ function deletePersistedSession(sessionId) {
 
 function now() {
   return Date.now();
+}
+
+// Wall-clock floors: the pulse stage always takes >=14s of real time and each
+// gesture step takes >=180ms, so a verification that claims seconds of camera
+// evidence cannot mint in milliseconds. Read per-request so tests can shorten.
+function livenessMinElapsedMs() {
+  return Number(process.env.ZOE_LIVENESS_MIN_ELAPSED_MS ?? 14000);
+}
+function stepMinElapsedMs() {
+  return Number(process.env.ZOE_STEP_MIN_ELAPSED_MS ?? MIN_STEP_DURATION_MS);
 }
 
 function clientIp(req) {
@@ -386,13 +415,15 @@ function getSession(req, res) {
       passkeyRegisterChallenge: null,
       passkeyAuthChallenge: null,
       livenessChallenge: null,
+      persisted: false,
     });
     res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`);
-    persistSession(sessions.get(sid));
   } else {
     const session = sessions.get(sid);
     session.lastSeenAt = now();
-    persistSession(session);
+    // Anonymous hits create memory-only sessions; a row is written only once
+    // the session stores real state (challenge, credential, token).
+    if (session.persisted) persistSession(session);
   }
   return sessions.get(sid);
 }
@@ -470,6 +501,7 @@ function createChallenge(session) {
     evidenceDigests: new Set(),
   };
   challenges.set(challenge.id, challenge);
+  persistSession(session);
   return challenge;
 }
 
@@ -481,17 +513,17 @@ function validateEvidence(challenge, body) {
   const expectedGesture = challenge.steps[challenge.currentStep].id;
   if (body.gestureId !== expectedGesture) return 'Gesture does not match this challenge step.';
 
-  const frameCount = Number(evidence.frameCount);
-  const holdFrames = Number(evidence.holdFrames);
-  const durationMs = Number(evidence.durationMs);
-  const matchedAt = Number(evidence.matchedAt);
-  const startedAt = Number(evidence.startedAt);
-  if (!Number.isFinite(frameCount) || frameCount < MIN_HOLD_FRAMES) return 'Too few processed frames.';
-  if (!Number.isFinite(holdFrames) || holdFrames < MIN_HOLD_FRAMES) return 'Gesture was not held long enough.';
-  if (!Number.isFinite(durationMs) || durationMs < MIN_STEP_DURATION_MS || durationMs > MAX_STEP_DURATION_MS) {
+  const frameCount = evidence.frameCount;
+  const holdFrames = evidence.holdFrames;
+  const durationMs = evidence.durationMs;
+  const matchedAt = evidence.matchedAt;
+  const startedAt = evidence.startedAt;
+  if (typeof frameCount !== 'number' || !Number.isFinite(frameCount) || frameCount < MIN_HOLD_FRAMES) return 'Too few processed frames.';
+  if (typeof holdFrames !== 'number' || !Number.isFinite(holdFrames) || holdFrames < MIN_HOLD_FRAMES) return 'Gesture was not held long enough.';
+  if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < MIN_STEP_DURATION_MS || durationMs > MAX_STEP_DURATION_MS) {
     return 'Step timing is outside the allowed range.';
   }
-  if (!Number.isFinite(startedAt) || !Number.isFinite(matchedAt) || matchedAt <= startedAt) return 'Invalid evidence timing.';
+  if (typeof startedAt !== 'number' || typeof matchedAt !== 'number' || !Number.isFinite(startedAt) || !Number.isFinite(matchedAt) || matchedAt <= startedAt) return 'Invalid evidence timing.';
 
   const digest = crypto.createHash('sha256').update(JSON.stringify({
     challengeId: body.challengeId,
@@ -654,6 +686,78 @@ function validatePixelSeries(pixelSeries, flashPlan) {
     }
   }
   return null;
+}
+
+// rPPG pulse check: detrended green-channel means sampled over a forehead ROI
+// should hold a spectral peak in the physiologic band (48-144 BPM) — strong
+// enough to be a real signal, but spread enough not to be a clean injected
+// sine wave. Returns { bpm } on success or { error } on rejection.
+function validatePulseSeries(pulseSeries) {
+  if (!Array.isArray(pulseSeries) || pulseSeries.length < PULSE_MIN_SAMPLES || pulseSeries.length > PULSE_MAX_SAMPLES) {
+    return { error: 'Pulse series is invalid.' };
+  }
+  const sig = [];
+  let lastT = -1;
+  for (const s of pulseSeries) {
+    const g = Number(s && s.g);
+    const t = Number(s && s.t);
+    if (!Number.isFinite(g) || g < 0 || g > 255) return { error: 'Pulse samples are invalid.' };
+    if (!Number.isFinite(t) || t < 0 || t > 120000 || t < lastT) return { error: 'Pulse sample timing is invalid.' };
+    lastT = t;
+    sig.push({ g, t });
+  }
+  const span = sig[sig.length - 1].t - sig[0].t;
+  if (span < PULSE_MIN_SPAN_MS) return { error: 'Pulse measurement was too short.' };
+
+  const mean = sig.reduce((a, s) => a + s.g, 0) / sig.length;
+  const xs = sig.map((s) => s.g - mean);
+  const std = Math.sqrt(xs.reduce((a, v) => a + v * v, 0) / xs.length);
+  if (std < PULSE_STD_MIN) return { error: 'Pulse signal was flat — no living tissue detected.' };
+
+  // Median sample interval gives the effective sample rate.
+  const dts = [];
+  for (let i = 1; i < sig.length; i++) dts.push(sig[i].t - sig[i - 1].t);
+  dts.sort((a, b) => a - b);
+  const fs = 1000 / Math.max(1, dts[Math.floor(dts.length / 2)]);
+  if (fs < 4) return { error: 'Pulse sampling rate is too low.' };
+
+  // Hann-windowed DFT magnitudes over the physiologic band.
+  const n = xs.length;
+  const windowed = xs.map((v, i) => v * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1))));
+  const binHz = 0.025;
+  const loBin = Math.ceil(0.5 / binHz);
+  const hiBin = Math.floor(3.2 / binHz);
+  const peakLo = Math.ceil(PULSE_MIN_HZ / binHz);
+  const peakHi = Math.floor(PULSE_MAX_HZ / binHz);
+  const powers = new Float64Array(hiBin + 1);
+  let peakIdx = -1;
+  let peakPower = 0;
+  let bandPower = 0;
+  for (let b = loBin; b <= hiBin; b++) {
+    let re = 0;
+    let im = 0;
+    const w = (2 * Math.PI * b * binHz) / fs;
+    for (let i = 0; i < n; i++) {
+      re += windowed[i] * Math.cos(w * i);
+      im -= windowed[i] * Math.sin(w * i);
+    }
+    const p = re * re + im * im;
+    powers[b] = p;
+    bandPower += p;
+    if (b >= peakLo && b <= peakHi && p > peakPower) {
+      peakPower = p;
+      peakIdx = b;
+    }
+  }
+  if (peakIdx < 0 || bandPower <= 0) return { error: 'No pulse found in the signal.' };
+  const meanBand = bandPower / (hiBin - loBin + 1);
+  if (peakPower / meanBand < PULSE_PEAK_RATIO_MIN) return { error: 'No clear heartbeat found in the signal.' };
+  let lobePower = 0;
+  for (let b = peakIdx - PULSE_LOBE_BINS; b <= peakIdx + PULSE_LOBE_BINS; b++) lobePower += powers[b] || 0;
+  const lobeFraction = lobePower / bandPower;
+  if (lobeFraction < PULSE_LOBE_FRACTION_MIN) return { error: 'Pulse signal looks like noise.' };
+  if (lobeFraction > PULSE_LOBE_FRACTION_MAX) return { error: 'Pulse signal looks synthetic.' };
+  return { bpm: Math.round(peakIdx * binHz * 60) };
 }
 
 function computeLivenessSeriesDigest(challengeId, motionSeries) {
@@ -881,6 +985,7 @@ function validateLivenessPhases(phases, plan, { legacy = false } = {}) {
 }
 
 function issueVerificationToken(session, source, method = 'gesture', assurance = 'standard') {
+  persistSession(session);
   const iat = now();
   const payload = {
     type: 'zoe.verification',
@@ -1013,6 +1118,10 @@ async function handleApi(req, res, pathname) {
     if (challenge.consumedAt) return sendJson(res, 409, { error: 'Challenge was already consumed.' });
     if (now() > challenge.expiresAt) return sendJson(res, 410, { error: 'Challenge expired.' });
 
+    if (now() - challenge.stepStartedAt < stepMinElapsedMs()) {
+      return sendJson(res, 400, { error: 'Gesture step completed too quickly to be real.' });
+    }
+
     const evidenceError = validateEvidence(challenge, body);
     if (evidenceError) {
       logVerificationFailure('gesture_step_rejected', pathname);
@@ -1058,6 +1167,7 @@ async function handleApi(req, res, pathname) {
 
     const challenge = randomId(32);
     session.passkeyRegisterChallenge = { challenge, createdAt: now(), verifiedBy: gate.payload.method };
+    persistSession(session);
     return sendJson(res, 200, {
       challenge,
       rp: { name: APP_NAME },
@@ -1116,6 +1226,7 @@ async function handleApi(req, res, pathname) {
       signCount: 0,
       createdAt: now(),
     });
+    persistSession(session);
     persistCredential(session.id, session.credentials.get(rawId));
     session.passkeyRegisterChallenge = null;
     return sendJson(res, 201, { ok: true, credentialId: rawId });
@@ -1125,6 +1236,7 @@ async function handleApi(req, res, pathname) {
     if (!session.credentials.size) return sendJson(res, 409, { error: 'No passkey is registered in this session yet.' });
     const challenge = randomId(32);
     session.passkeyAuthChallenge = { challenge, createdAt: now() };
+    persistSession(session);
     return sendJson(res, 200, {
       challenge,
       timeout: 60000,
@@ -1172,10 +1284,16 @@ async function handleApi(req, res, pathname) {
   }
 
   if (req.method === 'POST' && pathname === '/api/liveness/challenge') {
+    let challengeBody = {};
+    try {
+      challengeBody = await readJson(req);
+    } catch (err) {
+      challengeBody = {};
+    }
     const created = now();
     const challengeId = randomId();
     const plan = createLivenessPlan();
-    const flashPlan = createFlashPlan();
+    const flashPlan = challengeBody.reducedMotion === true ? null : createFlashPlan();
     session.livenessChallenge = {
       id: challengeId,
       plan,
@@ -1185,6 +1303,7 @@ async function handleApi(req, res, pathname) {
       consumedAt: null,
       seriesDigests: new Set(),
     };
+    persistSession(session);
     return sendJson(res, 201, {
       challengeId,
       plan,
@@ -1208,16 +1327,21 @@ async function handleApi(req, res, pathname) {
     if (pending.consumedAt) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
     if (now() > pending.expiresAt) return sendJson(res, 410, { error: 'Face liveness challenge expired.' });
 
-    const durationMs = Number(body.durationMs);
-    const faceFrames = Number(body.faceFrames);
-    const motionScore = Number(body.motionScore);
+    if (now() - pending.createdAt < livenessMinElapsedMs()) {
+      logVerificationFailure('liveness_too_fast', pathname);
+      return sendJson(res, 400, { error: 'Face check completed too quickly to be real.' });
+    }
+
+    const durationMs = body.durationMs;
+    const faceFrames = body.faceFrames;
+    const motionScore = body.motionScore;
     const seriesDigest = typeof body.seriesDigest === 'string' ? body.seriesDigest : '';
     const legacy = body.legacyEngine === true;
-    if (!Number.isFinite(durationMs) || durationMs < 900 || durationMs > 15000) {
+    if (typeof durationMs !== 'number' || !Number.isFinite(durationMs) || durationMs < 900 || durationMs > 15000) {
       return sendJson(res, 400, { error: 'Face check timing is outside the allowed range.' });
     }
-    if (!Number.isFinite(faceFrames) || faceFrames < 8) return sendJson(res, 400, { error: 'Face was not visible for long enough.' });
-    if (!Number.isFinite(motionScore) || motionScore < 0.08) return sendJson(res, 400, { error: 'Face motion was too small to count as liveness.' });
+    if (typeof faceFrames !== 'number' || !Number.isFinite(faceFrames) || faceFrames < 8) return sendJson(res, 400, { error: 'Face was not visible for long enough.' });
+    if (typeof motionScore !== 'number' || !Number.isFinite(motionScore) || motionScore < 0.08) return sendJson(res, 400, { error: 'Face motion was too small to count as liveness.' });
     if (!/^[a-f0-9]{64}$/.test(seriesDigest)) return sendJson(res, 400, { error: 'Face motion digest is invalid.' });
 
     const motionSeries = body.motionSeries;
@@ -1240,10 +1364,18 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 400, { error: phaseError });
     }
 
-    const pixelError = validatePixelSeries(body.pixelSeries, pending.flashPlan);
-    if (pixelError) {
-      logVerificationFailure('liveness_pixels_rejected', pathname);
-      return sendJson(res, 400, { error: pixelError });
+    if (pending.flashPlan) {
+      const pixelError = validatePixelSeries(body.pixelSeries, pending.flashPlan);
+      if (pixelError) {
+        logVerificationFailure('liveness_pixels_rejected', pathname);
+        return sendJson(res, 400, { error: pixelError });
+      }
+    }
+
+    const pulseResult = validatePulseSeries(body.pulseSeries);
+    if (pulseResult.error) {
+      logVerificationFailure('liveness_pulse_rejected', pathname);
+      return sendJson(res, 400, { error: pulseResult.error });
     }
 
     if (pending.seriesDigests.has(seriesDigest)) {
@@ -1258,6 +1390,7 @@ async function handleApi(req, res, pathname) {
       verified: true,
       verificationToken: token,
       tokenExpiresAt: now() + TOKEN_TTL_MS,
+      pulseBpm: pulseResult.bpm,
     });
   }
 

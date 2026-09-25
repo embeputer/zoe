@@ -1,8 +1,13 @@
 // Adversarial harness: measures which server checks a fully scripted client can
 // pass without a camera, a face, a hand, or MediaPipe. Run with `npm run attack`.
 process.env.ZOE_DB_PATH = ':memory:';
+// Wall-clock floors stay on but are shortened for runtime — the harness still
+// has to burn real seconds per attempt, not mint instantly.
+process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = process.env.ZOE_LIVENESS_MIN_ELAPSED_MS ?? '2000';
 const crypto = require('crypto');
 const { createServer } = require('./server');
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function request(baseUrl, path, options = {}, cookie) {
   const headers = { ...(options.headers || {}) };
@@ -64,6 +69,22 @@ function fabricatedPixelSeries(flashPlan) {
   return samples;
 }
 
+// Forged rPPG pulse: a fundamental + 2nd harmonic + slow drift + noise in the
+// physiologic band passes the spectral gates — raising attack cost again but
+// proving the check remains forgeable without server-side vision.
+function fabricatedPulseSeries() {
+  const samples = [];
+  const w1 = 2 * Math.PI * 1.17;
+  const w2 = 2 * Math.PI * 2.34;
+  const wd = 2 * Math.PI * 0.08;
+  for (let t = 0; t <= 14000; t += 95) {
+    const s = t / 1000;
+    const g = 118 + 3.5 * Math.sin(w1 * s) + 1.1 * Math.sin(w2 * s + 0.7) + 1.5 * Math.sin(wd * s + 1.2) + gaussian() * 2.2;
+    samples.push({ g: Math.round(g * 100) / 100, t });
+  }
+  return samples;
+}
+
 function fabricatedMotionSeries(plan) {
   const series = [];
   let t = 0;
@@ -92,6 +113,7 @@ async function attackFabricatedGestures(baseUrl, cookie) {
   cookie = res.cookie;
   let challenge = res.body;
   for (let i = 0; i < 3; i++) {
+    await sleep(200); // step floor: >=180ms between gesture steps
     res = await request(baseUrl, '/api/step', {
       method: 'POST',
       body: JSON.stringify({
@@ -121,6 +143,7 @@ async function attackFabricatedLiveness(baseUrl, cookie) {
   cookie = res.cookie;
   const { challengeId, plan, flashPlan } = res.body;
   const motionSeries = fabricatedMotionSeries(plan);
+  await sleep(2100); // wall-clock floor: >=2s (shortened from the 14s default)
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
     body: JSON.stringify({
@@ -131,6 +154,7 @@ async function attackFabricatedLiveness(baseUrl, cookie) {
       motionSeries,
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
       pixelSeries: flashPlan ? fabricatedPixelSeries(flashPlan) : undefined,
+      pulseSeries: fabricatedPulseSeries(),
     }),
   }, cookie);
   const token = res.body.verificationToken;
@@ -152,6 +176,7 @@ async function attackReplayedSeries(baseUrl, cookie) {
   cookie = res.cookie;
   const template = fabricatedMotionSeries(res.body.plan);
   const noisy = template.map((s) => ({ ...s, v: s.v + gaussian() * 0.0004 }));
+  await sleep(2100);
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
     body: JSON.stringify({
@@ -162,6 +187,7 @@ async function attackReplayedSeries(baseUrl, cookie) {
       motionSeries: noisy,
       seriesDigest: attackerSeriesDigest(res.body.challengeId, noisy),
       pixelSeries: res.body.flashPlan ? fabricatedPixelSeries(res.body.flashPlan) : undefined,
+      pulseSeries: fabricatedPulseSeries(),
     }),
   }, cookie);
   return {
@@ -197,6 +223,7 @@ async function controlUncorrelatedPixels(baseUrl, cookie) {
     ...s,
     f: Buffer.alloc(324).fill(40).toString('base64'),
   }));
+  await sleep(2100);
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
     body: JSON.stringify({
@@ -207,6 +234,7 @@ async function controlUncorrelatedPixels(baseUrl, cookie) {
       motionSeries,
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
       pixelSeries: flatPixels,
+      pulseSeries: fabricatedPulseSeries(),
     }),
   }, cookie);
   return { fooled: res.res.status === 200, note: `flash-ignoring pixels: ${res.res.status}`, cookie };
@@ -217,6 +245,7 @@ async function controlCrossSession(baseUrl, cookie) {
   cookie = res.cookie;
   const { challengeId, plan, flashPlan } = res.body;
   const motionSeries = fabricatedMotionSeries(plan);
+  await sleep(2100); // wall-clock floor: >=2s (shortened from the 14s default)
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
     body: JSON.stringify({
@@ -227,6 +256,7 @@ async function controlCrossSession(baseUrl, cookie) {
       motionSeries,
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
       pixelSeries: flashPlan ? fabricatedPixelSeries(flashPlan) : undefined,
+      pulseSeries: fabricatedPulseSeries(),
     }),
   }, cookie);
   const token = res.body.verificationToken;
@@ -277,8 +307,8 @@ async function main() {
     const controls = results.filter((x) => x.name.startsWith('control'));
     console.log(`\n${fooled.length}/3 attacks fooled the server; controls blocked: ${controls.filter((x) => !x.fooled).length}/${controls.length}`);
     if (fooled.length) {
-      console.log('Conclusion: even pixel-verified flash liveness stays forgeable by a script that');
-      console.log('synthesizes matching pixels — closing the hole needs server-side media verification.');
+      console.log('Conclusion: even pulse-checked, pixel-verified flash liveness stays forgeable by a script that');
+      console.log('synthesizes matching signals — closing the hole needs server-side media verification.');
     }
   } finally {
     await new Promise((resolve) => server.close(resolve));
