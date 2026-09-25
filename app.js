@@ -1681,18 +1681,19 @@ const PULSE_MEASURE_MS = 14000;
 // carries the liveness gate and measures longer to compensate.
 const PULSE_MEASURE_MS_REDUCED = 20000;
 const PULSE_SAMPLE_MS = 95;
-// Pulse sampling also runs in the background during the motion phases, so the
-// dedicated hold-still stage only tops up whatever window is still missing.
-// The floor keeps the server's analysis tail mostly stillness; reduced-motion
-// challenges rely on the pulse check alone so their tail is longer.
-const PULSE_TOPUP_MIN_MS = 5000;
-const PULSE_TOPUP_MIN_REDUCED_MS = 9000;
+// Pulse sampling also runs during motion, but the server analyzes the final
+// window. Keep that tail front-facing and still; reduced-motion challenges rely
+// on the pulse check alone, so their clean window is longer.
+const PULSE_TOPUP_MIN_MS = 9500;
+const PULSE_TOPUP_MIN_REDUCED_MS = 18500;
 const PULSE_BG_MIN_GAP_MS = 110;
 const PULSE_BG_MAX_SAMPLES = 300;
 const PRESENTATION_FRAME_WIDTH = 320;
 const PRESENTATION_FRAME_HEIGHT = 240;
+const PRESENTATION_FRAME_MIN_COUNT = 3;
 const PRESENTATION_FRAME_COUNT = 5;
 const PRESENTATION_FRAME_MIN_GAP_MS = 700;
+const PRESENTATION_CAPTURE_GRACE_MS = 3000;
 const pulseCanvas = document.createElement('canvas');
 pulseCanvas.width = PULSE_ROI_W;
 pulseCanvas.height = PULSE_ROI_H;
@@ -1744,20 +1745,32 @@ function capturePresentationFrame(box, startedAt) {
   };
 }
 
-async function runPulseCheck(engine, measureMs, samples, t0, mediaFrames) {
+function faceReadyForStillCapture(box, requirePoseLiveness) {
+  if (!box || box.stale || !box.pixelBox) return false;
+  const dx = Math.abs(displayedFaceX(box) - FACE_TARGET.cx);
+  const dy = Math.abs(box.cy - FACE_TARGET.cy);
+  const centered = dx < box.w * FACE_CENTER_GATE_X && dy < box.h * FACE_CENTER_GATE_Y;
+  const poseReady = !requirePoseLiveness || (box.pose && box.pose.pose === 'center');
+  return centered && poseReady;
+}
+
+async function runPulseCheck(engine, measureMs, samples, t0, mediaFrames, requirePoseLiveness) {
   const measureStart = performance.now();
   let lastMediaFrameT = -Infinity;
   setStatus('Verifying', 'listening');
   promptNameEl.textContent = 'Keep looking at the camera';
   while (faceChecking) {
     const now = performance.now() - measureStart;
-    if (now > measureMs) break;
+    const measurementComplete = now >= measureMs;
+    const mediaComplete = mediaFrames.length >= PRESENTATION_FRAME_MIN_COUNT;
+    if (measurementComplete && mediaComplete) break;
+    if (now > measureMs + PRESENTATION_CAPTURE_GRACE_MS) break;
     const box = await detectStableFaceFrame(engine);
-    const g = box && !box.stale ? samplePulseGreen(box) : null;
+    const ready = faceReadyForStillCapture(box, requirePoseLiveness);
+    const g = ready ? samplePulseGreen(box) : null;
     if (g !== null) samples.push({ g: Math.round(g * 100) / 100, t: Math.round(performance.now() - t0) });
     if (
-      box
-      && !box.stale
+      ready
       && mediaFrames.length < PRESENTATION_FRAME_COUNT
       && now - lastMediaFrameT >= PRESENTATION_FRAME_MIN_GAP_MS
     ) {
@@ -1767,9 +1780,13 @@ async function runPulseCheck(engine, measureMs, samples, t0, mediaFrames) {
         lastMediaFrameT = now;
       }
     }
-    const remaining = Math.max(1, Math.ceil((measureMs - now) / 1000));
-    promptHintEl.textContent = `Zoe is verifying · ${remaining}s left`;
-    drawFaceGuide(box, { state: box && !box.stale ? 'good' : 'neutral' });
+    const remaining = Math.max(0, Math.ceil((measureMs - now) / 1000));
+    promptHintEl.textContent = ready
+      ? remaining > 0
+        ? `Zoe is verifying · ${remaining}s left`
+        : 'Zoe is finishing the camera check'
+      : 'Center your face and keep looking at the camera';
+    drawFaceGuide(box, { state: ready ? 'good' : 'neutral' });
     await sleep(PULSE_SAMPLE_MS);
   }
   return samples;
@@ -1928,9 +1945,10 @@ async function runGuidedFaceCheck() {
       pulseSeries,
       startedAt,
       mediaFrames,
+      requirePoseLiveness,
     );
     if (!faceChecking) return;
-    if (mediaFrames.length < 3) {
+    if (mediaFrames.length < PRESENTATION_FRAME_MIN_COUNT) {
       throw new Error('Zoe could not capture enough clear camera frames. Keep looking at the camera and try again.');
     }
 

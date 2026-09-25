@@ -135,7 +135,7 @@ body {
 }
 
 .zoe-hero {
-  padding: 18px 18px 8px;
+  padding: 18px 8px 8px;
 }
 
 .panel-shell {
@@ -201,43 +201,41 @@ h1 {
 
 .intro-card h1 {
   text-align: left;
-  font-size: 25px;
-  line-height: 1.2;
+  font-size: 23px;
+  line-height: 1.25;
   letter-spacing: -0.025em;
 }
 
 .tagline {
-  max-width: 300px;
-  margin: 12px 0 26px;
+  max-width: 340px;
+  margin: 8px 0 18px;
   color: var(--muted);
   font-size: 14px;
-  line-height: 1.5;
+  line-height: 1.45;
   text-align: left;
 }
 
 .intro-note {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin: 0 0 20px;
-  padding: 13px 14px;
-  border-radius: 12px;
-  background: var(--quiet);
+  gap: 8px;
+  margin: 0 0 18px;
+  padding: 0;
   color: var(--muted);
   font-size: 12.5px;
   line-height: 1.4;
 }
 
 .intro-note span {
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   color: var(--blue);
   flex: 0 0 auto;
 }
 
 .intro-note svg {
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
 }
 
 .intro-actions {
@@ -414,10 +412,6 @@ h1 {
 
 .captcha-card.success-mode .verified {
   pointer-events: auto;
-}
-
-.captcha-card.success-mode footer {
-  display: none;
 }
 
 .verification-head {
@@ -793,21 +787,6 @@ button.ghost:hover {
   line-height: 1.4;
 }
 
-footer {
-  margin-top: 14px;
-  padding-top: 14px;
-  border-top: 1px solid var(--line);
-  text-align: center;
-  color: var(--muted);
-  font-size: 11.5px;
-}
-
-footer .lock-icon {
-  vertical-align: -1px;
-  margin-right: 4px;
-  opacity: 0.7;
-}
-
 @media (max-width: 560px) {
   body {
     padding: 14px;
@@ -824,11 +803,11 @@ footer .lock-icon {
   }
 
   .zoe-hero {
-    padding: 20px 4px 4px;
+    padding: 18px 2px 4px;
   }
 
   .intro-card h1 {
-    font-size: 23px;
+    font-size: 22px;
   }
 
   .tagline {

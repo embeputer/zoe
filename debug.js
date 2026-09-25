@@ -19,6 +19,9 @@ const metrics = window.ZoeDebugMetrics;
 const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
 const TASKS_VISION_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
 const FACE_MODEL_URL = '/models/blaze_face_short_range.tflite';
+const FACE_BOX_SHIFT_X = -0.75;
+const FACE_BOX_SHIFT_Y = -0.55;
+const FACE_BOX_HEIGHT_SCALE = 1.02;
 const SAMPLE_INTERVAL_MS = 100;
 const PULSE_WINDOW_MS = 12000;
 const FLASH_COLORS = [
@@ -38,6 +41,22 @@ let currentFlashSamples = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function calibratedFaceBox(box) {
+  const frameWidth = video.videoWidth;
+  const frameHeight = video.videoHeight;
+  const width = box.width;
+  const height = box.height * FACE_BOX_HEIGHT_SCALE;
+  const x = box.x + box.width * FACE_BOX_SHIFT_X;
+  const y = box.y + box.height * FACE_BOX_SHIFT_Y;
+  return {
+    x: Math.min(Math.max(0, x), Math.max(0, frameWidth - width)),
+    y: Math.min(Math.max(0, y), Math.max(0, frameHeight - height)),
+    width,
+    height,
+    score: box.score,
+  };
 }
 
 async function initDetector() {
@@ -67,7 +86,7 @@ function bestFace() {
       height: box.height,
       score,
     };
-    if (!best || candidate.score > best.score) best = candidate;
+    if (!best || candidate.score > best.score) best = calibratedFaceBox(candidate);
   }
   currentFace = best;
   return best;
