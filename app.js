@@ -55,6 +55,8 @@ const verificationTitleEl = $('verification-title');
 const startBtn = $('start-btn');
 const cardEl = $('captcha-card');
 const flashOverlayEl = $('flash-overlay');
+const flowStepsEl = $('flow-steps');
+const flowStepLabelEl = $('flow-step-label');
 const panelShellEl = $('panel-shell');
 const zoeIntroEl = $('zoe-intro');
 const zoeVerifyBtn = $('zoe-verify-btn');
@@ -73,6 +75,7 @@ const verifiedEl = $('verified');
 const mobileIdBtn = $('mobile-id-btn');
 const cameraHelpEl = $('camera-help');
 const cameraHelpTextEl = $('camera-help-text');
+const bootLoaderEl = $('boot-loader');
 const checkEls = Array.from(document.querySelectorAll('.check'));
 
 const LM = {
@@ -327,11 +330,24 @@ function isMobileLayout() {
 const PANEL_TRANSITION_MS = 440;
 let panelTransitionTimer = null;
 
+const FLOW_STEP_INDEX = { choice: 2, id: 2, verify: 3, success: 4 };
+
+function setFlowStep(mode) {
+  const n = FLOW_STEP_INDEX[mode] || 1;
+  if (flowStepLabelEl) flowStepLabelEl.textContent = `Step ${n} of 4`;
+  if (!flowStepsEl) return;
+  flowStepsEl.querySelectorAll('.step').forEach((el, i) => {
+    el.classList.toggle('active', i + 1 === n);
+    el.classList.toggle('done', i + 1 < n);
+  });
+}
+
 function setCardMode(mode) {
   cardEl.classList.toggle('choice-mode', mode === 'choice');
   cardEl.classList.toggle('id-mode', mode === 'id');
   cardEl.classList.toggle('verify-mode', mode === 'verify');
   cardEl.classList.toggle('success-mode', mode === 'success');
+  setFlowStep(mode);
 }
 
 function transitionToPanel(activePanel, mode, focusEl, direction = 'forward') {
@@ -1800,6 +1816,33 @@ function fitCardToViewport() {
 }
 window.addEventListener('resize', fitCardToViewport);
 window.addEventListener('orientationchange', fitCardToViewport);
+
+// Boot splash: cover first paint with the Zoe mark while the page and the
+// face model warm up; reveal the card once ready (or after a hard cap).
+(function bootSplash() {
+  if (!bootLoaderEl) return;
+  const MIN_MS = 750;
+  const HARD_CAP_MS = 5000;
+  const start = performance.now();
+  const warmModel = fetch('models/blaze_face_short_range.tflite', { cache: 'force-cache' })
+    .then((r) => r.ok ? r.arrayBuffer() : null)
+    .catch(() => null);
+  const pageLoad = new Promise((resolve) => {
+    if (document.readyState === 'complete') resolve();
+    else window.addEventListener('load', resolve, { once: true });
+  });
+  const minTime = new Promise((resolve) => setTimeout(resolve, MIN_MS));
+  const cap = new Promise((resolve) => setTimeout(resolve, HARD_CAP_MS));
+  let revealed = false;
+  const reveal = () => {
+    if (revealed || !bootLoaderEl.isConnected) return;
+    revealed = true;
+    bootLoaderEl.classList.add('done');
+    bootLoaderEl.addEventListener('transitionend', () => bootLoaderEl.remove(), { once: true });
+    setTimeout(() => bootLoaderEl.isConnected && bootLoaderEl.remove(), 1000);
+  };
+  Promise.race([Promise.all([pageLoad, warmModel, minTime]), cap]).then(reveal);
+})();
 // Recompute when the card's own size changes (panel switches, camera turning on).
 if (typeof ResizeObserver !== 'undefined') {
   new ResizeObserver(fitCardToViewport).observe(cardEl);

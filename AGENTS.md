@@ -140,7 +140,7 @@ https://github.com/embeputer/zoe.git
 
 ## Design Notes
 
-The UI should stay compact and verification-first:
+The UI should stay compact and verification-first, styled like a hosted KYC widget (Persona/Veriff feel):
 
 - No landing page.
 - No marketing hero.
@@ -150,7 +150,7 @@ The UI should stay compact and verification-first:
 - Keep mobile uncluttered.
 - Keep text fitting within buttons/cards at phone widths.
 
-Use the existing palette and component style unless there is a strong reason to change it.
+The current visual language (matched to Persona Relay / K-ID reference UIs, researched live in-browser): light page (`--page`), a white bordered card with large `--radius` 28px corners (`--shadow`), indigo used sparingly as an accent (`--blue`/`--blue-soft`), a persistent `.card-topbar` with the asterisk brand mark + lowercase `zoe` wordmark and segmented `.flow-steps` progress driven by `setFlowStep` inside `setCardMode` (intro→choice/id→verify→success = steps 1–4). Intro: lavender `--hero` hero with a Persona-style dashed-circle `.zoe-icon` face glyph, claim row with icon chip, navy `.privacy-panel` with SVG icon chips, then a near-black `--cta` primary `.intro-verify` button on the white card plus a `.legal-line` with linked Terms/Privacy. Choice rows: K-ID-style `.choice-card`s with `--chip` lavender icon chips, bold title, desc, `.choice-badge` outline pill, and `›` chevron. Primary buttons are near-black (`--cta`), secondaries are light-gray `--quiet` pills, ghosts are quiet text. SVG stroke icons inside `.choice-icon`/`.method-icon`/`.claim-icon`/`.privacy-icon` chips (deterministic — do not swap back to emoji glyphs for static icons; emoji remain for dynamic stream prompts), scan-corner brackets on `.video-wrap::after`, glass status pill, and an animated `.verified-icon` success state. `#flash-overlay` is a direct child of `<body>` (not inside the transformed `.captcha-card`) so `position:fixed` covers the real viewport. Keep new components consistent with this language.
 
 ## Editing Guidance
 
