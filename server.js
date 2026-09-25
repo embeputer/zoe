@@ -1340,23 +1340,32 @@ function verifyAttestation(attestationObjectB64, clientDataJSONBytes, origin, ex
   if (fmt === 'packed') {
     const x5c = Array.isArray(attStmt && attStmt.x5c) ? attStmt.x5c : [];
     const sig = attStmt && attStmt.sig;
+    if (!Buffer.isBuffer(sig)) {
+      return { error: 'Passkey attestation signature did not verify.' };
+    }
     if (x5c.length) {
-      if (!certChainsToRoot(x5c)) return { error: 'Passkey attestation chain is not trusted.' };
-      const leaf = new crypto.X509Certificate(x5c[0]);
-      if (!Buffer.isBuffer(sig) || !verifyAttestationSignature(attStmt.alg, signedData, leaf.publicKey, sig)) {
+      let leaf;
+      try {
+        leaf = new crypto.X509Certificate(x5c[0]);
+      } catch {
+        return { error: 'Passkey attestation certificate is malformed.' };
+      }
+      if (!verifyAttestationSignature(attStmt.alg, signedData, leaf.publicKey, sig)) {
         return { error: 'Passkey attestation signature did not verify.' };
       }
-      hardwareBacked = true;
+      // Only a chain that reaches an embedded FIDO root proves hardware.
+      // Untrusted chains (Chrome/Android software keys emit self-signed ones)
+      // still register — they just stay software-backed and cap at 'standard'.
+      hardwareBacked = certChainsToRoot(x5c);
     } else {
       // Self attestation: proves key possession, not hardware. Stays 'standard'.
-      if (!Buffer.isBuffer(sig) || !verifyAttestationSignature(attStmt && attStmt.alg, signedData, credential.publicKey, sig)) {
+      if (!verifyAttestationSignature(attStmt && attStmt.alg, signedData, credential.publicKey, sig)) {
         return { error: 'Passkey attestation signature did not verify.' };
       }
     }
   } else if (fmt === 'apple') {
     const x5c = Array.isArray(attStmt && attStmt.x5c) ? attStmt.x5c : [];
-    if (!x5c.length || !certChainsToRoot(x5c)) return { error: 'Passkey attestation chain is not trusted.' };
-    hardwareBacked = true;
+    hardwareBacked = x5c.length > 0 && certChainsToRoot(x5c);
   } else if (fmt !== 'none') {
     return { error: 'Passkey attestation format is not supported.' };
   }

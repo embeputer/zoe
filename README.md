@@ -28,7 +28,7 @@ If port `3000` is already in use:
 env PORT=3001 npm start
 ```
 
-Then open `http://127.0.0.1:3001` (or match your `PORT`).
+Then open `http://localhost:3001` (or match your `PORT`). Use `localhost`, not `127.0.0.1` — IP literals aren't valid WebAuthn relying-party IDs, so Zoe ID throws `SecurityError` on an IP host (APIs/curl work fine on 127.0.0.1).
 
 ## Environment Variables
 
@@ -81,7 +81,7 @@ npm run attack:agent
 `attack_agent.js` probes the API-level surface an autonomous agent sees — no media fabrication needed, just protocol abuse. Measured results:
 
 - **BLOCKED — instant verification.** The server now compares `now() - challenge.createdAt` to a wall-clock floor (`ZOE_LIVENESS_MIN_ELAPSED_MS`, default 14s — the pulse stage's real duration; `ZOE_STEP_MIN_ELAPSED_MS`, default 180ms per gesture step). A "20-second" verification submitted in ~40ms is rejected, which also caps attempt rate at ~1 per real flow duration.
-- **BLOCKED — scripted Zoe ID caps at `'standard'`.** Registration now asks the authenticator for an attestation (`attestation: 'direct'`) and verifies it: a `packed`/`apple` x5c chain reaching an embedded FIDO root (Apple, Yubico) marks the credential `hardwareBacked`; `fmt 'none'`, self-attestation, and anything else still register but stay software. A generated P-256 keypair completes the whole Zoe ID lifecycle but redeems `assurance: 'standard'` — `'strong'` requires hardware attestation plus a user-verified (UV) assertion.
+- **BLOCKED — scripted Zoe ID caps at `'standard'`.** Registration now asks the authenticator for an attestation (`attestation: 'direct'`) and verifies it: a `packed`/`apple` x5c chain reaching an embedded FIDO root (Apple, Yubico) marks the credential `hardwareBacked`; `fmt 'none'`, self-attestation, and chains that don't reach a known root (Chrome/Android software keys emit self-signed leaves) still register but stay software. A generated P-256 keypair completes the whole Zoe ID lifecycle but redeems `assurance: 'standard'` — `'strong'` requires hardware attestation plus a user-verified (UV) assertion.
 - **BLOCKED — type coercion.** Payload field types are asserted (`typeof === 'number'`), not coerced — `"2400"` as a string is now a 400.
 - **INFO — session farming closed.** Anonymous requests mint memory-only sessions; a row is persisted only when the session gains real state (challenge, credential, token).
 - **BLOCKED — token double-redeem** across `/api/protected-action` + `/api/verify` (one wins, one 409s).

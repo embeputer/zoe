@@ -497,7 +497,9 @@ async function main() {
         const { redeem } = await authAssurance(cred.rawId, cred.privateKey);
         assert.strictEqual(redeem.body.assurance, 'strong');
 
-        // A self-signed leaf that chains to no known root must be rejected outright.
+        // A well-formed chain that reaches no known root isn't an error — it
+        // registers like self-attestation and stays 'standard' (software keys
+        // like Chrome/Android emit self-signed leaves by design).
         run(['req', '-x509', '-new', '-key', 'leaf.key', '-out', 'bad.pem', '-subj', '/CN=Mallory', '-days', '2']);
         const badDer = execFileSync('openssl', ['x509', '-in', 'bad.pem', '-outform', 'DER'], { cwd: dir });
         const cred2 = newCred();
@@ -509,7 +511,21 @@ async function main() {
             x5c: [badDer],
           }), authData2),
         }));
-        assert.strictEqual(badVerify.res.status, 400);
+        assert.strictEqual(badVerify.res.status, 201);
+        const { redeem: badRedeem } = await authAssurance(cred2.rawId, cred2.privateKey);
+        assert.strictEqual(badRedeem.body.assurance, 'standard');
+
+        // But a garbage cert inside x5c is malformed, not merely untrusted.
+        const cred3 = newCred();
+        const authData3 = attAuthData(Buffer.from(cred3.rawId, 'base64url'), spkiToCose(cred3.spki));
+        const { verify: malformedVerify } = await registerWith(cred3.rawId, cred3.spki, (clientDataJSON) => ({
+          attestationObject: attestationObjectFor('packed', cborEncode({
+            alg: -7,
+            sig: crypto.sign('SHA256', Buffer.concat([authData3, crypto.createHash('sha256').update(clientDataJSON).digest()]), leafKey),
+            x5c: [Buffer.from('this is not a certificate')],
+          }), authData3),
+        }));
+        assert.strictEqual(malformedVerify.res.status, 400);
       } finally {
         if (savedRoots === undefined) delete process.env.ZOE_FIDO_ROOT_PEMS;
         else process.env.ZOE_FIDO_ROOT_PEMS = savedRoots;
