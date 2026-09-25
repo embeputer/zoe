@@ -108,12 +108,12 @@ const PULSE_LOBE_BINS = 5;
 // a clean injected sine concentrates ~everything. Both bounds reject fakes.
 const PULSE_LOBE_FRACTION_MIN = 0.45;
 const PULSE_LOBE_FRACTION_MAX = 0.97;
-const PASSKEY_CHALLENGE_TTL_MS = 2 * 60 * 1000;
+const PASSKEY_CHALLENGE_TTL_MS = 10 * 60 * 1000;
 const APP_NAME = 'Zoe';
 const COOKIE_NAME = 'zoe_sid';
 
 function resolveSecret() {
-  const fromEnv = process.env.ZOE_SECRET || process.env.REALHANDS_SECRET;
+  const fromEnv = process.env.ZOE_SECRET;
   if (fromEnv) return fromEnv;
   if (REQUIRE_SECRET) {
     console.error('ZOE_SECRET is required when NODE_ENV=production or ZOE_REQUIRE_SECRET=1.');
@@ -172,6 +172,12 @@ db.exec(`
     digest TEXT PRIMARY KEY,
     used_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS issued_tokens (
+    digest TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    exp INTEGER NOT NULL
+  );
 `);
 try {
   db.exec('ALTER TABLE credentials ADD COLUMN hardware_backed INTEGER NOT NULL DEFAULT 0');
@@ -186,8 +192,8 @@ for (const row of db.prepare('SELECT id, created_at, last_seen_at FROM sessions'
     lastSeenAt: row.last_seen_at,
     issuedTokens: new Map(),
     credentials: new Map(),
-    passkeyRegisterChallenge: null,
-    passkeyAuthChallenge: null,
+    passkeyRegisterChallenges: new Map(),
+    passkeyAuthChallenges: new Map(),
     livenessChallenge: null,
     persisted: true,
   });
@@ -212,9 +218,14 @@ for (const row of db.prepare('SELECT digest FROM used_tokens').all()) {
 const persistSessionStmt = db.prepare('INSERT OR REPLACE INTO sessions (id, created_at, last_seen_at) VALUES (?, ?, ?)');
 const persistCredentialStmt = db.prepare('INSERT OR REPLACE INTO credentials (session_id, id, public_key, alg, sign_count, created_at, hardware_backed) VALUES (?, ?, ?, ?, ?, ?, ?)');
 const persistUsedTokenStmt = db.prepare('INSERT OR IGNORE INTO used_tokens (digest, used_at) VALUES (?, ?)');
+const persistIssuedTokenStmt = db.prepare('INSERT OR REPLACE INTO issued_tokens (digest, session_id, payload_json, exp) VALUES (?, ?, ?, ?)');
+const getIssuedTokenStmt = db.prepare('SELECT session_id, payload_json, exp FROM issued_tokens WHERE digest = ?');
+const deleteIssuedTokenStmt = db.prepare('DELETE FROM issued_tokens WHERE digest = ?');
 const deleteSessionStmt = db.prepare('DELETE FROM sessions WHERE id = ?');
 const deleteSessionCredentialsStmt = db.prepare('DELETE FROM credentials WHERE session_id = ?');
+const deleteSessionIssuedTokensStmt = db.prepare('DELETE FROM issued_tokens WHERE session_id = ?');
 const pruneUsedTokensStmt = db.prepare('DELETE FROM used_tokens WHERE used_at < ?');
+const pruneIssuedTokensStmt = db.prepare('DELETE FROM issued_tokens WHERE exp < ?');
 
 function persistSession(session) {
   persistSessionStmt.run(session.id, session.createdAt, session.lastSeenAt);
@@ -229,9 +240,37 @@ function persistUsedToken(digest) {
   persistUsedTokenStmt.run(digest, now());
 }
 
+// Issued-token digests persist so redemption survives a restart: the in-memory
+// session.issuedTokens map is the fast path, this table is the fallback when
+// the session entry was reloaded without its issued tokens.
+function persistIssuedToken(digest, sessionId, payload) {
+  persistIssuedTokenStmt.run(digest, sessionId, JSON.stringify(payload), payload.exp);
+}
+
+function getIssuedToken(digest) {
+  const row = getIssuedTokenStmt.get(digest);
+  if (!row) return null;
+  if (now() > row.exp) {
+    deleteIssuedToken(digest);
+    return null;
+  }
+  let payload = null;
+  try {
+    payload = JSON.parse(row.payload_json);
+  } catch {
+    payload = null;
+  }
+  return { sessionId: row.session_id, payload, exp: row.exp };
+}
+
+function deleteIssuedToken(digest) {
+  deleteIssuedTokenStmt.run(digest);
+}
+
 function deletePersistedSession(sessionId) {
   deleteSessionStmt.run(sessionId);
   deleteSessionCredentialsStmt.run(sessionId);
+  deleteSessionIssuedTokensStmt.run(sessionId);
 }
 
 function now() {
@@ -340,6 +379,13 @@ function sweepExpiredState(force = false) {
   }
 
   pruneUsedTokensStmt.run(t - TOKEN_TTL_MS);
+  pruneIssuedTokensStmt.run(t);
+  for (const [ip, bucket] of rateLimitByIp) {
+    if (t >= bucket.resetAt) rateLimitByIp.delete(ip);
+  }
+  for (const [sid, bucket] of rateLimitBySession) {
+    if (t >= bucket.resetAt) rateLimitBySession.delete(sid);
+  }
   for (const [sid, session] of sessions) {
     if (t - session.lastSeenAt > SESSION_IDLE_TTL_MS) {
       sessions.delete(sid);
@@ -349,11 +395,11 @@ function sweepExpiredState(force = false) {
     for (const [digest, payload] of session.issuedTokens) {
       if (t > payload.exp) session.issuedTokens.delete(digest);
     }
-    if (session.passkeyRegisterChallenge && t - session.passkeyRegisterChallenge.createdAt > PASSKEY_CHALLENGE_TTL_MS) {
-      session.passkeyRegisterChallenge = null;
+    for (const [challenge, pending] of session.passkeyRegisterChallenges) {
+      if (t - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) session.passkeyRegisterChallenges.delete(challenge);
     }
-    if (session.passkeyAuthChallenge && t - session.passkeyAuthChallenge.createdAt > PASSKEY_CHALLENGE_TTL_MS) {
-      session.passkeyAuthChallenge = null;
+    for (const [challenge, pending] of session.passkeyAuthChallenges) {
+      if (t - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) session.passkeyAuthChallenges.delete(challenge);
     }
     if (session.livenessChallenge && t > session.livenessChallenge.expiresAt) {
       session.livenessChallenge = null;
@@ -361,7 +407,7 @@ function sweepExpiredState(force = false) {
   }
 }
 
-function enforcePostSecurity(req, res, pathname, session) {
+function enforcePostSecurity(req, res, pathname, sessionId) {
   if (req.method !== 'POST' || !STATE_CHANGING_POST_PATHS.has(pathname)) return true;
 
   // /api/verify is the relying-party redemption endpoint: the caller is a
@@ -374,7 +420,7 @@ function enforcePostSecurity(req, res, pathname, session) {
     return false;
   }
 
-  const rateLimit = checkRateLimit(clientIp(req), session.id);
+  const rateLimit = checkRateLimit(clientIp(req), sessionId);
   if (rateLimit.limited) {
     sendJson(res, 429, {
       error: 'Too many requests. Please slow down and try again.',
@@ -422,7 +468,11 @@ function parseCookies(header = '') {
   for (const part of header.split(';')) {
     const [rawName, ...rawValue] = part.trim().split('=');
     if (!rawName || !rawValue.length) continue;
-    out.set(rawName, decodeURIComponent(rawValue.join('=')));
+    try {
+      out.set(rawName, decodeURIComponent(rawValue.join('=')));
+    } catch {
+      // Skip malformed percent-encoding instead of throwing.
+    }
   }
   return out;
 }
@@ -438,12 +488,12 @@ function getSession(req, res) {
       lastSeenAt: now(),
       issuedTokens: new Map(),
       credentials: new Map(),
-      passkeyRegisterChallenge: null,
-      passkeyAuthChallenge: null,
+      passkeyRegisterChallenges: new Map(),
+      passkeyAuthChallenges: new Map(),
       livenessChallenge: null,
       persisted: false,
     });
-    res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`);
+    res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secureCookieSuffix(req)}`);
   } else {
     const session = sessions.get(sid);
     session.lastSeenAt = now();
@@ -452,6 +502,12 @@ function getSession(req, res) {
     if (session.persisted) persistSession(session);
   }
   return sessions.get(sid);
+}
+
+function secureCookieSuffix(req) {
+  const forwardedHttps = req.headers['x-forwarded-proto'] === 'https';
+  const tlsSocket = Boolean(req.socket && req.socket.encrypted);
+  return forwardedHttps || tlsSocket || process.env.ZOE_SECURE_COOKIES === '1' ? '; Secure' : '';
 }
 
 function securityHeaders(res) {
@@ -1035,10 +1091,11 @@ function validateLivenessPhases(phases, plan, { legacy = false } = {}) {
 function issueVerificationToken(session, source, method = 'gesture', assurance = 'standard') {
   persistSession(session);
   const iat = now();
+  // The payload is RP-visible: no session id or challenge id — binding stays
+  // server-side via issuedTokens/issued_tokens, so a token can't link the
+  // live zoe_sid cookie or a stable credential/challenge across relying parties.
   const payload = {
     type: 'zoe.verification',
-    sid: session.id,
-    challengeId: source.id,
     action: 'demo.protected-action',
     method,
     assurance,
@@ -1047,14 +1104,15 @@ function issueVerificationToken(session, source, method = 'gesture', assurance =
     exp: iat + TOKEN_TTL_MS,
   };
   const token = signPayload(payload);
-  session.issuedTokens.set(crypto.createHash('sha256').update(token).digest('base64url'), payload);
+  const digest = crypto.createHash('sha256').update(token).digest('base64url');
+  session.issuedTokens.set(digest, payload);
+  persistIssuedToken(digest, session.id, payload);
   return token;
 }
 
 function consumeVerificationToken(session, token, allowed) {
   const payload = verifySignedPayload(token);
   if (!payload || payload.type !== 'zoe.verification') return { error: 'Invalid verification token.' };
-  if (payload.sid !== session.id) return { error: 'Token is not bound to this session.', status: 403 };
   if (payload.action !== 'demo.protected-action') return { error: 'Token is not valid for this action.', status: 403 };
   if (now() > payload.exp) return { error: 'Verification token expired.' };
 
@@ -1065,11 +1123,19 @@ function consumeVerificationToken(session, token, allowed) {
 
   const digest = crypto.createHash('sha256').update(token).digest('base64url');
   if (usedTokenDigests.has(digest)) return { error: 'Verification token was already used.', status: 409 };
-  if (!session.issuedTokens.has(digest)) return { error: 'Token was not issued to this session.', status: 403 };
+  // Session binding is server-side: the digest must have been issued to this
+  // session (in-memory fast path, durable table after a restart).
+  const issued = session.issuedTokens.has(digest)
+    ? { sessionId: session.id }
+    : getIssuedToken(digest);
+  if (!issued || issued.sessionId !== session.id) {
+    return { error: 'Token is not bound to this session.', status: 403 };
+  }
 
   usedTokenDigests.add(digest);
   persistUsedToken(digest);
   session.issuedTokens.delete(digest);
+  deleteIssuedToken(digest);
   return { payload };
 }
 
@@ -1077,6 +1143,17 @@ function decodeCredentialPart(value) {
   if (typeof value !== 'string') return null;
   try {
     return Buffer.from(value, 'base64url');
+  } catch {
+    return null;
+  }
+}
+
+function presentedClientChallenge(value) {
+  const bytes = decodeCredentialPart(value);
+  if (!bytes) return null;
+  try {
+    const challenge = JSON.parse(bytes.toString('utf8')).challenge;
+    return typeof challenge === 'string' && challenge ? challenge : null;
   } catch {
     return null;
   }
@@ -1423,6 +1500,19 @@ function verifyAttestation(attestationObjectB64, clientDataJSONBytes, origin, ex
     }
   } else if (fmt === 'apple') {
     const x5c = Array.isArray(attStmt && attStmt.x5c) ? attStmt.x5c : [];
+    const sig = attStmt && attStmt.sig;
+    if (!Buffer.isBuffer(sig)) {
+      return { error: 'Passkey attestation signature did not verify.' };
+    }
+    let leaf;
+    try {
+      leaf = new crypto.X509Certificate(x5c[0]);
+    } catch {
+      return { error: 'Passkey attestation certificate is malformed.' };
+    }
+    if (!verifyAttestationSignature(attStmt && attStmt.alg, signedData, leaf.publicKey, sig)) {
+      return { error: 'Passkey attestation signature did not verify.' };
+    }
     hardwareBacked = appleAttestationBacked(x5c, credential, signedData);
   } else if (fmt !== 'none') {
     return { error: 'Passkey attestation format is not supported.' };
@@ -1439,11 +1529,25 @@ function verifyAttestation(attestationObjectB64, clientDataJSONBytes, origin, ex
 
 async function handleApi(req, res, pathname, services = {}) {
   sweepExpiredState();
-  const session = getSession(req, res);
-  if (!enforcePostSecurity(req, res, pathname, session)) return;
+  // Sessions mint lazily: endpoints that need session state call session(),
+  // while non-session endpoints (e.g. /api/verify) never mint a cookie.
+  let requestSession = null;
+  const session = () => {
+    if (!requestSession) requestSession = getSession(req, res);
+    return requestSession;
+  };
+  // Rate limiting uses the already-established session id when the cookie maps
+  // to a live session; otherwise it falls back to per-IP limiting — it must
+  // never mint a session of its own.
+  const rateLimitSessionId = () => {
+    const sid = parseCookies(req.headers.cookie).get(COOKIE_NAME);
+    const existing = sid ? sessions.get(sid) : null;
+    return existing ? existing.id : null;
+  };
+  if (!enforcePostSecurity(req, res, pathname, rateLimitSessionId())) return;
 
   if (req.method === 'POST' && pathname === '/api/challenge') {
-    const challenge = createChallenge(session);
+    const challenge = createChallenge(session());
     return sendJson(res, 201, {
       challengeId: challenge.id,
       totalSteps: challenge.steps.length,
@@ -1461,7 +1565,7 @@ async function handleApi(req, res, pathname, services = {}) {
     }
 
     const challenge = challenges.get(body.challengeId);
-    if (!challenge || challenge.sessionId !== session.id) return sendJson(res, 404, { error: 'Unknown challenge.' });
+    if (!challenge || challenge.sessionId !== session().id) return sendJson(res, 404, { error: 'Unknown challenge.' });
     if (challenge.consumedAt) return sendJson(res, 409, { error: 'Challenge was already consumed.' });
     if (now() > challenge.expiresAt) return sendJson(res, 410, { error: 'Challenge expired.' });
 
@@ -1480,7 +1584,7 @@ async function handleApi(req, res, pathname, services = {}) {
       challenge.consumedAt = now();
       return sendJson(res, 200, {
         verified: true,
-        verificationToken: issueVerificationToken(session, challenge, 'gesture', 'standard'),
+        verificationToken: issueVerificationToken(session(), challenge, 'gesture', 'standard'),
         tokenExpiresAt: now() + TOKEN_TTL_MS,
       });
     }
@@ -1503,7 +1607,7 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const gate = consumeVerificationToken(session, body.registrationVerificationToken, {
+    const gate = consumeVerificationToken(session(), body.registrationVerificationToken, {
       methods: ['gesture', 'face-motion'],
       assurances: ['standard'],
     });
@@ -1513,14 +1617,14 @@ async function handleApi(req, res, pathname, services = {}) {
     }
 
     const challenge = randomId(32);
-    session.passkeyRegisterChallenge = { challenge, createdAt: now(), verifiedBy: gate.payload.method };
-    persistSession(session);
+    session().passkeyRegisterChallenges.set(challenge, { createdAt: now(), verifiedBy: gate.payload.method });
+    persistSession(session());
     return sendJson(res, 200, {
       challenge,
       rp: { name: APP_NAME },
       user: {
-        id: session.id,
-        name: `zoe-${session.id.slice(0, 8)}`,
+        id: session().id,
+        name: `zoe-${session().id.slice(0, 8)}`,
         displayName: 'Zoe user',
       },
       pubKeyCredParams: [
@@ -1533,7 +1637,7 @@ async function handleApi(req, res, pathname, services = {}) {
         residentKey: 'preferred',
         userVerification: 'preferred',
       },
-      excludeCredentials: Array.from(session.credentials.keys()).map((id) => ({ type: 'public-key', id })),
+      excludeCredentials: Array.from(session().credentials.keys()).map((id) => ({ type: 'public-key', id })),
     });
   }
 
@@ -1541,8 +1645,8 @@ async function handleApi(req, res, pathname, services = {}) {
     // Demo-only escape hatch for local testing. Registration no longer calls this:
     // users must verify before adding a new Zoe ID passkey, and existing passkeys
     // are preserved instead of being silently cleared.
-    session.passkeyRegisterChallenge = null;
-    session.passkeyAuthChallenge = null;
+    session().passkeyRegisterChallenges.clear();
+    session().passkeyAuthChallenges.clear();
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1554,9 +1658,14 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const pending = session.passkeyRegisterChallenge;
-    if (!pending || now() - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) return sendJson(res, 410, { error: 'Passkey registration expired.' });
-    const client = parseClientData(body.clientDataJSON, 'webauthn.create', pending.challenge);
+    const registerChallenge = presentedClientChallenge(body.clientDataJSON);
+    const pending = registerChallenge ? session().passkeyRegisterChallenges.get(registerChallenge) : null;
+    if (!pending) return sendJson(res, 410, { error: 'Passkey registration expired.' });
+    if (now() - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) {
+      session().passkeyRegisterChallenges.delete(registerChallenge);
+      return sendJson(res, 410, { error: 'Passkey registration expired.' });
+    }
+    const client = parseClientData(body.clientDataJSON, 'webauthn.create', registerChallenge);
     if (!client) return sendJson(res, 400, { error: 'Passkey registration challenge did not verify.' });
 
     const rawId = typeof body.rawId === 'string' ? body.rawId : null;
@@ -1575,7 +1684,7 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: 'Browser did not provide a usable passkey public key.' });
     }
 
-    session.credentials.set(rawId, {
+    session().credentials.set(rawId, {
       id: rawId,
       publicKey,
       alg,
@@ -1583,22 +1692,22 @@ async function handleApi(req, res, pathname, services = {}) {
       createdAt: now(),
       hardwareBacked,
     });
-    persistSession(session);
-    persistCredential(session.id, session.credentials.get(rawId));
-    session.passkeyRegisterChallenge = null;
+    persistSession(session());
+    persistCredential(session().id, session().credentials.get(rawId));
+    session().passkeyRegisterChallenges.delete(registerChallenge);
     return sendJson(res, 201, { ok: true, credentialId: rawId });
   }
 
   if (req.method === 'POST' && pathname === '/api/passkey/auth/options') {
-    if (!session.credentials.size) return sendJson(res, 409, { error: 'No passkey is registered in this session yet.' });
+    if (!session().credentials.size) return sendJson(res, 409, { error: 'No passkey is registered in this session() yet.' });
     const challenge = randomId(32);
-    session.passkeyAuthChallenge = { challenge, createdAt: now() };
-    persistSession(session);
+    session().passkeyAuthChallenges.set(challenge, { createdAt: now() });
+    persistSession(session());
     return sendJson(res, 200, {
       challenge,
       timeout: 60000,
       userVerification: 'preferred',
-      allowCredentials: Array.from(session.credentials.keys()).map((id) => ({ type: 'public-key', id })),
+      allowCredentials: Array.from(session().credentials.keys()).map((id) => ({ type: 'public-key', id })),
     });
   }
 
@@ -1610,12 +1719,17 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const pending = session.passkeyAuthChallenge;
-    if (!pending || now() - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) return sendJson(res, 410, { error: 'Passkey challenge expired.' });
-    const credential = session.credentials.get(body.rawId);
+    const authChallenge = presentedClientChallenge(body.clientDataJSON);
+    const pending = authChallenge ? session().passkeyAuthChallenges.get(authChallenge) : null;
+    if (!pending) return sendJson(res, 410, { error: 'Passkey challenge expired.' });
+    if (now() - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) {
+      session().passkeyAuthChallenges.delete(authChallenge);
+      return sendJson(res, 410, { error: 'Passkey challenge expired.' });
+    }
+    const credential = session().credentials.get(body.rawId);
     if (!credential) return sendJson(res, 404, { error: 'Unknown passkey credential.' });
 
-    const client = parseClientData(body.clientDataJSON, 'webauthn.get', pending.challenge);
+    const client = parseClientData(body.clientDataJSON, 'webauthn.get', authChallenge);
     const authenticatorData = decodeCredentialPart(body.authenticatorData);
     const signature = decodeCredentialPart(body.signature);
     if (!client || !authenticatorData || !signature) return sendJson(res, 400, { error: 'Passkey response was incomplete.' });
@@ -1633,13 +1747,13 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 401, { error: 'Passkey replay was detected.' });
     }
     credential.signCount = signCount || credential.signCount;
-    persistCredential(session.id, credential);
-    session.passkeyAuthChallenge = null;
+    persistCredential(session().id, credential);
+    session().passkeyAuthChallenges.delete(authChallenge);
     // 'strong' requires a real authenticator: verified hardware attestation at
     // registration AND user verification on this assertion. Software keys and
     // fmt:'none' credentials cap at 'standard'.
     const assurance = credential.hardwareBacked && authData.userVerified ? 'strong' : 'standard';
-    const token = issueVerificationToken(session, { id: `passkey:${credential.id}` }, 'passkey', assurance);
+    const token = issueVerificationToken(session(), { id: `passkey:${credential.id}` }, 'passkey', assurance);
     return sendJson(res, 200, { verified: true, verificationToken: token, tokenExpiresAt: now() + TOKEN_TTL_MS });
   }
 
@@ -1654,7 +1768,7 @@ async function handleApi(req, res, pathname, services = {}) {
     const challengeId = randomId();
     const plan = createLivenessPlan();
     const flashPlan = challengeBody.reducedMotion === true ? null : createFlashPlan();
-    session.livenessChallenge = {
+    session().livenessChallenge = {
       id: challengeId,
       plan,
       flashPlan,
@@ -1664,12 +1778,12 @@ async function handleApi(req, res, pathname, services = {}) {
       consumedAt: null,
       seriesDigests: new Set(),
     };
-    persistSession(session);
+    persistSession(session());
     return sendJson(res, 201, {
       challengeId,
       plan,
       flashPlan,
-      expiresAt: session.livenessChallenge.expiresAt,
+      expiresAt: session().livenessChallenge.expiresAt,
     });
   }
 
@@ -1681,7 +1795,7 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const pending = session.livenessChallenge;
+    const pending = session().livenessChallenge;
     if (!pending || body.challengeId !== pending.id) {
       return sendJson(res, 400, { error: 'Face liveness challenge is missing or invalid.' });
     }
@@ -1741,7 +1855,7 @@ async function handleApi(req, res, pathname, services = {}) {
       pending.mediaAttempts = (pending.mediaAttempts || 0) + 1;
       if (pending.mediaAttempts > 3) {
         pending.consumedAt = now();
-        session.livenessChallenge = null;
+        session().livenessChallenge = null;
         return sendJson(res, 429, { error: 'Too many camera media attempts on this challenge.' });
       }
       try {
@@ -1790,9 +1904,9 @@ async function handleApi(req, res, pathname, services = {}) {
     }
     pending.seriesDigests.add(seriesDigest);
     pending.consumedAt = now();
-    session.livenessChallenge = null;
+    session().livenessChallenge = null;
 
-    const token = issueVerificationToken(session, { id: `face:${pending.id}` }, 'face-motion', 'standard');
+    const token = issueVerificationToken(session(), { id: `face:${pending.id}` }, 'face-motion', 'standard');
     return sendJson(res, 200, {
       verified: true,
       verificationToken: token,
@@ -1819,8 +1933,14 @@ async function handleApi(req, res, pathname, services = {}) {
 
     usedTokenDigests.add(digest);
     persistUsedToken(digest);
-    const issuingSession = sessions.get(payload.sid);
-    if (issuingSession) issuingSession.issuedTokens.delete(digest);
+    // The payload no longer carries the session id: resolve the issuer through
+    // the persisted issued-token digest so the pending entry is released too.
+    const issued = getIssuedToken(digest);
+    if (issued) {
+      const issuingSession = sessions.get(issued.sessionId);
+      if (issuingSession) issuingSession.issuedTokens.delete(digest);
+      deleteIssuedToken(digest);
+    }
 
     return sendJson(res, 200, {
       valid: true,
@@ -1839,7 +1959,7 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const gate = consumeVerificationToken(session, body.verificationToken);
+    const gate = consumeVerificationToken(session(), body.verificationToken);
     if (gate.error) {
       logVerificationFailure('protected_action_gate', pathname);
       return sendJson(res, gate.status || 401, { error: gate.error });
@@ -1875,7 +1995,8 @@ function serveStatic(req, res, pathname) {
     return res.end('Not found');
   }
   const filePath = path.resolve(__dirname, `.${requested}`);
-  if (!filePath.startsWith(__dirname)) {
+  const rel = path.relative(__dirname, filePath);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
     securityHeaders(res);
     res.writeHead(404);
     return res.end('Not found');
@@ -1917,6 +2038,7 @@ if (require.main === module) {
 
 module.exports = {
   createServer,
+  sessions,
   checkRateLimit,
   resetRateLimitState,
   validateStateChangingOrigin,
