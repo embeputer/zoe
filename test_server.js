@@ -230,9 +230,20 @@ async function main() {
   const exposurePlan = createFlashPlan();
   assert.strictEqual(validatePixelSeries(samplePixelSeries(exposurePlan, 0.35), exposurePlan), null);
 
+  // One-shot hold set by the concurrent-verify test: the analyzer signals
+  // `entered` then blocks on `gate`, so the racing second request provably
+  // lands while the first is still inside presentation analysis.
+  let analysisHold = null;
   const server = createServer({
     analyzePresentationFrames: async (frames) => {
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (analysisHold) {
+        const hold = analysisHold;
+        analysisHold = null;
+        hold.entered();
+        await hold.gate;
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
       return {
         real: frames.every((frame) => frame.face[0] !== 0.36),
         medianScore: 1,
@@ -323,11 +334,26 @@ async function main() {
     const raceBodyB = livenessBody(raceChallenge.body.challengeId, raceChallenge.body.plan, raceChallenge.body.flashPlan, {
       motionSeries: raceSeriesB,
     });
-    const [raceA, raceB] = await Promise.all([
-      request(baseUrl, '/api/liveness/verify', { method: 'POST', body: JSON.stringify(raceBodyA) }, cookie),
-      request(baseUrl, '/api/liveness/verify', { method: 'POST', body: JSON.stringify(raceBodyB) }, cookie),
-    ]);
-    assert.deepStrictEqual([raceA.res.status, raceB.res.status].sort(), [200, 409]);
+    // The winner blocks inside the analyzer until the loser has answered —
+    // the second request must observe `verifying` and 409 deterministically.
+    let releaseAnalysis;
+    let analysisEntered;
+    const analysisGate = new Promise((resolve) => { releaseAnalysis = resolve; });
+    const entered = new Promise((resolve) => { analysisEntered = resolve; });
+    analysisHold = { entered: analysisEntered, gate: analysisGate };
+    const racePromiseA = request(baseUrl, '/api/liveness/verify', { method: 'POST', body: JSON.stringify(raceBodyA) }, cookie);
+    try {
+      await Promise.race([
+        entered,
+        new Promise((resolve, reject) => setTimeout(() => reject(new Error('first race verify never reached presentation analysis')), 5000)),
+      ]);
+      const raceB = await request(baseUrl, '/api/liveness/verify', { method: 'POST', body: JSON.stringify(raceBodyB) }, cookie);
+      assert.strictEqual(raceB.res.status, 409);
+    } finally {
+      releaseAnalysis();
+    }
+    const raceA = await racePromiseA;
+    assert.strictEqual(raceA.res.status, 200);
 
     // PAD analysis is capped per challenge: three media rejections, then 429
     // and the challenge is consumed.
