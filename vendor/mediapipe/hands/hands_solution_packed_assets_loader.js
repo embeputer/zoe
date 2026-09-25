@@ -133,7 +133,7 @@ Module['FS_createPath']("/third_party/mediapipe/modules", "palm_detection", true
         },
         finish: function(byteArray) {
           var that = this;
-          
+
           Module['FS_createPreloadedFile'](this.name, null, byteArray, true, true, function() {
             Module['removeRunDependency']('fp ' + that.name);
           }, function() {
