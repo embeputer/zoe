@@ -505,6 +505,14 @@ h1 {
   pointer-events: auto;
 }
 
+.captcha-card.success-mode .flow-progress {
+  visibility: hidden;
+}
+
+.captcha-card.success-mode footer {
+  display: none;
+}
+
 .verification-head {
   display: flex;
   align-items: center;
@@ -821,12 +829,11 @@ button.ghost:hover {
 }
 
 .verified {
+  position: relative;
   margin-top: 18px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  text-align: center;
-  gap: 12px;
+  display: block;
+  min-height: 172px;
+  text-align: left;
   padding: 30px 20px;
   background: var(--success-soft);
   border: 1px solid #c6ead3;
@@ -834,6 +841,9 @@ button.ghost:hover {
 }
 
 .verified-icon {
+  position: absolute;
+  left: 50%;
+  top: 50%;
   width: 64px;
   height: 64px;
   border-radius: 50%;
@@ -843,19 +853,47 @@ button.ghost:hover {
   color: #fff;
   flex-shrink: 0;
   box-shadow: 0 8px 20px rgba(21, 138, 84, 0.3);
-  animation: verified-pop 0.45s cubic-bezier(0.2, 1.4, 0.4, 1) both;
+  transform: translate(-50%, -50%);
+  animation: verified-pop 0.35s cubic-bezier(0.2, 1.4, 0.4, 1) both;
+  transition: left 0.48s var(--screen-ease), transform 0.48s var(--screen-ease);
 }
 
 @keyframes verified-pop {
-  0% { transform: scale(0.4); opacity: 0; }
-  70% { transform: scale(1.12); }
-  100% { transform: scale(1); opacity: 1; }
+  0% { opacity: 0; scale: 0.55; }
+  70% { scale: 1.08; }
+  100% { opacity: 1; scale: 1; }
+}
+
+.verified-icon path {
+  stroke-dasharray: 30;
+  stroke-dashoffset: 30;
+  animation: verified-check-draw 0.45s 0.18s ease forwards;
+}
+
+@keyframes verified-check-draw {
+  to { stroke-dashoffset: 0; }
+}
+
+.verified.settled .verified-icon {
+  left: 20px;
+  transform: translate(0, -50%);
 }
 
 .verified-text {
+  min-height: 110px;
+  margin-left: 80px;
   display: flex;
   flex-direction: column;
+  justify-content: center;
   gap: 4px;
+  opacity: 0;
+  transform: translateX(14px);
+  transition: opacity 0.3s 0.18s ease, transform 0.45s 0.08s var(--screen-ease);
+}
+
+.verified.settled .verified-text {
+  opacity: 1;
+  transform: translateX(0);
 }
 
 .verified-text strong {
@@ -961,6 +999,17 @@ footer .lock-icon {
   button,
   .progress-bar {
     transition: none;
+  }
+
+  .verified-icon,
+  .verified-text {
+    animation: none;
+    transition: none;
+  }
+
+  .verified-icon path {
+    animation: none;
+    stroke-dashoffset: 0;
   }
 }
 

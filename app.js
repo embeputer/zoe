@@ -5,6 +5,8 @@
 const HOLD_FRAMES = 8;
 const COOLDOWN_MS = 1200;
 const FRAME_SAMPLE_MS = 33;
+const HOLD_MISMATCH_GRACE_FRAMES = 3;
+const HAND_POSE_CHANGE_MIN = 0.08;
 
 let stream = null;
 let handsModel = null;
@@ -33,6 +35,10 @@ let gestureMatchedAt = 0;
 let verificationToken = null;
 let noHandFrames = 0;
 let noMatchFrames = 0;
+let holdMismatchFrames = 0;
+let currentHandShape = null;
+let lastAcceptedHandShape = null;
+let awaitingHandPoseChange = false;
 let lastHelpMessageAt = 0;
 let selectedPrimaryMethod = 'hand';
 let zoeIdReturnTarget = 'choice';
@@ -122,14 +128,35 @@ function classifyGesture(lm) {
   const okDist = dist(lm[LM.thumbTip], lm[LM.indexTip]);
 
   if (index && middle && ring && pinky && thumb) return 'open_palm';
-  if (okDist < 0.05 && middle && ring && pinky) return 'ok';
+  if (okDist < 0.06 && [middle, ring, pinky].filter(Boolean).length >= 2) return 'ok';
   if (!thumb && index && !middle && !ring && pinky) return 'rock';
   if (!thumb && index && middle && ring && !pinky) return 'three';
   if (thumb && !index && !middle && !ring && pinky) return 'call_me';
   if (index && middle && !ring && !pinky) return 'peace';
   if (index && !middle && !ring && !pinky) return 'point';
-  if (!index && !middle && !ring && !pinky && !thumb) return 'fist';
+  const compactFist = [
+    [LM.indexTip, LM.indexPip],
+    [LM.middleTip, LM.middlePip],
+    [LM.ringTip, LM.ringPip],
+    [LM.pinkyTip, LM.pinkyPip],
+  ].every(([tip, pip]) => dist(lm[tip], lm[LM.wrist]) < dist(lm[pip], lm[LM.wrist]) * 1.12);
+  if (!index && !middle && !ring && !pinky && !thumb && compactFist) return 'fist';
   return null;
+}
+
+function normalizedHandShape(lm) {
+  const wrist = lm[LM.wrist];
+  const scale = Math.max(0.01, dist(wrist, lm[LM.middleMcp]));
+  return lm.map((point) => ({
+    x: (point.x - wrist.x) / scale,
+    y: (point.y - wrist.y) / scale,
+    z: ((point.z || 0) - (wrist.z || 0)) / scale,
+  }));
+}
+
+function handShapeDistance(a, b) {
+  if (!a || !b || a.length !== b.length) return Infinity;
+  return a.reduce((sum, point, index) => sum + dist(point, b[index]), 0) / a.length;
 }
 
 function detectTwoHandHeart(hands) {
@@ -354,6 +381,7 @@ function isMobileLayout() {
 
 const PANEL_TRANSITION_MS = 440;
 let panelTransitionTimer = null;
+let successSettleTimer = null;
 
 const FLOW_STEP_INDEX = { choice: 2, id: 2, verify: 3, success: 4 };
 
@@ -445,7 +473,12 @@ function showVerificationPanel(direction = 'forward') {
 
 function showSuccessPanel() {
   zoeVerifyBtn.disabled = true;
+  if (successSettleTimer) window.clearTimeout(successSettleTimer);
+  verifiedEl.classList.remove('settled');
   transitionToPanel(verifiedEl, 'success', null);
+  successSettleTimer = window.setTimeout(() => {
+    if (!verifiedEl.hidden) verifiedEl.classList.add('settled');
+  }, prefersReducedMotion() ? 0 : 850);
 }
 
 function showIntroPanel() {
@@ -530,6 +563,7 @@ function resetStepEvidence() {
   framesSinceStep = 0;
   noHandFrames = 0;
   noMatchFrames = 0;
+  holdMismatchFrames = 0;
   landmarkSamples = [];
   motionSamples = [];
   formingSamples = [];
@@ -716,6 +750,7 @@ async function buildEvidence() {
 async function submitCurrentStep() {
   if (submittingStep || !currentChallengeId || !currentStep) return;
   submittingStep = true;
+  const acceptedHandShape = currentHandShape;
   setStatus('Checking server...', 'cooldown');
 
   try {
@@ -740,6 +775,8 @@ async function submitCurrentStep() {
     }
 
     currentStep = result.step;
+    lastAcceptedHandShape = acceptedHandShape;
+    awaitingHandPoseChange = Boolean(lastAcceptedHandShape);
     cooldownUntil = performance.now() + COOLDOWN_MS;
     setTimeout(() => {
       showPrompt(currentStep);
@@ -791,6 +828,9 @@ async function startVerification() {
   verificationToken = null;
   cooldownUntil = 0;
   submittingStep = false;
+  currentHandShape = null;
+  lastAcceptedHandShape = null;
+  awaitingHandPoseChange = false;
 
   resetStepEvidence();
   hideCameraHelp();
@@ -830,6 +870,15 @@ function onResults(results) {
 
   framesSinceStep++;
   sampleMotion(lm);
+  currentHandShape = normalizedHandShape(lm);
+
+  if (awaitingHandPoseChange) {
+    if (handShapeDistance(currentHandShape, lastAcceptedHandShape) < HAND_POSE_CHANGE_MIN) {
+      setStatus('Change to the new pose', 'idle');
+      return;
+    }
+    awaitingHandPoseChange = false;
+  }
 
   let matched = false;
   let detectedGesture = null;
@@ -871,6 +920,7 @@ function onResults(results) {
       });
     }
     noMatchFrames = 0;
+    holdMismatchFrames = 0;
     holdCounter++;
     progressEl.style.width = `${Math.min(100, (holdCounter / HOLD_FRAMES) * 100)}%`;
     if (holdCounter >= HOLD_FRAMES) {
@@ -880,7 +930,14 @@ function onResults(results) {
     }
   } else {
     noMatchFrames++;
-    if (holdCounter > 0) failStep();
+    if (holdCounter > 0) {
+      holdMismatchFrames++;
+      if (holdMismatchFrames <= HOLD_MISMATCH_GRACE_FRAMES) {
+        setStatus(`Hold it... ${holdCounter}/${HOLD_FRAMES}`, 'listening');
+        return;
+      }
+      failStep();
+    }
     if (noMatchFrames > 90) {
       const message = currentStep.id === 'ily'
         ? 'For hand hearts, use both hands: touch both thumbs together and both index fingertips together.'
