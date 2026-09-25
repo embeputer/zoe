@@ -11,7 +11,7 @@ This is a plain Node/static app:
 - `index.html` is the single page.
 - `styles.css` is the complete UI styling.
 - `test_server.js` is the regression/security test suite.
-- `attack_server.js` is the adversarial harness: it submits fully fabricated evidence and reports which server checks a scripted client fools.
+- `attack_server.js` is the media-surface adversarial harness: it submits fully fabricated evidence and reports which server checks a scripted client fools. `attack_agent.js` is the API-level harness: protocol abuse plus a fully fabricated liveness body so probes reach the real pipeline. `npm run attack` runs both fail-fast. Both report tri-state — `FOOLED` / `BLOCKED at <stage>` / `NOT-PROBED` — and a probe killed upstream of its target must never count as `BLOCKED`.
 - `face_pad.js` validates bounded challenge-bound JPEG frames, independently detects face regions, and runs server-side presentation-attack analysis.
 - `debug.html`, `debug.js`, and `debug_metrics.js` form a disposable pulse/flash camera lab available only through `npm run debug`.
 
@@ -25,6 +25,7 @@ Use:
 npm start
 npm test
 npm run debug
+npm run attack
 ```
 
 The app must be served over the local server. Do not open `index.html` with `file://`.

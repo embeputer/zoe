@@ -7,7 +7,8 @@
     "start": "node server.js",
     "debug": "ZOE_DEBUG=1 PORT=3001 node server.js",
     "test": "node test_server.js && node test_debug_metrics.js",
-    "attack": "node attack_server.js",
+    "attack": "node attack_server.js && node attack_agent.js",
+    "attack:server": "node attack_server.js",
     "attack:agent": "node attack_agent.js"
   },
   "engines": {
