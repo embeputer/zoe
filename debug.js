@@ -19,12 +19,21 @@ const metrics = window.ZoeDebugMetrics;
 const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
 const TASKS_VISION_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
 const FACE_MODEL_URL = '/models/blaze_face_short_range.tflite';
+const FACE_BOX_SHIFT_X = -0.75;
+const FACE_BOX_SHIFT_Y = -0.55;
+const FACE_BOX_HEIGHT_SCALE = 1.02;
+const FLASH_CHROMA_COSINE_MIN = 0.6;
+const FLASH_CHROMA_RATIO_MIN = 0.025;
+const FLASH_CHROMA_RATIO_MAX = 2;
 const SAMPLE_INTERVAL_MS = 100;
 const PULSE_WINDOW_MS = 12000;
 const FLASH_COLORS = [
-  { name: 'Red', className: 'flash-red', rgb: [255, 72, 72] },
-  { name: 'Green', className: 'flash-green', rgb: [72, 255, 124] },
-  { name: 'Blue', className: 'flash-blue', rgb: [72, 120, 255] },
+  { name: 'Red', rgb: [255, 64, 64] },
+  { name: 'Blue', rgb: [64, 160, 255] },
+  { name: 'Green', rgb: [72, 220, 120] },
+  { name: 'Amber', rgb: [255, 190, 60] },
+  { name: 'Purple', rgb: [190, 110, 255] },
+  { name: 'Cyan', rgb: [60, 220, 220] },
 ];
 
 let detector = null;
@@ -38,6 +47,48 @@ let currentFlashSamples = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function pointToPixel(point, width, height) {
+  return {
+    x: point.x <= 1 ? point.x * width : point.x,
+    y: point.y <= 1 ? point.y * height : point.y,
+  };
+}
+
+function fitBoxToKeypoints(box, keypoints, frameWidth, frameHeight) {
+  const points = (keypoints || [])
+    .map((point) => pointToPixel(point, frameWidth, frameHeight))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (points.length < 3) return box;
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  const width = Math.min(frameWidth, Math.max(box.width, maxX - minX + box.width * 0.16));
+  const height = Math.min(frameHeight, Math.max(box.height, maxY - minY + box.height * 0.16));
+  const x = Math.min(Math.max(0, (minX + maxX - width) / 2), Math.max(0, frameWidth - width));
+  const y = Math.min(Math.max(0, (minY + maxY - height) / 2), Math.max(0, frameHeight - height));
+  return { ...box, x, y, width, height };
+}
+
+function calibratedFaceBox(box, keypoints) {
+  const frameWidth = video.videoWidth;
+  const frameHeight = video.videoHeight;
+  const width = box.width;
+  const height = box.height * FACE_BOX_HEIGHT_SCALE;
+  const x = box.x + box.width * FACE_BOX_SHIFT_X;
+  const y = box.y + box.height * FACE_BOX_SHIFT_Y;
+  return fitBoxToKeypoints({
+    x: Math.min(Math.max(0, x), Math.max(0, frameWidth - width)),
+    y: Math.min(Math.max(0, y), Math.max(0, frameHeight - height)),
+    width,
+    height,
+    score: box.score,
+  }, keypoints, frameWidth, frameHeight);
 }
 
 async function initDetector() {
@@ -67,7 +118,7 @@ function bestFace() {
       height: box.height,
       score,
     };
-    if (!best || candidate.score > best.score) best = candidate;
+    if (!best || candidate.score > best.score) best = calibratedFaceBox(candidate, detection.keypoints);
   }
   currentFace = best;
   return best;
@@ -94,7 +145,7 @@ function drawFace(face) {
   }
 }
 
-function faceRegionMean(face) {
+function cameraRegionMeans(face) {
   const width = video.videoWidth;
   const height = video.videoHeight;
   if (!width || !height || !face) return null;
@@ -103,20 +154,30 @@ function faceRegionMean(face) {
     sampleCanvas.height = height;
   }
   sampleContext.drawImage(video, 0, 0, width, height);
-  const x = Math.max(0, Math.round(face.x + face.width * 0.3));
-  const y = Math.max(0, Math.round(face.y + face.height * 0.12));
-  const roiWidth = Math.max(8, Math.min(width - x, Math.round(face.width * 0.4)));
-  const roiHeight = Math.max(8, Math.min(height - y, Math.round(face.height * 0.18)));
-  const pixels = sampleContext.getImageData(x, y, roiWidth, roiHeight).data;
-  const totals = [0, 0, 0];
-  let count = 0;
-  for (let index = 0; index < pixels.length; index += 16) {
-    totals[0] += pixels[index];
-    totals[1] += pixels[index + 1];
-    totals[2] += pixels[index + 2];
-    count += 1;
-  }
-  return totals.map((total) => total / Math.max(1, count));
+  const regionMean = (x, y, regionWidth, regionHeight) => {
+    const pixels = sampleContext.getImageData(x, y, regionWidth, regionHeight).data;
+    const totals = [0, 0, 0];
+    let count = 0;
+    for (let index = 0; index < pixels.length; index += 16) {
+      totals[0] += pixels[index];
+      totals[1] += pixels[index + 1];
+      totals[2] += pixels[index + 2];
+      count += 1;
+    }
+    return totals.map((total) => total / Math.max(1, count));
+  };
+  const pulseX = Math.max(0, Math.round(face.x + face.width * 0.3));
+  const pulseY = Math.max(0, Math.round(face.y + face.height * 0.12));
+  const pulseWidth = Math.max(8, Math.min(width - pulseX, Math.round(face.width * 0.4)));
+  const pulseHeight = Math.max(8, Math.min(height - pulseY, Math.round(face.height * 0.18)));
+  const flashWidth = Math.max(8, Math.min(width, Math.round(face.width * 1.2)));
+  const flashHeight = Math.max(8, Math.min(height, Math.round(face.height * 1.2)));
+  const flashX = Math.max(0, Math.min(Math.round(face.x + (face.width - flashWidth) / 2), width - flashWidth));
+  const flashY = Math.max(0, Math.min(Math.round(face.y + (face.height - flashHeight) / 2), height - flashHeight));
+  return {
+    pulse: regionMean(pulseX, pulseY, pulseWidth, pulseHeight),
+    flash: regionMean(flashX, flashY, flashWidth, flashHeight),
+  };
 }
 
 function renderPulse(now) {
@@ -145,10 +206,10 @@ function frame(now) {
   drawFace(face);
   faceStatus.textContent = face ? `${Math.round(face.score * 100)}% confidence` : 'No face found';
   if (face && now - lastSampleAt >= SAMPLE_INTERVAL_MS) {
-    const rgb = faceRegionMean(face);
-    if (rgb) {
-      pulseSamples.push({ t: now, g: rgb[1] });
-      if (currentFlashSamples) currentFlashSamples.push(rgb);
+    const regions = cameraRegionMeans(face);
+    if (regions) {
+      pulseSamples.push({ t: now, g: regions.pulse[1] });
+      if (currentFlashSamples) currentFlashSamples.push(regions.flash);
       lastSampleAt = now;
       renderPulse(now);
     }
@@ -207,11 +268,13 @@ async function runFlashTest() {
   const results = [];
   for (const color of FLASH_COLORS) {
     flashButton.textContent = `Testing ${color.name.toLowerCase()}`;
-    flashOverlay.className = color.className;
+    flashOverlay.style.background = `rgb(${color.rgb.join(',')})`;
+    flashOverlay.style.opacity = '0.85';
     flashOverlay.hidden = false;
     await sleep(150);
     const samples = await collectWindow(650);
     flashOverlay.hidden = true;
+    flashOverlay.style.opacity = '0';
     await sleep(450);
     results.push({ color, sampleCount: samples.length, result: metrics.flashMetrics(baselineSamples, samples, color.rgb) });
   }
@@ -219,13 +282,19 @@ async function runFlashTest() {
     const row = document.createElement('div');
     row.className = 'flash-row';
     const swatch = document.createElement('span');
-    swatch.className = `swatch ${color.className}`;
+    swatch.className = 'swatch';
+    swatch.style.background = `rgb(${color.rgb.join(',')})`;
     const name = document.createElement('span');
     name.textContent = `${color.name} (${sampleCount} samples)`;
     const value = document.createElement('strong');
-    value.textContent = result
-      ? `${Math.round(result.cosine * 100)}% direction / ${result.strength.toFixed(2)}× strength`
-      : 'No usable response';
+    if (result) {
+      const passes = result.cosine >= FLASH_CHROMA_COSINE_MIN
+        && result.strength >= FLASH_CHROMA_RATIO_MIN
+        && result.strength <= FLASH_CHROMA_RATIO_MAX;
+      value.textContent = `${passes ? 'Pass' : 'Below Zoe threshold'} · ${Math.round(result.cosine * 100)}% direction / ${result.strength.toFixed(2)}× strength`;
+    } else {
+      value.textContent = 'No usable response';
+    }
     row.append(swatch, name, value);
     return row;
   }));

@@ -243,6 +243,39 @@ async function main() {
     }, cookie);
     assert.strictEqual(missingMedia.res.status, 400);
 
+    const minimumMediaChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const minimumMediaFrames = sampleMediaFrames().slice(0, 3);
+    const minimumMedia = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(
+        minimumMediaChallenge.body.challengeId,
+        minimumMediaChallenge.body.plan,
+        minimumMediaChallenge.body.flashPlan,
+        {
+          mediaFrames: minimumMediaFrames,
+          mediaDigest: computePresentationDigest(minimumMediaChallenge.body.challengeId, minimumMediaFrames),
+        },
+      )),
+    }, cookie);
+    assert.strictEqual(minimumMedia.res.status, 200);
+
+    const sparseMediaChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const sparseMediaFrames = sampleMediaFrames().slice(0, 2);
+    const sparseMedia = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(
+        sparseMediaChallenge.body.challengeId,
+        sparseMediaChallenge.body.plan,
+        sparseMediaChallenge.body.flashPlan,
+        {
+          mediaFrames: sparseMediaFrames,
+          mediaDigest: computePresentationDigest(sparseMediaChallenge.body.challengeId, sparseMediaFrames),
+        },
+      )),
+    }, cookie);
+    assert.strictEqual(sparseMedia.res.status, 400);
+    assert.match(sparseMedia.body.error, /Camera media/);
+
     const spoofMediaChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
     const spoofMediaFrames = sampleMediaFrames().map((frame) => ({ ...frame, face: [0.36, 0.15, 0.3, 0.5] }));
     const spoofMedia = await request(baseUrl, '/api/liveness/verify', {
