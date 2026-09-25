@@ -230,8 +230,8 @@ async function initMediaPipe() {
 }
 
 // MediaPipe Tasks Vision: cross-browser face detection that runs under a strict
-// CSP (only needs 'wasm-unsafe-eval'). The WASM runtime loads from the CDN; the
-// model is vendored locally so no extra connect-src origin is required.
+// CSP (only needs 'wasm-unsafe-eval'). The runtime and WASM files are vendored
+// locally, and so is the model, so no extra connect-src origin is required.
 const TASKS_VISION_URL = '/vendor/mediapipe/tasks-vision/vision_bundle.mjs';
 const TASKS_VISION_WASM = '/vendor/mediapipe/tasks-vision/wasm';
 const FACE_DETECTOR_MODEL_URL = '/models/blaze_face_short_range.tflite';

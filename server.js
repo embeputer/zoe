@@ -464,7 +464,7 @@ function securityHeaders(res) {
   res.setHeader('Permissions-Policy', 'camera=(self), microphone=()');
   res.setHeader(
     'Content-Security-Policy',
-    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://cdn.jsdelivr.net; media-src 'self' blob:; worker-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
   );
 }
 
@@ -1996,22 +1996,43 @@ function contentType(filePath) {
   const ext = path.extname(filePath);
   if (ext === '.html') return 'text/html; charset=utf-8';
   if (ext === '.css') return 'text/css; charset=utf-8';
-  if (ext === '.js') return 'application/javascript; charset=utf-8';
+  if (ext === '.js' || ext === '.mjs') return 'application/javascript; charset=utf-8';
   if (ext === '.json') return 'application/json; charset=utf-8';
+  if (ext === '.wasm') return 'application/wasm';
   if (ext === '.tflite' || ext === '.task') return 'application/octet-stream';
   if (ext === '.png') return 'image/png';
   return 'application/octet-stream';
 }
 
 const STATIC_FILES = new Set([
-  '/index.html', '/styles.css', '/app.js', '/models/blaze_face_short_range.tflite',
+  '/index.html', '/styles.css', '/app.js', '/face_calib.js',
+  '/models/blaze_face_short_range.tflite',
 ]);
 const DEBUG_FILES = new Set(['/debug.html', '/debug.css', '/debug.js', '/debug_metrics.js']);
+const VENDOR_FILES = new Set([
+  '/vendor/mediapipe/hands/hands.js',
+  '/vendor/mediapipe/hands/hands.binarypb',
+  '/vendor/mediapipe/hands/hands_solution_packed_assets_loader.js',
+  '/vendor/mediapipe/hands/hands_solution_packed_assets.data',
+  '/vendor/mediapipe/hands/hands_solution_simd_wasm_bin.js',
+  '/vendor/mediapipe/hands/hands_solution_simd_wasm_bin.wasm',
+  '/vendor/mediapipe/hands/hands_solution_wasm_bin.js',
+  '/vendor/mediapipe/hands/hands_solution_wasm_bin.wasm',
+  '/vendor/mediapipe/hands/hand_landmark_full.tflite',
+  '/vendor/mediapipe/hands/hand_landmark_lite.tflite',
+  '/vendor/mediapipe/camera_utils/camera_utils.js',
+  '/vendor/mediapipe/drawing_utils/drawing_utils.js',
+  '/vendor/mediapipe/tasks-vision/vision_bundle.mjs',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_internal.js',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_internal.wasm',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_nosimd_internal.js',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_nosimd_internal.wasm',
+]);
 
 function serveStatic(req, res, pathname) {
   const requested = pathname === '/' ? '/index.html' : pathname;
   const debugAllowed = DEBUG_FILES.has(requested) && process.env.ZOE_DEBUG === '1';
-  if (!STATIC_FILES.has(requested) && !debugAllowed) {
+  if (!STATIC_FILES.has(requested) && !VENDOR_FILES.has(requested) && !debugAllowed) {
     securityHeaders(res);
     res.writeHead(404);
     return res.end('Not found');

@@ -16,8 +16,8 @@ const baseline = document.querySelector('#baseline');
 const flashResults = document.querySelector('#flash-results');
 
 const metrics = window.ZoeDebugMetrics;
-const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
-const TASKS_VISION_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
+const TASKS_VISION_URL = '/vendor/mediapipe/tasks-vision/vision_bundle.mjs';
+const TASKS_VISION_WASM = '/vendor/mediapipe/tasks-vision/wasm';
 const FACE_MODEL_URL = '/models/blaze_face_short_range.tflite';
 const FLASH_CHROMA_COSINE_MIN = 0.6;
 const FLASH_CHROMA_RATIO_MIN = 0.025;
