@@ -15,4 +15,5 @@ https://github.com/google-ai-edge/mediapipe/blob/master/LICENSE
 
 To update, download the matching npm tarballs (`npm pack @mediapipe/<name>@<version>`),
 replace the files here, and bump the versions in this table and in `index.html`,
-`app.js`, and `debug.js`.
+`app.js`, and `debug.js`. Keep the `VENDOR_FILES` set in `server.js` in sync —
+only paths listed there are served.

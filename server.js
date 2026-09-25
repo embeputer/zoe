@@ -1823,18 +1823,42 @@ function contentType(filePath) {
   return 'application/octet-stream';
 }
 
+const STATIC_FILES = new Set([
+  '/index.html', '/styles.css', '/app.js', '/face_calib.js',
+  '/models/blaze_face_short_range.tflite',
+]);
+const DEBUG_FILES = new Set(['/debug.html', '/debug.css', '/debug.js', '/debug_metrics.js']);
+const VENDOR_FILES = new Set([
+  '/vendor/mediapipe/hands/hands.js',
+  '/vendor/mediapipe/hands/hands.binarypb',
+  '/vendor/mediapipe/hands/hands_solution_packed_assets_loader.js',
+  '/vendor/mediapipe/hands/hands_solution_packed_assets.data',
+  '/vendor/mediapipe/hands/hands_solution_simd_wasm_bin.js',
+  '/vendor/mediapipe/hands/hands_solution_simd_wasm_bin.wasm',
+  '/vendor/mediapipe/hands/hands_solution_simd_wasm_bin.data',
+  '/vendor/mediapipe/hands/hands_solution_wasm_bin.js',
+  '/vendor/mediapipe/hands/hands_solution_wasm_bin.wasm',
+  '/vendor/mediapipe/hands/hand_landmark_full.tflite',
+  '/vendor/mediapipe/hands/hand_landmark_lite.tflite',
+  '/vendor/mediapipe/camera_utils/camera_utils.js',
+  '/vendor/mediapipe/drawing_utils/drawing_utils.js',
+  '/vendor/mediapipe/tasks-vision/vision_bundle.mjs',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_internal.js',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_internal.wasm',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_nosimd_internal.js',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_nosimd_internal.wasm',
+]);
+
 function serveStatic(req, res, pathname) {
   const requested = pathname === '/' ? '/index.html' : pathname;
-  if (
-    process.env.ZOE_DEBUG !== '1'
-    && ['/debug.html', '/debug.css', '/debug.js', '/debug_metrics.js'].includes(requested)
-  ) {
+  const debugAllowed = DEBUG_FILES.has(requested) && process.env.ZOE_DEBUG === '1';
+  if (!STATIC_FILES.has(requested) && !VENDOR_FILES.has(requested) && !debugAllowed) {
     securityHeaders(res);
     res.writeHead(404);
     return res.end('Not found');
   }
   const filePath = path.resolve(__dirname, `.${requested}`);
-  if (!filePath.startsWith(__dirname) || !['.html', '.css', '.js', '.mjs', '.wasm', '.data', '.binarypb', '.tflite', '.task', '.png'].includes(path.extname(filePath))) {
+  if (!filePath.startsWith(__dirname)) {
     securityHeaders(res);
     res.writeHead(404);
     return res.end('Not found');
