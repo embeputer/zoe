@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "test": "node test_server.js",
-    "attack": "node attack_server.js"
+    "attack": "node attack_server.js",
+    "attack:agent": "node attack_agent.js"
   },
   "engines": {
     "node": ">=22.5"

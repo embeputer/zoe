@@ -73,6 +73,20 @@ npm run attack
 
 `attack_server.js` spins up the real server and submits fully fabricated evidence — no camera, no MediaPipe — including synthesized pixel streams that match the issued flash sequence and pulse series with a physiologic-band spectral peak. It reports which checks a scripted client fools and documents the honest ceiling of client-side evidence: even pulse-checked, pixel-verified flash liveness stays forgeable by a script that synthesizes matching signals. Closing that hole needs server-side media verification (e.g. a PAD model on uploaded frames) or hardware attestation.
 
+```sh
+npm run attack:agent
+```
+
+`attack_agent.js` probes the API-level surface an autonomous agent sees — no media fabrication needed, just protocol abuse. Measured results:
+
+- **FOOLED — no wall-clock anywhere.** Every duration (`durationMs`, `pulseSeries.t`, `pixelSeries.t`, step `startedAt`/`matchedAt`) is client-claimed; the server only ever enforces TTL ceilings. A complete "20-second" liveness verification mints a token in ~40ms; the gesture flow in ~6ms. The cheapest meaningful fix is comparing `now() - challenge.createdAt` to claimed durations, which would also cap attempt rate to ~1 per real flow duration.
+- **FOOLED — Zoe ID is fully scriptable.** `attestation: 'none'` + register accepting any SPKI key means a generated P-256 keypair registers behind a forged liveness token, then authenticates with self-asserted UP|UV flags and mints a `'strong'`-assurance token. The highest-assurance path needs no human at all — closing it needs real attestation (packed/fido-u2f + AAGUID allowlist), not more statistics.
+- **FOOLED (nit) — type coercion.** `Number(body.durationMs)` accepts `"2400"` as a string; payload field types are never asserted, only coerced.
+- **INFO — session farming.** Every anonymous POST persists a session row in SQLite; capped by the per-IP limit but unbounded across IPs.
+- **BLOCKED — token double-redeem** across `/api/protected-action` + `/api/verify` (one wins, one 409s).
+- **BLOCKED — challenge binding.** Liveness challenges live in a per-session slot with unguessable ids; cross-session use and id guessing both 400.
+- **BLOCKED — rate limit.** First 429 lands at the 120/min IP cap; cookie rotation gains nothing, but distributed IPs bypass it and the per-session limiter ships disabled (`ZOE_RATE_LIMIT_MAX_PER_SESSION=0`).
+
 The regression test starts a temporary local HTTP server and checks that:
 
 - fake client-side verification is rejected
