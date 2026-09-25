@@ -101,6 +101,7 @@ Assurance on redeem: `hardwareBacked && userVerified` → `'strong'`; everything
 Zoe ID registration must be gated. Do not blindly create a passkey just because the user clicked register:
 
 - The user must first complete a fresh face or hand check.
+- The Zoe ID registration UI starts with face verification. Hand verification can still unlock registration when the user intentionally completes that fallback first.
 - `/api/passkey/register/options` requires `registrationVerificationToken`.
 - Only `gesture` and `face-motion` verification tokens with `standard` assurance may unlock registration.
 - Creating a passkey should not immediately act as proof of identity; future access uses `Use existing Zoe ID`.
