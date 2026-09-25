@@ -19,9 +19,6 @@ const metrics = window.ZoeDebugMetrics;
 const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
 const TASKS_VISION_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
 const FACE_MODEL_URL = '/models/blaze_face_short_range.tflite';
-const FACE_BOX_SHIFT_X = -0.75;
-const FACE_BOX_SHIFT_Y = -0.55;
-const FACE_BOX_HEIGHT_SCALE = 1.02;
 const FLASH_CHROMA_COSINE_MIN = 0.6;
 const FLASH_CHROMA_RATIO_MIN = 0.025;
 const FLASH_CHROMA_RATIO_MAX = 2;
@@ -78,15 +75,11 @@ function fitBoxToKeypoints(box, keypoints, frameWidth, frameHeight) {
 function calibratedFaceBox(box, keypoints) {
   const frameWidth = video.videoWidth;
   const frameHeight = video.videoHeight;
-  const width = box.width;
-  const height = box.height * FACE_BOX_HEIGHT_SCALE;
-  const x = box.x + box.width * FACE_BOX_SHIFT_X;
-  const y = box.y + box.height * FACE_BOX_SHIFT_Y;
   return fitBoxToKeypoints({
-    x: Math.min(Math.max(0, x), Math.max(0, frameWidth - width)),
-    y: Math.min(Math.max(0, y), Math.max(0, frameHeight - height)),
-    width,
-    height,
+    x: Math.min(Math.max(0, box.x), Math.max(0, frameWidth - box.width)),
+    y: Math.min(Math.max(0, box.y), Math.max(0, frameHeight - box.height)),
+    width: box.width,
+    height: box.height,
     score: box.score,
   }, keypoints, frameWidth, frameHeight);
 }

@@ -1232,9 +1232,6 @@ const FACE_MAX_ASPECT = 1.7;
 // tight: a real face should be in the oval, not down on the shoulder line.
 const FACE_OVAL_SCALE_X = 1.25;
 const FACE_OVAL_SCALE_Y = 0.95;
-const FACE_BOX_SHIFT_X = -0.75;
-const FACE_BOX_SHIFT_Y = -0.55;
-const FACE_BOX_HEIGHT_SCALE = 1.02;
 // Face-box acceptance offsets are expressed as detected-box multipliers, not
 // fixed pixels or fixed frame percentages, so they scale with camera distance.
 const FACE_CENTER_GATE_X = 0.75;
@@ -1299,18 +1296,13 @@ function fitBoxToKeypoints(box, keypoints, vw, vh) {
 }
 
 function calibratedFaceBox(box, vw, vh, keypoints) {
-  // In this camera/model setup Blaze's raw box tracks the face pattern but is
-  // consistently displaced down/right on the displayed frame. Keep all detector
-  // calibration centralized here so drawing and motion checks share one box.
-  const w = box.w;
-  const h = box.h * FACE_BOX_HEIGHT_SCALE;
-  const x = box.x + box.w * FACE_BOX_SHIFT_X;
-  const y = box.y + box.h * FACE_BOX_SHIFT_Y;
+  // Blaze's raw box already tracks the face; keep it frame-clamped and let
+  // landmark fitting absorb residual detector offset instead of hard shifts.
   return fitBoxToKeypoints({
-    x: Math.min(Math.max(0, x), Math.max(0, vw - w)),
-    y: Math.min(Math.max(0, y), Math.max(0, vh - h)),
-    w,
-    h,
+    x: Math.min(Math.max(0, box.x), Math.max(0, vw - box.w)),
+    y: Math.min(Math.max(0, box.y), Math.max(0, vh - box.h)),
+    w: box.w,
+    h: box.h,
   }, keypoints, vw, vh);
 }
 
