@@ -1593,6 +1593,9 @@ function sampleFlashPixels(box) {
 const PULSE_ROI_W = 8;
 const PULSE_ROI_H = 4;
 const PULSE_MEASURE_MS = 14000;
+// Reduced-motion challenges skip the flash stage, so the pulse check alone
+// carries the liveness gate and measures longer to compensate.
+const PULSE_MEASURE_MS_REDUCED = 20000;
 const PULSE_SAMPLE_MS = 95;
 const pulseCanvas = document.createElement('canvas');
 pulseCanvas.width = PULSE_ROI_W;
@@ -1620,18 +1623,18 @@ function samplePulseGreen(box) {
   return g / n;
 }
 
-async function runPulseCheck(engine) {
+async function runPulseCheck(engine, measureMs = PULSE_MEASURE_MS) {
   const t0 = performance.now();
   const samples = [];
   setStatus('Hold still', 'listening');
   promptNameEl.textContent = 'Hold still';
   while (faceChecking) {
     const now = performance.now() - t0;
-    if (now > PULSE_MEASURE_MS) break;
+    if (now > measureMs) break;
     const box = await detectStableFaceFrame(engine);
     const g = box && !box.stale ? samplePulseGreen(box) : null;
     if (g !== null) samples.push({ g: Math.round(g * 100) / 100, t: Math.round(now) });
-    const remaining = Math.max(1, Math.ceil((PULSE_MEASURE_MS - now) / 1000));
+    const remaining = Math.max(1, Math.ceil((measureMs - now) / 1000));
     promptHintEl.textContent = `Keep your face lit and steady — ${remaining}s left`;
     await sleep(PULSE_SAMPLE_MS);
   }
@@ -1766,7 +1769,7 @@ async function runGuidedFaceCheck() {
     if (!faceChecking) return;
 
     promptEmojiEl.textContent = '💓';
-    const pulseSeries = await runPulseCheck(engine);
+    const pulseSeries = await runPulseCheck(engine, flashPlan ? PULSE_MEASURE_MS : PULSE_MEASURE_MS_REDUCED);
     if (!faceChecking) return;
 
     let pixelSeries = null;
