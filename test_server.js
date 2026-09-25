@@ -168,11 +168,14 @@ async function main() {
   assert.strictEqual(validatePixelSeries(samplePixelSeries(exposurePlan, 0.35), exposurePlan), null);
 
   const server = createServer({
-    analyzePresentationFrames: async (frames) => ({
-      real: frames.every((frame) => frame.face[0] !== 0.36),
-      medianScore: 1,
-      longestRealRun: 5,
-    }),
+    analyzePresentationFrames: async (frames) => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return {
+        real: frames.every((frame) => frame.face[0] !== 0.36),
+        medianScore: 1,
+        longestRealRun: 5,
+      };
+    },
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -242,6 +245,19 @@ async function main() {
       body: JSON.stringify(missingMediaBody),
     }, cookie);
     assert.strictEqual(missingMedia.res.status, 400);
+
+    const raceChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const raceBodyA = livenessBody(raceChallenge.body.challengeId, raceChallenge.body.plan, raceChallenge.body.flashPlan);
+    const raceSeriesB = sampleMotionSeries(raceChallenge.body.plan).map((entry) => ({ ...entry, v: entry.v + 0.001 }));
+    const raceBodyB = livenessBody(raceChallenge.body.challengeId, raceChallenge.body.plan, raceChallenge.body.flashPlan, {
+      motionSeries: raceSeriesB,
+      seriesDigest: computeLivenessSeriesDigest(raceChallenge.body.challengeId, raceSeriesB),
+    });
+    const [raceA, raceB] = await Promise.all([
+      request(baseUrl, '/api/liveness/verify', { method: 'POST', body: JSON.stringify(raceBodyA) }, cookie),
+      request(baseUrl, '/api/liveness/verify', { method: 'POST', body: JSON.stringify(raceBodyB) }, cookie),
+    ]);
+    assert.deepStrictEqual([raceA.res.status, raceB.res.status].sort(), [200, 409]);
 
     const minimumMediaChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
     const minimumMediaFrames = sampleMediaFrames().slice(0, 3);

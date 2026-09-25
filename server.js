@@ -1655,7 +1655,7 @@ async function handleApi(req, res, pathname, services = {}) {
     if (!pending || body.challengeId !== pending.id) {
       return sendJson(res, 400, { error: 'Face liveness challenge is missing or invalid.' });
     }
-    if (pending.consumedAt) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
+    if (pending.consumedAt || pending.verifying) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
     if (now() > pending.expiresAt) return sendJson(res, 410, { error: 'Face liveness challenge expired.' });
 
     const minElapsedMs = pending.reducedMotion === true ? Math.max(livenessMinElapsedMs(), reducedMotionMinElapsedMs()) : livenessMinElapsedMs();
@@ -1710,10 +1710,13 @@ async function handleApi(req, res, pathname, services = {}) {
     } else {
       try {
         const analyzer = services.analyzePresentationFrames || analyzePresentationFrames;
+        pending.verifying = true;
         presentationResult = await analyzer(mediaValidation.frames);
       } catch (err) {
         console.error('Face presentation analysis failed:', err.message);
         return sendJson(res, 503, { error: 'Face presentation analysis is temporarily unavailable.' });
+      } finally {
+        pending.verifying = false;
       }
     }
     if (!presentationResult || presentationResult.real !== true) {
