@@ -25,6 +25,7 @@ const {
   createFlashPlan,
   validatePixelSeries,
   computePresentationDigest,
+  computeFlashDigest,
 } = require('./server');
 
 function request(baseUrl, path, options = {}, cookie) {
@@ -105,22 +106,33 @@ function samplePixelSeries(flashPlan, flashExposureGain = 1) {
   return samples;
 }
 
+// Deterministic pulse curve shared by the claimed series AND the media
+// frames' face-region green means — the server recomputes green means from
+// the submitted JPEGs and requires them to track the claim, so fixtures must
+// drive both from one source.
+const PULSE_W1 = 2 * Math.PI * 1.17;
+const PULSE_W2 = 2 * Math.PI * 2.34;
+const PULSE_WD = 2 * Math.PI * 0.08;
+function pulseGreenAt(t) {
+  const s = t / 1000;
+  return 118 + 3.5 * Math.sin(PULSE_W1 * s) + 1.1 * Math.sin(PULSE_W2 * s + 0.7) + 1.5 * Math.sin(PULSE_WD * s + 1.2);
+}
+
 // Green-channel means with a physiologic-band pulse (fundamental + harmonic +
 // drift + noise) — shaped like a real rPPG signal.
-function samplePulseSeries(spanMs = 14000) {
+function samplePulseSeries(spanMs = 14000, noiseScale = 2.2) {
   const samples = [];
-  const w1 = 2 * Math.PI * 1.17;
-  const w2 = 2 * Math.PI * 2.34;
-  const wd = 2 * Math.PI * 0.08;
   for (let t = 0; t <= spanMs; t += 95) {
-    const s = t / 1000;
-    const g = 118 + 3.5 * Math.sin(w1 * s) + 1.1 * Math.sin(w2 * s + 0.7) + 1.5 * Math.sin(wd * s + 1.2) + gaussian() * 2.2;
+    const g = pulseGreenAt(t) + gaussian() * noiseScale;
     samples.push({ g: Math.round(g * 100) / 100, t });
   }
   return samples;
 }
 
-const mediaFrameImages = Array.from({ length: 5 }, (_, frameIndex) => {
+// Face-crop frames whose face-region green mean tracks pulseGreenAt so the
+// pixel↔series binding passes; r/b textures vary per frame for uniqueness.
+function synthMediaFrame(t, frameIndex) {
+  const target = pulseGreenAt(t);
   const width = 320;
   const height = 240;
   const data = Buffer.alloc(width * height * 4);
@@ -128,48 +140,110 @@ const mediaFrameImages = Array.from({ length: 5 }, (_, frameIndex) => {
     for (let x = 0; x < width; x += 1) {
       const offset = (y * width + x) * 4;
       data[offset] = (x + frameIndex * 7) % 256;
-      data[offset + 1] = (y + frameIndex * 11) % 256;
+      data[offset + 1] = Math.max(0, Math.min(255, Math.round(target + ((x % 7) - 3))));
       data[offset + 2] = (x + y + frameIndex * 13) % 256;
       data[offset + 3] = 255;
     }
   }
   return jpeg.encode({ data, width, height }, 70).data.toString('base64');
-});
+}
 
-function sampleMediaFrames() {
-  return mediaFrameImages.map((image, index) => ({
-    t: index * 700,
+function sampleMediaFrames(ts) {
+  // Mirrors the production client: ~14 face crops over the pulse window.
+  const times = ts || Array.from({ length: 14 }, (_, i) => i * 520);
+  return times.map((t, index) => ({
+    t,
     face: [0.35, 0.15, 0.3, 0.5],
-    image,
+    image: synthMediaFrame(t, index),
   }));
 }
 
+// Face-crop JPEG whose pixel means sit near `mean` — used for flash frames,
+// where the server recomputes chroma deltas of the face region per color.
+function synthFaceCrop(mean) {
+  const width = 192;
+  const height = 192;
+  const data = Buffer.alloc(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = (y * width + x) * 4;
+      data[offset] = Math.max(0, Math.min(255, Math.round(mean[0] + ((x % 7) - 3))));
+      data[offset + 1] = Math.max(0, Math.min(255, Math.round(mean[1] + (((x + y) % 5) - 2))));
+      data[offset + 2] = Math.max(0, Math.min(255, Math.round(mean[2] + ((y % 3) - 1))));
+      data[offset + 3] = 255;
+    }
+  }
+  return jpeg.encode({ data, width, height }, 70).data.toString('base64');
+}
+
+// Baseline crop(s) before the first flash plus two crops inside each flash
+// window, tagged the way the real client tags them (f:-1 baseline, f:i color).
+// `static: true` keeps every crop at baseline brightness — valid shape but
+// chroma never moves, which the flash binding must reject.
+function sampleFlashFrames(flashPlan, { static: staticPixels = false } = {}) {
+  const baseline = [40, 45, 50];
+  const frames = [300, 620].map((t) => ({
+    t,
+    f: -1,
+    face: [0.35, 0.15, 0.3, 0.5],
+    image: synthFaceCrop(baseline),
+  }));
+  flashPlan.forEach((flash, index) => {
+    const mean = staticPixels ? baseline : baseline.map((v, c) => Math.min(255, v + flash.c[c] * 0.5));
+    [flash.o + 140, flash.o + 320].forEach((t) => {
+      frames.push({ t, f: index, face: [0.35, 0.15, 0.3, 0.5], image: synthFaceCrop(mean) });
+    });
+  });
+  frames.sort((a, b) => a.t - b.t);
+  return frames;
+}
+
 function livenessBody(challengeId, plan, flashPlan, overrides = {}) {
-  const motionSeries = sampleMotionSeries(plan);
-  const mediaFrames = sampleMediaFrames();
-  return {
+  const motionSeries = overrides.motionSeries || sampleMotionSeries(plan);
+  const pulseSeries = overrides.pulseSeries !== undefined ? overrides.pulseSeries : samplePulseSeries();
+  const mediaFrames = overrides.mediaFrames || sampleMediaFrames();
+  const flashFrames = flashPlan && overrides.flashFrames !== undefined
+    ? overrides.flashFrames
+    : flashPlan ? sampleFlashFrames(flashPlan) : undefined;
+  const body = {
     challengeId,
     durationMs: 1200,
     faceFrames: 10,
     motionScore: 0.12,
     phases: validLivenessPhases(plan),
     motionSeries,
-    seriesDigest: computeLivenessSeriesDigest(challengeId, motionSeries),
+    seriesDigest: overrides.seriesDigest || computeLivenessSeriesDigest(challengeId, motionSeries, pulseSeries),
     pixelSeries: flashPlan ? samplePixelSeries(flashPlan) : undefined,
-    pulseSeries: samplePulseSeries(),
+    pulseSeries,
     mediaFrames,
-    mediaDigest: computePresentationDigest(challengeId, mediaFrames),
+    mediaDigest: overrides.mediaDigest || computePresentationDigest(challengeId, mediaFrames),
     ...overrides,
   };
+  if (body.flashFallback === true && flashFrames) {
+    body.flashFrames = flashFrames;
+    body.flashDigest = overrides.flashDigest || computeFlashDigest(challengeId, flashFrames);
+  }
+  return body;
 }
 
 async function main() {
   const exposurePlan = createFlashPlan();
   assert.strictEqual(validatePixelSeries(samplePixelSeries(exposurePlan, 0.35), exposurePlan), null);
 
+  // One-shot hold set by the concurrent-verify test: the analyzer signals
+  // `entered` then blocks on `gate`, so the racing second request provably
+  // lands while the first is still inside presentation analysis.
+  let analysisHold = null;
   const server = createServer({
     analyzePresentationFrames: async (frames) => {
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      if (analysisHold) {
+        const hold = analysisHold;
+        analysisHold = null;
+        hold.entered();
+        await hold.gate;
+      } else {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
       return {
         real: frames.every((frame) => frame.face[0] !== 0.36),
         medianScore: 1,
@@ -254,8 +328,53 @@ async function main() {
     }, cookie);
     assert.strictEqual(missingMedia.res.status, 400);
 
+    const raceChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const raceBodyA = livenessBody(raceChallenge.body.challengeId, raceChallenge.body.plan, raceChallenge.body.flashPlan);
+    const raceSeriesB = sampleMotionSeries(raceChallenge.body.plan).map((entry) => ({ ...entry, v: entry.v + 0.001 }));
+    const raceBodyB = livenessBody(raceChallenge.body.challengeId, raceChallenge.body.plan, raceChallenge.body.flashPlan, {
+      motionSeries: raceSeriesB,
+    });
+    // The winner blocks inside the analyzer until the loser has answered —
+    // the second request must observe `verifying` and 409 deterministically.
+    let releaseAnalysis;
+    let analysisEntered;
+    const analysisGate = new Promise((resolve) => { releaseAnalysis = resolve; });
+    const entered = new Promise((resolve) => { analysisEntered = resolve; });
+    analysisHold = { entered: analysisEntered, gate: analysisGate };
+    const racePromiseA = request(baseUrl, '/api/liveness/verify', { method: 'POST', body: JSON.stringify(raceBodyA) }, cookie);
+    try {
+      await Promise.race([
+        entered,
+        new Promise((resolve, reject) => setTimeout(() => reject(new Error('first race verify never reached presentation analysis')), 5000)),
+      ]);
+      const raceB = await request(baseUrl, '/api/liveness/verify', { method: 'POST', body: JSON.stringify(raceBodyB) }, cookie);
+      assert.strictEqual(raceB.res.status, 409);
+    } finally {
+      releaseAnalysis();
+    }
+    const raceA = await racePromiseA;
+    assert.strictEqual(raceA.res.status, 200);
+
+    // PAD analysis is capped per challenge: three media rejections, then 429
+    // and the challenge is consumed.
+    const mediaRetryChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const spoofFrames = sampleMediaFrames().map((frame) => ({ ...frame, face: [0.36, frame.face[1], frame.face[2], frame.face[3]] }));
+    const spoofBody = livenessBody(mediaRetryChallenge.body.challengeId, mediaRetryChallenge.body.plan, mediaRetryChallenge.body.flashPlan, {
+      mediaFrames: spoofFrames,
+      mediaDigest: computePresentationDigest(mediaRetryChallenge.body.challengeId, spoofFrames),
+    });
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const spoof = await request(baseUrl, '/api/liveness/verify', { method: 'POST', body: JSON.stringify(spoofBody) }, cookie);
+      assert.strictEqual(spoof.res.status, 400);
+    }
+    const spoofCapped = await request(baseUrl, '/api/liveness/verify', { method: 'POST', body: JSON.stringify(spoofBody) }, cookie);
+    assert.strictEqual(spoofCapped.res.status, 429);
+
     const minimumMediaChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
-    const minimumMediaFrames = sampleMediaFrames().slice(0, 3);
+    // The floor is four frames over >=2500ms — enough for both the media
+    // window and the pulse binding's minimum coverage. A low-noise claim
+    // keeps the test deterministic: the marginal case is the frame count.
+    const minimumMediaFrames = sampleMediaFrames([500, 2500, 4500, 6500]);
     const minimumMedia = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
       body: JSON.stringify(livenessBody(
@@ -265,13 +384,14 @@ async function main() {
         {
           mediaFrames: minimumMediaFrames,
           mediaDigest: computePresentationDigest(minimumMediaChallenge.body.challengeId, minimumMediaFrames),
+          pulseSeries: samplePulseSeries(14000, 0.4),
         },
       )),
     }, cookie);
     assert.strictEqual(minimumMedia.res.status, 200);
 
     const sparseMediaChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
-    const sparseMediaFrames = sampleMediaFrames().slice(0, 2);
+    const sparseMediaFrames = sampleMediaFrames([0, 900]);
     const sparseMedia = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
       body: JSON.stringify(livenessBody(
@@ -313,7 +433,8 @@ async function main() {
     ));
     wrongSeriesBody.seriesDigest = computeLivenessSeriesDigest(
       wrongPlanPhases.body.challengeId,
-      wrongSeriesBody.motionSeries
+      wrongSeriesBody.motionSeries,
+      wrongSeriesBody.pulseSeries
     );
     const wrongPlan = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
@@ -332,7 +453,6 @@ async function main() {
       method: 'POST',
       body: JSON.stringify(livenessBody(smoothChallenge.body.challengeId, smoothPlan, smoothChallenge.body.flashPlan, {
         motionSeries: smoothSeries,
-        seriesDigest: computeLivenessSeriesDigest(smoothChallenge.body.challengeId, smoothSeries),
         phases: validLivenessPhases(smoothPlan),
       })),
     }, cookie);
@@ -444,6 +564,74 @@ async function main() {
       })),
     }, cookie);
     assert.strictEqual(offBandRes.res.status, 422);
+
+    // Pixel↔series binding: a spectrally-valid pulse that disagrees with the
+    // submitted camera pixels still cannot verify — claims must match frames.
+    const mismatchChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const mismatchPulse = [];
+    for (let t = 0; t <= 14000; t += 95) {
+      const s = t / 1000 + 0.35;
+      const g = 118 + 3.5 * Math.sin(PULSE_W1 * s) + 1.1 * Math.sin(PULSE_W2 * s + 0.7) + 1.5 * Math.sin(PULSE_WD * s + 1.2);
+      mismatchPulse.push({ g: Math.round(g * 100) / 100, t });
+    }
+    const mismatchRes = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(mismatchChallenge.body.challengeId, mismatchChallenge.body.plan, mismatchChallenge.body.flashPlan, {
+        pulseSeries: mismatchPulse,
+      })),
+    }, cookie);
+    assert.strictEqual(mismatchRes.res.status, 422);
+    assert.strictEqual(mismatchRes.body.flashAvailable, true);
+
+    // Pulse replay across challenges: the series digest now covers the pulse,
+    // so a digest minted under another challenge id must fail.
+    const replayChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const replayBody = livenessBody(replayChallenge.body.challengeId, replayChallenge.body.plan, replayChallenge.body.flashPlan);
+    replayBody.seriesDigest = computeLivenessSeriesDigest(mismatchChallenge.body.challengeId, replayBody.motionSeries, replayBody.pulseSeries);
+    const replayRes = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(replayBody),
+    }, cookie);
+    assert.strictEqual(replayRes.res.status, 400);
+
+    // Flash fallback without camera frames must 400 even with a valid offer.
+    const noFramesChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(noFramesChallenge.body.challengeId, noFramesChallenge.body.plan, noFramesChallenge.body.flashPlan, {
+        pulseSeries: flatPulse,
+      })),
+    }, cookie);
+    const noFlashFramesBody = livenessBody(noFramesChallenge.body.challengeId, noFramesChallenge.body.plan, noFramesChallenge.body.flashPlan, {
+      pulseSeries: flatPulse,
+      flashFallback: true,
+    });
+    delete noFlashFramesBody.flashFrames;
+    delete noFlashFramesBody.flashDigest;
+    const noFlashFrames = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(noFlashFramesBody),
+    }, cookie);
+    assert.strictEqual(noFlashFrames.res.status, 400);
+
+    // Flash frames whose pixels never changed must fail the chroma binding.
+    const staticFlashChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(staticFlashChallenge.body.challengeId, staticFlashChallenge.body.plan, staticFlashChallenge.body.flashPlan, {
+        pulseSeries: flatPulse,
+      })),
+    }, cookie);
+    const staticFlashFrames = sampleFlashFrames(staticFlashChallenge.body.flashPlan, { static: true });
+    const staticFlashRes = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(staticFlashChallenge.body.challengeId, staticFlashChallenge.body.plan, staticFlashChallenge.body.flashPlan, {
+        pulseSeries: flatPulse,
+        flashFallback: true,
+        flashFrames: staticFlashFrames,
+      })),
+    }, cookie);
+    assert.strictEqual(staticFlashRes.res.status, 400);
 
     // Reduced motion: no flash plan is issued, pixels are not required, and
     // the pulse check alone carries the liveness gate — so it demands a
@@ -699,8 +887,12 @@ async function main() {
         // (a stapled attestation) must not count as hardware-backed.
         const cred4 = newCred();
         const authData4 = attAuthData(Buffer.from(cred4.rawId, 'base64url'), spkiToCose(cred4.spki));
-        const { verify: appleWrongKey } = await registerWith(cred4.rawId, cred4.spki, () => ({
-          attestationObject: attestationObjectFor('apple', cborEncode({ x5c: [leafDer] }), authData4),
+        const { verify: appleWrongKey } = await registerWith(cred4.rawId, cred4.spki, (clientDataJSON) => ({
+          attestationObject: attestationObjectFor('apple', cborEncode({
+            alg: -7,
+            sig: crypto.sign('SHA256', Buffer.concat([authData4, crypto.createHash('sha256').update(clientDataJSON).digest()]), leafKey),
+            x5c: [leafDer],
+          }), authData4),
         }));
         assert.strictEqual(appleWrongKey.res.status, 201);
         const { redeem: appleWrongKeyRedeem } = await authAssurance(cred4.rawId, cred4.privateKey);
@@ -713,8 +905,12 @@ async function main() {
         run(['req', '-new', '-key', 'cred.key', '-out', 'cred.csr', '-subj', '/CN=Zoe Test Apple Leaf']);
         run(['x509', '-req', '-in', 'cred.csr', '-CA', 'root.pem', '-CAkey', 'root.key', '-CAcreateserial', '-out', 'credleaf.pem', '-days', '2', '-sha256']);
         const credleafDer = execFileSync('openssl', ['x509', '-in', 'credleaf.pem', '-outform', 'DER'], { cwd: dir });
-        const { verify: appleNoNonce } = await registerWith(cred5.rawId, cred5.spki, () => ({
-          attestationObject: attestationObjectFor('apple', cborEncode({ x5c: [credleafDer] }), authData5),
+        const { verify: appleNoNonce } = await registerWith(cred5.rawId, cred5.spki, (clientDataJSON) => ({
+          attestationObject: attestationObjectFor('apple', cborEncode({
+            alg: -7,
+            sig: crypto.sign('SHA256', Buffer.concat([authData5, crypto.createHash('sha256').update(clientDataJSON).digest()]), cred5.privateKey),
+            x5c: [credleafDer],
+          }), authData5),
         }));
         assert.strictEqual(appleNoNonce.res.status, 201);
         const { redeem: appleNoNonceRedeem } = await authAssurance(cred5.rawId, cred5.privateKey);
@@ -732,7 +928,11 @@ async function main() {
           run(['x509', '-req', '-in', 'cred6.csr', '-CA', 'root.pem', '-CAkey', 'root.key', '-CAcreateserial', '-out', 'appleleaf.pem', '-days', '2', '-sha256', '-extfile', 'apple.ext.cnf']);
           const appleDer = execFileSync('openssl', ['x509', '-in', 'appleleaf.pem', '-outform', 'DER'], { cwd: dir });
           return {
-            attestationObject: attestationObjectFor('apple', cborEncode({ x5c: [appleDer] }), authData6),
+            attestationObject: attestationObjectFor('apple', cborEncode({
+              alg: -7,
+              sig: crypto.sign('SHA256', Buffer.concat([authData6, crypto.createHash('sha256').update(clientDataJSON).digest()]), cred6.privateKey),
+              x5c: [appleDer],
+            }), authData6),
           };
         });
         assert.strictEqual(appleOk.res.status, 201);
@@ -830,6 +1030,9 @@ async function main() {
       ]],
     }]);
     assert.strictEqual(thumbMcpThreeGeometry, null);
+
+    // Earlier liveness probes consumed most of the per-IP minute bucket.
+    resetRateLimitState();
 
     let finalToken = null;
     for (let i = 0; i < 3; i++) {
@@ -932,7 +1135,7 @@ async function main() {
     const rpSeries = sampleMotionSeries(rpChallenge.body.plan);
     const rpVerify = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
-      body: JSON.stringify(livenessBody(rpChallenge.body.challengeId, rpChallenge.body.plan, rpChallenge.body.flashPlan, { motionSeries: rpSeries, seriesDigest: computeLivenessSeriesDigest(rpChallenge.body.challengeId, rpSeries) })),
+      body: JSON.stringify(livenessBody(rpChallenge.body.challengeId, rpChallenge.body.plan, rpChallenge.body.flashPlan, { motionSeries: rpSeries })),
     }, cookie);
     assert.strictEqual(rpVerify.res.status, 200);
     const rpToken = rpVerify.body.verificationToken;
