@@ -168,11 +168,14 @@ async function main() {
   assert.strictEqual(validatePixelSeries(samplePixelSeries(exposurePlan, 0.35), exposurePlan), null);
 
   const server = createServer({
-    analyzePresentationFrames: async (frames) => ({
-      real: frames.every((frame) => frame.face[0] !== 0.36),
-      medianScore: 1,
-      longestRealRun: 5,
-    }),
+    analyzePresentationFrames: async (frames) => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return {
+        real: frames.every((frame) => frame.face[0] !== 0.36),
+        medianScore: 1,
+        longestRealRun: 5,
+      };
+    },
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -206,6 +209,14 @@ async function main() {
 
     const unverifiedRegisterOptions = await request(baseUrl, '/api/passkey/register/options', { method: 'POST' }, cookie);
     assert.strictEqual(unverifiedRegisterOptions.res.status, 401);
+
+    // Static whitelist: server-side sources are not servable.
+    const serverSource = await fetch(`${baseUrl}/server.js`);
+    assert.strictEqual(serverSource.status, 404);
+    const attackHarness = await fetch(`${baseUrl}/attack_server.js`);
+    assert.strictEqual(attackHarness.status, 404);
+    const appSource = await fetch(`${baseUrl}/app.js`);
+    assert.strictEqual(appSource.status, 200);
 
     const livenessWithoutChallenge = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
@@ -683,6 +694,50 @@ async function main() {
         assert.strictEqual(badVerify.res.status, 201);
         const { redeem: badRedeem } = await authAssurance(cred2.rawId, cred2.privateKey);
         assert.strictEqual(badRedeem.body.assurance, 'standard');
+
+        // fmt 'apple' with a valid chain but a leaf certifying a DIFFERENT key
+        // (a stapled attestation) must not count as hardware-backed.
+        const cred4 = newCred();
+        const authData4 = attAuthData(Buffer.from(cred4.rawId, 'base64url'), spkiToCose(cred4.spki));
+        const { verify: appleWrongKey } = await registerWith(cred4.rawId, cred4.spki, () => ({
+          attestationObject: attestationObjectFor('apple', cborEncode({ x5c: [leafDer] }), authData4),
+        }));
+        assert.strictEqual(appleWrongKey.res.status, 201);
+        const { redeem: appleWrongKeyRedeem } = await authAssurance(cred4.rawId, cred4.privateKey);
+        assert.strictEqual(appleWrongKeyRedeem.body.assurance, 'standard');
+
+        // apple leaf keyed to THIS credential but missing the nonce extension → 'standard'.
+        const cred5 = newCred();
+        const authData5 = attAuthData(Buffer.from(cred5.rawId, 'base64url'), spkiToCose(cred5.spki));
+        fs.writeFileSync(path.join(dir, 'cred.key'), cred5.privateKey.export({ format: 'pem', type: 'sec1' }));
+        run(['req', '-new', '-key', 'cred.key', '-out', 'cred.csr', '-subj', '/CN=Zoe Test Apple Leaf']);
+        run(['x509', '-req', '-in', 'cred.csr', '-CA', 'root.pem', '-CAkey', 'root.key', '-CAcreateserial', '-out', 'credleaf.pem', '-days', '2', '-sha256']);
+        const credleafDer = execFileSync('openssl', ['x509', '-in', 'credleaf.pem', '-outform', 'DER'], { cwd: dir });
+        const { verify: appleNoNonce } = await registerWith(cred5.rawId, cred5.spki, () => ({
+          attestationObject: attestationObjectFor('apple', cborEncode({ x5c: [credleafDer] }), authData5),
+        }));
+        assert.strictEqual(appleNoNonce.res.status, 201);
+        const { redeem: appleNoNonceRedeem } = await authAssurance(cred5.rawId, cred5.privateKey);
+        assert.strictEqual(appleNoNonceRedeem.body.assurance, 'standard');
+
+        // apple leaf keyed to this credential + carrying the nonce extension → 'strong'.
+        const cred6 = newCred();
+        const authData6 = attAuthData(Buffer.from(cred6.rawId, 'base64url'), spkiToCose(cred6.spki));
+        fs.writeFileSync(path.join(dir, 'cred6.key'), cred6.privateKey.export({ format: 'pem', type: 'sec1' }));
+        run(['req', '-new', '-key', 'cred6.key', '-out', 'cred6.csr', '-subj', '/CN=Zoe Test Apple Leaf 2']);
+        const { verify: appleOk } = await registerWith(cred6.rawId, cred6.spki, (clientDataJSON) => {
+          const nonce = crypto.createHash('sha256').update(Buffer.concat([authData6, crypto.createHash('sha256').update(clientDataJSON).digest()])).digest();
+          const nonceHex = [...nonce].map((b) => b.toString(16).padStart(2, '0')).join(':');
+          fs.writeFileSync(path.join(dir, 'apple.ext.cnf'), `1.2.840.113635.100.8.2=DER:04:20:${nonceHex}\n`);
+          run(['x509', '-req', '-in', 'cred6.csr', '-CA', 'root.pem', '-CAkey', 'root.key', '-CAcreateserial', '-out', 'appleleaf.pem', '-days', '2', '-sha256', '-extfile', 'apple.ext.cnf']);
+          const appleDer = execFileSync('openssl', ['x509', '-in', 'appleleaf.pem', '-outform', 'DER'], { cwd: dir });
+          return {
+            attestationObject: attestationObjectFor('apple', cborEncode({ x5c: [appleDer] }), authData6),
+          };
+        });
+        assert.strictEqual(appleOk.res.status, 201);
+        const { redeem: appleOkRedeem } = await authAssurance(cred6.rawId, cred6.privateKey);
+        assert.strictEqual(appleOkRedeem.body.assurance, 'strong');
 
         // But a garbage cert inside x5c is malformed, not merely untrusted.
         const cred3 = newCred();

@@ -592,9 +592,9 @@ function createLivenessPlan() {
 const FLASH_COLORS = [
   [255, 64, 64],
   [64, 160, 255],
-  [72, 220, 120],
+  [60, 220, 60],
   [255, 190, 60],
-  [190, 110, 255],
+  [180, 60, 255],
   [60, 220, 220],
 ];
 
@@ -1308,6 +1308,36 @@ function certChainsToRoot(x5cDers) {
   }
 }
 
+const APPLE_NONCE_EXTENSION_DER = Buffer.from('06092a864886f763640802', 'hex');
+
+// Apple anonymous attestation carries no signature: trust comes from the
+// credCert chaining to a FIDO root, the leaf certifying THIS credential key,
+// and the Apple nonce extension (sha256(authData||clientDataHash)) binding the
+// cert to this exact attestation. Without all three a harvested real Apple
+// chain could be stapled onto an attacker-generated credential key.
+function appleAttestationBacked(x5cDers, credential, signedData) {
+  if (!x5cDers.length) return false;
+  let leaf;
+  try {
+    leaf = new crypto.X509Certificate(x5cDers[0]);
+  } catch {
+    return false;
+  }
+  let leafSpki;
+  try {
+    leafSpki = leaf.publicKey.export({ format: 'der', type: 'spki' });
+  } catch {
+    return false;
+  }
+  if (!leafSpki.equals(Buffer.from(credential.publicKey, 'base64url'))) return false;
+  const nonce = crypto.createHash('sha256').update(signedData).digest();
+  const raw = leaf.raw;
+  const oidIndex = raw.indexOf(APPLE_NONCE_EXTENSION_DER);
+  if (oidIndex === -1) return false;
+  const nonceMarker = Buffer.concat([Buffer.from([0x04, 0x20]), nonce]);
+  return raw.indexOf(nonceMarker, oidIndex) !== -1 && certChainsToRoot(x5cDers);
+}
+
 function verifyAttestationSignature(alg, signedData, publicKeySource, signature) {
   const key = typeof publicKeySource === 'string'
     ? crypto.createPublicKey({ key: Buffer.from(publicKeySource, 'base64url'), format: 'der', type: 'spki' })
@@ -1393,7 +1423,7 @@ function verifyAttestation(attestationObjectB64, clientDataJSONBytes, origin, ex
     }
   } else if (fmt === 'apple') {
     const x5c = Array.isArray(attStmt && attStmt.x5c) ? attStmt.x5c : [];
-    hardwareBacked = x5c.length > 0 && certChainsToRoot(x5c);
+    hardwareBacked = appleAttestationBacked(x5c, credential, signedData);
   } else if (fmt !== 'none') {
     return { error: 'Passkey attestation format is not supported.' };
   }
@@ -1655,7 +1685,7 @@ async function handleApi(req, res, pathname, services = {}) {
     if (!pending || body.challengeId !== pending.id) {
       return sendJson(res, 400, { error: 'Face liveness challenge is missing or invalid.' });
     }
-    if (pending.consumedAt) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
+    if (pending.consumedAt || pending.verifying) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
     if (now() > pending.expiresAt) return sendJson(res, 410, { error: 'Face liveness challenge expired.' });
 
     const minElapsedMs = pending.reducedMotion === true ? Math.max(livenessMinElapsedMs(), reducedMotionMinElapsedMs()) : livenessMinElapsedMs();
@@ -1708,12 +1738,21 @@ async function handleApi(req, res, pathname, services = {}) {
     if (pending.presentationDigest) {
       presentationResult = pending.presentationResult;
     } else {
+      pending.mediaAttempts = (pending.mediaAttempts || 0) + 1;
+      if (pending.mediaAttempts > 3) {
+        pending.consumedAt = now();
+        session.livenessChallenge = null;
+        return sendJson(res, 429, { error: 'Too many camera media attempts on this challenge.' });
+      }
       try {
         const analyzer = services.analyzePresentationFrames || analyzePresentationFrames;
+        pending.verifying = true;
         presentationResult = await analyzer(mediaValidation.frames);
       } catch (err) {
         console.error('Face presentation analysis failed:', err.message);
         return sendJson(res, 503, { error: 'Face presentation analysis is temporarily unavailable.' });
+      } finally {
+        pending.verifying = false;
       }
     }
     if (!presentationResult || presentationResult.real !== true) {
@@ -1822,18 +1861,21 @@ function contentType(filePath) {
   return 'application/octet-stream';
 }
 
+const STATIC_FILES = new Set([
+  '/index.html', '/styles.css', '/app.js', '/models/blaze_face_short_range.tflite',
+]);
+const DEBUG_FILES = new Set(['/debug.html', '/debug.css', '/debug.js', '/debug_metrics.js']);
+
 function serveStatic(req, res, pathname) {
   const requested = pathname === '/' ? '/index.html' : pathname;
-  if (
-    process.env.ZOE_DEBUG !== '1'
-    && ['/debug.html', '/debug.css', '/debug.js', '/debug_metrics.js'].includes(requested)
-  ) {
+  const debugAllowed = DEBUG_FILES.has(requested) && process.env.ZOE_DEBUG === '1';
+  if (!STATIC_FILES.has(requested) && !debugAllowed) {
     securityHeaders(res);
     res.writeHead(404);
     return res.end('Not found');
   }
   const filePath = path.resolve(__dirname, `.${requested}`);
-  if (!filePath.startsWith(__dirname) || !['.html', '.css', '.js', '.tflite', '.task', '.png'].includes(path.extname(filePath))) {
+  if (!filePath.startsWith(__dirname)) {
     securityHeaders(res);
     res.writeHead(404);
     return res.end('Not found');
