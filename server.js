@@ -66,21 +66,22 @@ const FLASH_FACE_PIXEL_BYTES = 12 * 9 * 3;
 const FLASH_BG_PIXEL_BYTES = 4 * 1 * 3;
 const MAX_PIXEL_SAMPLES = 140;
 const FLASH_COUNT = 4;
-const FLASH_LEAD_MS = 400;
-// Photosensitivity safety (WCAG-style): a flash cycle is at least ~860ms, so
-// the sequence stays under ~1.2 flashes/second — well clear of the >3/second
+const FLASH_LEAD_MS = 900;
+// Photosensitivity safety (WCAG-style): a flash cycle is at least ~1.1s, so
+// the sequence stays under one flash/second — well clear of the >3/second
 // risk band — and reduced-motion users skip the plan entirely.
-const FLASH_DURATION_MIN_MS = 480;
-const FLASH_DURATION_SPAN_MS = 160;
-const FLASH_GAP_MIN_MS = 380;
-const FLASH_GAP_SPAN_MS = 220;
-const FLASH_BASELINE_LEAD_MS = 60;
+const FLASH_DURATION_MIN_MS = 650;
+const FLASH_DURATION_SPAN_MS = 150;
+const FLASH_GAP_MIN_MS = 460;
+const FLASH_GAP_SPAN_MS = 180;
+const FLASH_BASELINE_LEAD_MS = 100;
+const FLASH_RESPONSE_LEAD_MS = 80;
 const FLASH_LAG_SLACK_MS = 120;
 const FLASH_MIN_BASELINE_SAMPLES = 3;
 const FLASH_MIN_SAMPLES_PER_FLASH = 2;
-const FLASH_COSINE_MIN = 0.55;
-const FLASH_DELTA_RATIO_MIN = 0.04;
-const FLASH_DELTA_RATIO_MAX = 1.6;
+const FLASH_CHROMA_COSINE_MIN = 0.6;
+const FLASH_CHROMA_RATIO_MIN = 0.025;
+const FLASH_CHROMA_RATIO_MAX = 2;
 const FLASH_NOISE_L1_MIN = 0.3;
 const FLASH_NOISE_L1_MAX = 90;
 const FLASH_DISTINCT_FRAMES_MIN = 0.6;
@@ -623,6 +624,12 @@ function pixelMeanChannels(buffers) {
   return acc.map((v) => v / Math.max(1, count));
 }
 
+function channelChromaticity(channels) {
+  const sum = channels.reduce((total, value) => total + Math.max(0, value), 0);
+  if (sum < 1e-6) return [0, 0, 0];
+  return channels.map((value) => Math.max(0, value) / sum);
+}
+
 function decodePixelField(value, expectedBytes) {
   if (typeof value !== 'string') return null;
   const buf = Buffer.from(value, 'base64');
@@ -688,19 +695,27 @@ function validatePixelSeries(pixelSeries, flashPlan) {
     return 'Pixel stream repeats identical frames.';
   }
 
+  const baselineChroma = channelChromaticity(baseline);
   for (const flash of flashPlan) {
     const expected = flash.c;
-    const window = samples.filter((s) => s.f && s.t >= flash.o - 30 && s.t <= flash.o + flash.d + FLASH_LAG_SLACK_MS);
+    const window = samples.filter((s) => (
+      s.f
+      && s.t >= flash.o + FLASH_RESPONSE_LEAD_MS
+      && s.t <= flash.o + flash.d + FLASH_LAG_SLACK_MS
+    ));
     if (window.length < FLASH_MIN_SAMPLES_PER_FLASH) return 'Pixel sampling missed a flash window.';
     const observed = pixelMeanChannels(window.map((s) => s.f));
-    const delta = observed.map((v, i) => v - baseline[i]);
+    const observedChroma = channelChromaticity(observed);
+    const expectedChroma = channelChromaticity(expected);
+    const delta = observedChroma.map((v, i) => v - baselineChroma[i]);
+    const expectedDelta = expectedChroma.map((v) => v - (1 / 3));
     const deltaMag = Math.hypot(...delta);
-    const expectedMag = Math.hypot(...expected);
+    const expectedMag = Math.hypot(...expectedDelta);
     const cosine = deltaMag > 1e-6 && expectedMag > 1e-6
-      ? delta.reduce((sum, v, i) => sum + v * expected[i], 0) / (deltaMag * expectedMag)
+      ? delta.reduce((sum, v, i) => sum + v * expectedDelta[i], 0) / (deltaMag * expectedMag)
       : 0;
     const ratio = deltaMag / expectedMag;
-    if (cosine < FLASH_COSINE_MIN || ratio < FLASH_DELTA_RATIO_MIN || ratio > FLASH_DELTA_RATIO_MAX) {
+    if (cosine < FLASH_CHROMA_COSINE_MIN || ratio < FLASH_CHROMA_RATIO_MIN || ratio > FLASH_CHROMA_RATIO_MAX) {
       return 'Face pixels did not reflect the issued flash sequence.';
     }
   }

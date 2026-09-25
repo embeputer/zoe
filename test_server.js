@@ -13,7 +13,17 @@ process.env.ZOE_RATE_LIMIT_MAX_PER_SESSION = '0';
 const assert = require('assert');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
-const { createServer, checkRateLimit, resetRateLimitState, RATE_LIMIT_MAX_PER_IP, computeLivenessSeriesDigest, validateHandLandmarkGeometry, verifyAuthenticatorData } = require('./server');
+const {
+  createServer,
+  checkRateLimit,
+  resetRateLimitState,
+  RATE_LIMIT_MAX_PER_IP,
+  computeLivenessSeriesDigest,
+  validateHandLandmarkGeometry,
+  verifyAuthenticatorData,
+  createFlashPlan,
+  validatePixelSeries,
+} = require('./server');
 
 function request(baseUrl, path, options = {}, cookie) {
   const headers = { ...(options.headers || {}) };
@@ -72,14 +82,16 @@ function gaussian() {
 
 // Fabricated pixel evidence matching an issued flash plan: baseline-lit frames
 // with sensor noise, shifted toward each flash color inside its window.
-function samplePixelSeries(flashPlan) {
+function samplePixelSeries(flashPlan, flashExposureGain = 1) {
   const baseline = [40, 45, 50];
   const last = flashPlan[flashPlan.length - 1];
   const endMs = last.o + last.d + 300;
   const samples = [];
   for (let t = 0; t <= endMs; t += 75) {
     const active = flashPlan.find((f) => t >= f.o && t <= f.o + f.d);
-    const mean = active ? baseline.map((v, i) => v + active.c[i] * 0.5) : baseline;
+    const mean = active
+      ? baseline.map((v, i) => (v + active.c[i] * 0.5) * flashExposureGain)
+      : baseline;
     const f = Buffer.alloc(324);
     for (let i = 0; i < f.length; i++) {
       f[i] = Math.max(0, Math.min(255, Math.round(mean[i % 3] + gaussian() * 6)));
@@ -123,6 +135,9 @@ function livenessBody(challengeId, plan, flashPlan, overrides = {}) {
 }
 
 async function main() {
+  const exposurePlan = createFlashPlan();
+  assert.strictEqual(validatePixelSeries(samplePixelSeries(exposurePlan, 0.35), exposurePlan), null);
+
   const server = createServer();
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
