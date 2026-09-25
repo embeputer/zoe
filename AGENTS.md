@@ -12,6 +12,8 @@ This is a plain Node/static app:
 - `styles.css` is the complete UI styling.
 - `test_server.js` is the regression/security test suite.
 - `attack_server.js` is the adversarial harness: it submits fully fabricated evidence and reports which server checks a scripted client fools.
+- `face_pad.js` validates bounded challenge-bound JPEG frames, independently detects face regions, and runs server-side presentation-attack analysis.
+- `debug.html`, `debug.js`, and `debug_metrics.js` form a disposable pulse/flash camera lab available only through `npm run debug`.
 
 Sessions, passkey credentials, and consumed token digests persist in SQLite (`node:sqlite`, file `zoe-data.sqlite3`, override with `ZOE_DB_PATH`; tests use `:memory:` or a temp file). Session rows persist lazily — a cookie-only anonymous hit stays memory-only until the session gains real state (challenge, credential, token). Short-lived challenge state stays in memory. Verification enforces wall-clock floors server-side (`ZOE_LIVENESS_MIN_ELAPSED_MS`, `ZOE_STEP_MIN_ELAPSED_MS`; tests shorten them via env). Relying parties redeem tokens via `POST /api/verify` (signature + expiry + one-use; no session cookie required).
 
@@ -22,6 +24,7 @@ Use:
 ```sh
 npm start
 npm test
+npm run debug
 ```
 
 The app must be served over the local server. Do not open `index.html` with `file://`.
@@ -63,7 +66,7 @@ Do not reintroduce a fake phone frame. The design is inspired by the card inside
 
 Face motion is the default on mobile. It runs cross-browser using MediaPipe Tasks Vision (`@mediapipe/tasks-vision`), imported dynamically in `app.js`. The WASM runtime loads from `cdn.jsdelivr.net`, and the active compatible short-range FaceDetector model is vendored locally at `models/blaze_face_short_range.tflite` and served from the same origin. The Tasks Vision FaceDetector is the active gate because it exposes confidence scores, a conventional bounding box, and face keypoints; the browser validates confidence, size/aspect, target-oval position, and eye/nose keypoint yaw before counting prompted head turns. The older `@mediapipe/face_detection` Solutions build is intentionally avoided because it evaluates strings as JavaScript and would require loosening the CSP. The browser's non-standard `FaceDetector` API is used only as an opportunistic fallback when the MediaPipe runtime cannot load; it has no keypoints, so only that fallback uses box-motion gates. It is a liveness-style motion check, not identity verification.
 
-The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval and follows the server-issued motion plan (`center_hold`, then left-first or right-first turns). Forehead green-channel samples are collected in the background throughout those phases, then `runPulseCheck` adds a short hold-still top-up; the server looks for a physiologic-band heartbeat (48–144 BPM, flat/clean-sine rejected) in the stillness tail. Pulse is the default media gate. A failed pulse attempt returns HTTP 422 without consuming the challenge and may offer `runFlashPixelCheck` as an explicit fallback: the user must opt in through the photosensitivity warning before Zoe shows the full-screen random color sequence and uploads timestamped face-region pixel bursts. Flash never auto-starts. The server only accepts `flashFallback: true` after it has offered that fallback for the same challenge, then verifies reflected light against the issued `flashPlan` (color-delta cosine + magnitude, baseline sensor noise, coverage). Reduced-motion challenges receive no flash plan, so pulse remains the only media gate. These checks raise attack cost but stay forgeable — see `attack_server.js`. The app counts keypoint yaw poses (`center`, `left`, `right`) instead of only box translation, then submits yaw-range motion evidence plus phase-tagged micro-jitter/tortuosity summaries, a bounded `motionSeries`, and a `seriesDigest` bound to `challengeId`.
+The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval, follows the server-issued left-first or right-first motion plan, collects forehead green-channel samples throughout, then uses a calm front-facing tail to top up pulse evidence and capture up to five 320×240 JPEG frames. The frames include bounded timestamps and normalized client face regions; `mediaDigest` binds their exact JSON representation to `challengeId`. `face_pad.js` enforces count, spacing, span, size, dimensions, uniqueness, and digest bounds, then runs the vendored YuNet-style detector independently on each frame before running MiniFASNetV2-SE presentation analysis on the matched face crop. Acceptance requires three consecutive independently detected faces, three consecutive real PAD results, and a passing median PAD score. An accepted digest/result is cached on the challenge so explicit flash fallback cannot replace the media set. Pulse remains the default media gate; failed pulse may offer flash only after affirmative photosensitivity consent, and flash never auto-starts. These checks raise attack cost but do not prove camera provenance or defeat realistic injected/replayed video.
 
 Known face-detector findings:
 
@@ -127,8 +130,10 @@ Keep these properties intact:
 - Challenge steps must be ordered and session-bound.
 - Passkey assertions must verify against a server-issued challenge.
 - Passkey registration must be gated by a fresh face or hand verification token.
+- Flash fallback must reuse the exact accepted `mediaDigest`; it must never bypass or replace server-side presentation analysis.
+- The camera lab must remain behind `ZOE_DEBUG=1` and must never issue tokens or alter verification thresholds.
 
-The app is still a demo. For production, the README already calls out needed upgrades: durable storage, real account-backed passkeys, server-side media verification or stronger liveness, abuse monitoring, datastore-backed rate limits, deployment-specific CSRF/origin checks, secret management, and a complete accessibility policy.
+The app is still a demo. For production, the README calls out remaining work including evaluated PAD thresholds and datasets, camera/device integrity signals, realistic replay and injection resistance, abuse monitoring, datastore-backed rate limits, deployment-specific CSRF/origin checks, secret management, and a complete accessibility policy.
 
 ## Branding
 

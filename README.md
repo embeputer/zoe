@@ -48,6 +48,8 @@ Then open `http://localhost:3001` (or match your `PORT`). Use `localhost`, not `
 | `ZOE_LOG_VERIFICATION_FAILURES` | off | Set to `1` to emit JSON lines for verification rejections (reason code only, no PII) |
 | `ZOE_DB_PATH` | `./zoe-data.sqlite3` | SQLite file for durable sessions, passkey credentials, and consumed token digests (`:memory:` disables persistence) |
 | `ZOE_FIDO_ROOT_PEMS` | embedded Apple + Yubico roots | JSON array of PEMs replacing the built-in attestation trust anchors (tests inject a generated root) |
+| `ZOE_FACE_PAD_MODEL` | `models/face_antispoof_quantized.onnx` | Server-side face presentation-attack model |
+| `ZOE_FACE_DETECTOR_MODEL` | `models/face_detector.onnx` | Server-side face detector used to validate submitted face regions |
 
 ### Production behavior
 
@@ -66,13 +68,25 @@ Rate limits apply in-memory to POST routes under `/api/challenge`, `/api/step`, 
 npm test
 ```
 
+## Camera Debug Lab
+
+```sh
+npm run debug
+```
+
+Open `http://localhost:3001/debug.html`. The disposable camera lab reports face confidence, pulse detection, estimated BPM, signal quality, flash baseline coverage, and per-color response direction/strength. It does not call verification APIs or issue tokens, and its files return 404 unless the server starts with `ZOE_DEBUG=1`.
+
+## Bundled Models
+
+The server-side MiniFASNetV2-SE presentation model and YuNet-style face detector come from [`facenox/face-antispoof-onnx`](https://github.com/facenox/face-antispoof-onnx). Their MIT license is retained in `models/face_antispoof_LICENSE.txt`.
+
 ## Adversarial Harness
 
 ```sh
 npm run attack
 ```
 
-`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera, no MediaPipe — including synthesized pixel streams that match the issued flash sequence and pulse series with a physiologic-band spectral peak. It reports which checks a scripted client fools and documents the honest ceiling of client-side evidence: even pulse-checked, pixel-verified flash liveness stays forgeable by a script that synthesizes matching signals. Closing that hole needs server-side media verification (e.g. a PAD model on uploaded frames) or hardware attestation.
+`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera or MediaPipe — including a procedural face, synthesized pulse, and pixels that match the issued flash sequence. Server-side face detection plus presentation analysis blocks the harness's fabricated and replayed-summary face attacks. The hand-gesture route remains forgeable because it still accepts client-generated landmark evidence, and face PAD does not prove camera provenance or defeat a sufficiently realistic injected/replayed feed.
 
 ```sh
 npm run attack:agent
@@ -102,11 +116,12 @@ The regression test starts a temporary local HTTP server and checks that:
 1. The browser asks the server for a challenge.
 2. The user chooses a primary verification method, such as hand gestures or face motion.
 3. The browser performs the local check and submits bounded evidence for that step.
-4. Face verification uses rPPG as its default media gate: the client samples green-channel means over a forehead ROI in the background during centering and head turns, then adds a short hold-still top-up. The server analyzes the stillness tail for a physiologic-band heartbeat (48–144 BPM, rejecting flat and clean-sine signals).
-5. If the pulse signal is inconclusive, Zoe keeps the challenge open and explicitly offers a flash-reflection fallback. Flash never auto-starts: the user must accept a photosensitivity warning that also calls out poor-lighting and skin-tone accuracy limits. The server then checks timestamped face pixels against its random color plan for correlation, coverage, and sensor noise. `prefers-reduced-motion` clients are never offered this fallback.
-6. The server validates order, timing, replay state, pulse or explicitly accepted flash evidence, and session binding.
-6. After all steps pass, the server issues a short-lived signed token.
-7. The protected action accepts only that server-issued token, once.
+4. During the calm front-facing tail, the browser captures three to five bounded 320×240 JPEG frames with normalized face regions and a digest bound to the challenge id.
+5. The server validates frame count, spacing, duration, dimensions, encoded size, uniqueness, and digest binding. It independently detects a face in consecutive frames, compares the detected regions with the submitted regions, then runs the bundled MiniFASNet presentation-attack model over the face crops.
+6. Face verification also uses rPPG as its default media gate: the client samples green-channel means over a forehead ROI during centering and head turns, then adds a short stillness top-up. The server analyzes the stillness tail for a physiologic-band heartbeat (48–144 BPM, rejecting flat and clean-sine signals).
+7. If pulse is inconclusive, Zoe keeps the challenge open and explicitly offers a flash-reflection fallback. Flash never auto-starts. The accepted frame digest and presentation result stay fixed across that retry, so flash cannot replace rejected media.
+8. The server validates order, wall-clock timing, replay state, presentation analysis, pulse or explicitly accepted flash evidence, and session binding.
+9. After all steps pass, the server issues a short-lived signed token that the protected action accepts once.
 
 Relying parties can redeem a token without the user's session cookie via `POST /api/verify` with `{ "verificationToken": "..." }`. It validates the signature and expiry, enforces one-use, and returns `{ valid, action, method, assurance, expiresAt }`. A second redemption returns `409`. Production deployments should additionally authenticate the calling party (e.g. a shared RP secret).
 
@@ -121,4 +136,4 @@ There is no emergency text/audio verification path. When camera detection takes 
 
 ## Security Notes
 
-This patch fixes the original client-side trust-boundary problem and adds a pixel-verified flash challenge to face checks, but it is still a demo — the attack harness proves a script synthesizing matching pixels still fools it. For high-value production use, add server-side media verification, abuse monitoring, durable storage, passkey credentials stored on user accounts instead of in memory, rate limits backed by a shared datastore (this demo uses in-memory limits only), secret management via your platform, CSRF/origin allowlists tuned to your deployment (`ZOE_ALLOWED_ORIGINS`), and a fully designed accessibility policy.
+Face checks now include bounded challenge-bound frames, independent server face-region validation, and temporal presentation analysis. This raises the cost above simply speaking Zoe's public JSON protocol, but it does not prove that frames came from a physical camera and should not be marketed as immune to injected media, high-quality replay, or advanced generated video. Production use still needs evaluated PAD thresholds and datasets, camera/device integrity signals where available, abuse monitoring, datastore-backed rate limits, deployment-specific origin policy, secret management, retention/privacy policy, and a complete accessibility policy.

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Zoe camera lab</title>
+  <link rel="stylesheet" href="debug.css" />
+</head>
+<body>
+  <div id="flash-overlay" hidden></div>
+  <main>
+    <header>
+      <h1>Zoe camera lab</h1>
+      <p>Disposable pulse and flash diagnostics. Nothing here issues a verification token or changes Zoe's acceptance rules.</p>
+    </header>
+    <div class="grid">
+      <section class="card">
+        <div class="camera">
+          <video id="video" autoplay playsinline muted></video>
+          <canvas id="overlay"></canvas>
+        </div>
+        <div class="actions">
+          <button id="start" class="primary" type="button">Start camera</button>
+          <button id="reset" class="secondary" type="button" disabled>Reset pulse sample</button>
+        </div>
+        <p class="small">Keep your face centered and look at the camera for about 10 seconds.</p>
+      </section>
+      <div>
+        <section class="card">
+          <div class="metric"><span class="label">Face</span><span id="face-status" class="value">Camera off</span></div>
+          <div class="metric"><span class="label">Pulse</span><span id="pulse-status" class="value">Waiting</span><span id="pulse-detail" class="small">No samples yet</span></div>
+          <div class="metric"><span class="label">Estimated heart rate</span><span id="bpm" class="value">—</span></div>
+          <div class="metric"><span class="label">Signal quality</span><span id="quality" class="value">—</span></div>
+        </section>
+        <section class="card flash-card">
+          <h2>Flash response</h2>
+          <div class="warning">This test flashes the screen. Do not run it if you have photosensitive epilepsy or are sensitive to flashing lights.</div>
+          <div class="actions"><button id="flash" class="secondary" type="button" disabled>Run flash test</button></div>
+          <div class="metric"><span class="label">Baseline coverage</span><span id="baseline" class="value">—</span></div>
+          <div id="flash-results"><span class="small">No flash test yet</span></div>
+        </section>
+      </div>
+    </div>
+  </main>
+  <script src="debug_metrics.js"></script>
+  <script type="module" src="debug.js"></script>
+</body>
+</html>

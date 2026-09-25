@@ -3,6 +3,11 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
+const {
+  computePresentationDigest,
+  validatePresentationFrames,
+  analyzePresentationFrames,
+} = require('./face_pad');
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -62,6 +67,7 @@ const MAX_MOTION_SERIES = 120;
 const LIVENESS_PLAN_LEFT_FIRST = ['center_hold', 'center_to_left', 'left_to_right'];
 const LIVENESS_PLAN_RIGHT_FIRST = ['center_hold', 'center_to_right', 'right_to_left'];
 const MAX_BODY_BYTES = 128 * 1024;
+const MAX_LIVENESS_BODY_BYTES = 640 * 1024;
 const FLASH_FACE_PIXEL_BYTES = 12 * 9 * 3;
 const FLASH_BG_PIXEL_BYTES = 4 * 1 * 3;
 const MAX_PIXEL_SAMPLES = 140;
@@ -465,12 +471,12 @@ function sendJson(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-function readJson(req) {
+function readJson(req, maxBytes = MAX_BODY_BYTES) {
   return new Promise((resolve, reject) => {
     let body = '';
     req.on('data', (chunk) => {
       body += chunk;
-      if (body.length > MAX_BODY_BYTES) {
+      if (body.length > maxBytes) {
         reject(new Error('Request body too large.'));
         req.destroy();
       }
@@ -1401,7 +1407,7 @@ function verifyAttestation(attestationObjectB64, clientDataJSONBytes, origin, ex
   };
 }
 
-async function handleApi(req, res, pathname) {
+async function handleApi(req, res, pathname, services = {}) {
   sweepExpiredState();
   const session = getSession(req, res);
   if (!enforcePostSecurity(req, res, pathname, session)) return;
@@ -1640,7 +1646,7 @@ async function handleApi(req, res, pathname) {
   if (req.method === 'POST' && pathname === '/api/liveness/verify') {
     let body;
     try {
-      body = await readJson(req);
+      body = await readJson(req, MAX_LIVENESS_BODY_BYTES);
     } catch (err) {
       return sendJson(res, 400, { error: err.message });
     }
@@ -1689,6 +1695,33 @@ async function handleApi(req, res, pathname) {
       logVerificationFailure('liveness_phases_rejected', pathname);
       return sendJson(res, 400, { error: phaseError });
     }
+
+    const mediaValidation = validatePresentationFrames(pending.id, body.mediaFrames, body.mediaDigest);
+    if (mediaValidation.error) {
+      logVerificationFailure('liveness_media_rejected', pathname);
+      return sendJson(res, 400, { error: mediaValidation.error });
+    }
+    if (pending.presentationDigest && pending.presentationDigest !== body.mediaDigest) {
+      return sendJson(res, 400, { error: 'Camera media changed during this verification attempt.' });
+    }
+    let presentationResult;
+    if (pending.presentationDigest) {
+      presentationResult = pending.presentationResult;
+    } else {
+      try {
+        const analyzer = services.analyzePresentationFrames || analyzePresentationFrames;
+        presentationResult = await analyzer(mediaValidation.frames);
+      } catch (err) {
+        console.error('Face presentation analysis failed:', err.message);
+        return sendJson(res, 503, { error: 'Face presentation analysis is temporarily unavailable.' });
+      }
+    }
+    if (!presentationResult || presentationResult.real !== true) {
+      logVerificationFailure('liveness_presentation_rejected', pathname);
+      return sendJson(res, 400, { error: 'The camera view looked like a photo or screen. Try again with your face clearly visible.' });
+    }
+    pending.presentationDigest = body.mediaDigest;
+    pending.presentationResult = presentationResult;
 
     const pulseResult = validatePulseSeries(body.pulseSeries, pending.reducedMotion);
     if (pulseResult.error) {
@@ -1791,6 +1824,14 @@ function contentType(filePath) {
 
 function serveStatic(req, res, pathname) {
   const requested = pathname === '/' ? '/index.html' : pathname;
+  if (
+    process.env.ZOE_DEBUG !== '1'
+    && ['/debug.html', '/debug.css', '/debug.js', '/debug_metrics.js'].includes(requested)
+  ) {
+    securityHeaders(res);
+    res.writeHead(404);
+    return res.end('Not found');
+  }
   const filePath = path.resolve(__dirname, `.${requested}`);
   if (!filePath.startsWith(__dirname) || !['.html', '.css', '.js', '.tflite', '.task', '.png'].includes(path.extname(filePath))) {
     securityHeaders(res);
@@ -1809,11 +1850,11 @@ function serveStatic(req, res, pathname) {
   });
 }
 
-function createServer() {
+function createServer(services = {}) {
   return http.createServer((req, res) => {
     const url = new URL(req.url, `http://${req.headers.host || `${HOST}:${PORT}`}`);
     if (url.pathname.startsWith('/api/')) {
-      handleApi(req, res, url.pathname).catch((err) => {
+      handleApi(req, res, url.pathname, services).catch((err) => {
         console.error(err);
         sendJson(res, 500, { error: 'Internal server error.' });
       });
@@ -1826,6 +1867,9 @@ function createServer() {
 if (require.main === module) {
   createServer().listen(PORT, HOST, () => {
     console.log(`Zoe server listening on http://${HOST}:${PORT}`);
+    if (process.env.ZOE_DEBUG === '1') {
+      console.log(`Camera lab: http://${HOST}:${PORT}/debug.html`);
+    }
   });
 }
 
@@ -1844,4 +1888,6 @@ module.exports = {
   verifyAuthenticatorData,
   createFlashPlan,
   validatePixelSeries,
+  computePresentationDigest,
+  validatePresentationFrames,
 };
