@@ -5,8 +5,11 @@ const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
 const {
   computePresentationDigest,
+  computeFlashDigest,
   validatePresentationFrames,
+  validateFlashFrames,
   analyzePresentationFrames,
+  faceSignals,
 } = require('./face_pad');
 
 const PORT = Number(process.env.PORT || 3000);
@@ -660,11 +663,6 @@ function validatePixelSeries(pixelSeries, flashPlan) {
       if (!f) return 'Pixel sample face data is invalid.';
       entry.f = f;
     }
-    if (sample.b !== undefined) {
-      const b = decodePixelField(sample.b, FLASH_BG_PIXEL_BYTES);
-      if (!b) return 'Pixel sample background data is invalid.';
-      entry.b = b;
-    }
     samples.push(entry);
   }
 
@@ -808,8 +806,134 @@ function validatePulseSeries(pulseSeries, reducedMotion) {
   return { bpm: Math.round(peakIdx * binHz * 60) };
 }
 
-function computeLivenessSeriesDigest(challengeId, motionSeries) {
-  return crypto.createHash('sha256').update(`${challengeId}\n${JSON.stringify(motionSeries)}`).digest('hex');
+// The submitted pulse and pixel claims must agree with the camera frames'
+// actual pixels — recomputed here from the JPEGs, so fabrication has to
+// produce real changing pixel data, not just plausible numbers.
+const PULSE_FRAME_MIN_MATCH = 4;
+const PULSE_FRAME_CORR_MIN = 0.35;
+const PULSE_FRAME_SIGN_MIN = 0.66;
+
+function chromaOf({ r, g, b }) {
+  const s = r + g + b;
+  return s > 0 ? [r / s, g / s, b / s] : [1 / 3, 1 / 3, 1 / 3];
+}
+
+function detrended(xs) {
+  const n = xs.length;
+  const mean = xs.reduce((a, v) => a + v, 0) / n;
+  const xm = (n - 1) / 2;
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < n; i += 1) {
+    num += (i - xm) * (xs[i] - mean);
+    den += (i - xm) * (i - xm);
+  }
+  const slope = den > 0 ? num / den : 0;
+  return xs.map((v, i) => v - mean - slope * (i - xm));
+}
+
+// Recompute each frame's face-region green mean, interpolate the submitted
+// pulse at those timestamps, and require the two traces to move together.
+function validatePulseFrameBinding(pulseSeries, frameSignalsList) {
+  if (!Array.isArray(pulseSeries) || !pulseSeries.length) return 'Pulse series is invalid.';
+  const usable = frameSignalsList.filter((f) => f.signals);
+  if (usable.length < PULSE_FRAME_MIN_MATCH) return 'Camera frames did not cover the pulse window.';
+  const byT = pulseSeries.map((s) => s.t);
+  // Claims are noisy singletons at ~10Hz while a frame is an instantaneous
+  // mean; compare each frame against the local claim average (±140ms) so a
+  // single noisy sample can't decorrelate an honest trace.
+  const pulseAt = (t) => {
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i < byT.length; i += 1) {
+      if (byT[i] < t - 140) continue;
+      if (byT[i] > t + 140) break;
+      sum += pulseSeries[i].g;
+      count += 1;
+    }
+    if (count) return sum / count;
+    let lo = 0;
+    let hi = byT.length - 1;
+    if (t <= byT[0]) return pulseSeries[0].g;
+    if (t >= byT[hi]) return pulseSeries[hi].g;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (byT[mid] <= t) lo = mid; else hi = mid;
+    }
+    const span = byT[hi] - byT[lo] || 1;
+    return pulseSeries[lo].g + ((pulseSeries[hi].g - pulseSeries[lo].g) * (t - byT[lo])) / span;
+  };
+  const span0 = byT[0];
+  const span1 = byT[byT.length - 1];
+  const inWindow = usable.filter((f) => f.t >= span0 - 200 && f.t <= span1 + 200);
+  if (inWindow.length < PULSE_FRAME_MIN_MATCH) return 'Camera frames did not cover the pulse window.';
+  const frameG = detrended(inWindow.map((f) => f.signals.g));
+  const claimedG = detrended(inWindow.map((f) => pulseAt(f.t)));
+  const n = frameG.length;
+  const dot = frameG.reduce((a, v, i) => a + v * claimedG[i], 0);
+  const magA = Math.sqrt(frameG.reduce((a, v) => a + v * v, 0));
+  const magB = Math.sqrt(claimedG.reduce((a, v) => a + v * v, 0));
+  const corr = magA > 1e-6 && magB > 1e-6 ? dot / (magA * magB) : 0;
+  let signs = 0;
+  let signN = 0;
+  for (let i = 1; i < n; i += 1) {
+    const dF = frameG[i] - frameG[i - 1];
+    const dC = claimedG[i] - claimedG[i - 1];
+    if (Math.abs(dF) < 1e-4 || Math.abs(dC) < 1e-4) continue;
+    signN += 1;
+    if (Math.sign(dF) === Math.sign(dC)) signs += 1;
+  }
+  const signAgree = signN >= 4 ? signs / signN : 0;
+  if (corr >= PULSE_FRAME_CORR_MIN || signAgree >= PULSE_FRAME_SIGN_MIN) return null;
+  return 'Pulse claim does not match the camera pixels.';
+}
+
+// Recompute chroma of each flash-tagged frame and require per-flash deltas to
+// track the issued plan — same cosine/ratio rule as validatePixelSeries, but
+// measured from the JPEGs rather than client-claimed rows.
+function validateFlashFrameBinding(flashFrames, flashPlan) {
+  const signalOf = (f) => faceSignals(f.image, f.face);
+  const baselineFrames = flashFrames.filter((d) => d.f === -1);
+  const baselineChroma = chromaOf(meanSignals(baselineFrames.map(signalOf)));
+  for (let i = 0; i < flashPlan.length; i += 1) {
+    const during = flashFrames.filter((d) => d.f === i);
+    const observed = chromaOf(meanSignals(during.map(signalOf)));
+    const expected = chromaOf({ r: flashPlan[i].c[0], g: flashPlan[i].c[1], b: flashPlan[i].c[2] });
+    const delta = observed.map((v, k) => v - baselineChroma[k]);
+    const expectedDelta = expected.map((v) => v - 1 / 3);
+    const deltaMag = Math.hypot(...delta);
+    const expectedMag = Math.hypot(...expectedDelta);
+    const cosine = deltaMag > 1e-6 && expectedMag > 1e-6
+      ? delta.reduce((sum, v, k) => sum + v * expectedDelta[k], 0) / (deltaMag * expectedMag)
+      : 0;
+    const ratio = deltaMag / expectedMag;
+    if (cosine < FLASH_CHROMA_COSINE_MIN || ratio < FLASH_CHROMA_RATIO_MIN || ratio > FLASH_CHROMA_RATIO_MAX) {
+      return 'Flash camera pixels did not reflect the issued sequence.';
+    }
+  }
+  return null;
+}
+
+function meanSignals(list) {
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  let n = 0;
+  for (const s of list) {
+    if (!s) continue;
+    r += s.r;
+    g += s.g;
+    b += s.b;
+    n += 1;
+  }
+  return n ? { r: r / n, g: g / n, b: b / n } : { r: 0, g: 0, b: 0 };
+}
+
+function computeLivenessSeriesDigest(challengeId, motionSeries, pulseSeries) {
+  return crypto
+    .createHash('sha256')
+    .update(`${challengeId}\n${JSON.stringify(motionSeries)}\n${JSON.stringify(pulseSeries || [])}`)
+    .digest('hex');
 }
 
 function validateMotionSeriesAgainstPlan(motionSeries, plan) {
@@ -1714,9 +1838,10 @@ async function handleApi(req, res, pathname, services = {}) {
     if (seriesPlanError) return sendJson(res, 400, { error: seriesPlanError });
     const coverageError = validateMotionSeriesCoverage(motionSeries, pending.plan);
     if (coverageError) return sendJson(res, 400, { error: coverageError });
-    const expectedDigest = computeLivenessSeriesDigest(pending.id, motionSeries);
+    const pulseSeriesBody = body.pulseSeries;
+    const expectedDigest = computeLivenessSeriesDigest(pending.id, motionSeries, pulseSeriesBody);
     if (expectedDigest !== seriesDigest) {
-      return sendJson(res, 400, { error: 'Face motion digest does not match the submitted series.' });
+      return sendJson(res, 400, { error: 'Face evidence digest does not match the submitted series.' });
     }
 
     const derivedPhases = deriveLivenessPhasesFromMotionSeries(motionSeries, pending.plan);
@@ -1762,7 +1887,14 @@ async function handleApi(req, res, pathname, services = {}) {
     pending.presentationDigest = body.mediaDigest;
     pending.presentationResult = presentationResult;
 
-    const pulseResult = validatePulseSeries(body.pulseSeries, pending.reducedMotion);
+    // The claimed pulse must agree with the frames' own pixels — recomputed
+    // green means over the face region, interpolated against the submitted
+    // series. Fabricated series can't match real (or static) camera data.
+    const pulseFrameSignals = mediaValidation.frames.map((f) => ({ t: f.t, signals: faceSignals(f.image, f.face) }));
+    const pulseBindingError = validatePulseFrameBinding(body.pulseSeries, pulseFrameSignals);
+    const pulseResult = pulseBindingError
+      ? { error: pulseBindingError }
+      : validatePulseSeries(body.pulseSeries, pending.reducedMotion);
     if (pulseResult.error) {
       logVerificationFailure('liveness_pulse_rejected', pathname);
       if (!pending.flashPlan) {
@@ -1782,6 +1914,16 @@ async function handleApi(req, res, pathname, services = {}) {
       if (pixelError) {
         logVerificationFailure('liveness_pixels_rejected', pathname);
         return sendJson(res, 400, { error: pixelError });
+      }
+      const flashFramesValidation = validateFlashFrames(pending.id, body.flashFrames, body.flashDigest, pending.flashPlan);
+      if (flashFramesValidation.error) {
+        logVerificationFailure('liveness_flash_frames_rejected', pathname);
+        return sendJson(res, 400, { error: flashFramesValidation.error });
+      }
+      const flashBindingError = validateFlashFrameBinding(flashFramesValidation.frames, pending.flashPlan);
+      if (flashBindingError) {
+        logVerificationFailure('liveness_flash_frames_rejected', pathname);
+        return sendJson(res, 400, { error: flashBindingError });
       }
     }
 
@@ -1932,4 +2074,6 @@ module.exports = {
   validatePixelSeries,
   computePresentationDigest,
   validatePresentationFrames,
+  computeFlashDigest,
+  validateFlashFrames,
 };
