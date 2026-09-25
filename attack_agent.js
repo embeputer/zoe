@@ -208,14 +208,15 @@ async function probeScriptedZoeId(baseUrl, cookie) {
   cookie = res.cookie;
   const token = res.body && res.body.verificationToken;
   if (!token) return { fooled: false, note: `auth rejected (${res.res.status}: ${res.body && res.body.error})`, cookie };
-  const use = await request(baseUrl, '/api/protected-action', {
+  const redeem = await request(baseUrl, '/api/verify', {
     method: 'POST',
     body: { verificationToken: token },
   }, cookie);
+  const assurance = redeem.body && redeem.body.assurance;
   return {
-    fooled: use.res.status === 200,
-    note: `Zoe ID lifecycle fully scripted; token minted with 'strong' assurance (self-asserted UV flag), protected action ${use.res.status}`,
-    cookie: use.cookie,
+    fooled: redeem.res.status === 200 && assurance === 'strong',
+    note: `Zoe ID lifecycle fully scripted; token assurance '${assurance}' — ${assurance === 'strong' ? "software key minted 'strong'" : "attestation gate holds: software key capped at 'standard'"}`,
+    cookie: redeem.cookie,
   };
 }
 
