@@ -55,6 +55,9 @@ const verificationTitleEl = $('verification-title');
 const startBtn = $('start-btn');
 const cardEl = $('captcha-card');
 const flashOverlayEl = $('flash-overlay');
+const flashConsentEl = $('flash-consent');
+const flashConsentAcceptBtn = $('flash-consent-accept');
+const flashConsentDeclineBtn = $('flash-consent-decline');
 const flowStepsEl = $('flow-steps');
 const flowStepLabelEl = $('flow-step-label');
 const panelShellEl = $('panel-shell');
@@ -264,8 +267,30 @@ async function apiJson(path, body) {
     body: JSON.stringify(body || {}),
   });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status}).`);
+  if (!response.ok) {
+    const error = new Error(data.error || `Request failed (${response.status}).`);
+    error.status = response.status;
+    error.data = data;
+    throw error;
+  }
   return data;
+}
+
+function askForFlashFallback() {
+  return new Promise((resolve) => {
+    const finish = (accepted) => {
+      flashConsentEl.hidden = true;
+      flashConsentAcceptBtn.removeEventListener('click', accept);
+      flashConsentDeclineBtn.removeEventListener('click', decline);
+      resolve(accepted);
+    };
+    const accept = () => finish(true);
+    const decline = () => finish(false);
+    flashConsentAcceptBtn.addEventListener('click', accept);
+    flashConsentDeclineBtn.addEventListener('click', decline);
+    flashConsentEl.hidden = false;
+    flashConsentDeclineBtn.focus();
+  });
 }
 
 function base64urlToBuffer(value) {
@@ -1011,6 +1036,9 @@ async function registerPasskey(registrationVerificationToken) {
     clientDataJSON: bufferToBase64url(credential.response.clientDataJSON),
     publicKey: bufferToBase64url(publicKey),
     alg,
+    attestationObject: credential.response.attestationObject
+      ? bufferToBase64url(credential.response.attestationObject)
+      : undefined,
   });
 }
 
@@ -1497,6 +1525,7 @@ async function runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeri
           const motionValue = opts.motionValue(box);
           pushFaceSeriesSample(phaseSeries, opts.phase, opts.flowStartedAt, motionValue, box.keypoints);
         }
+        if (opts.collectPulse) opts.collectPulse(box);
       }
       promptHintEl.textContent = opts.hint;
       drawFaceGuide(box, { state: 'move', arrow: opts.arrow });
@@ -1597,6 +1626,14 @@ const PULSE_MEASURE_MS = 14000;
 // carries the liveness gate and measures longer to compensate.
 const PULSE_MEASURE_MS_REDUCED = 20000;
 const PULSE_SAMPLE_MS = 95;
+// Pulse sampling also runs in the background during the motion phases, so the
+// dedicated hold-still stage only tops up whatever window is still missing.
+// The floor keeps the server's analysis tail mostly stillness; reduced-motion
+// challenges rely on the pulse check alone so their tail is longer.
+const PULSE_TOPUP_MIN_MS = 5000;
+const PULSE_TOPUP_MIN_REDUCED_MS = 9000;
+const PULSE_BG_MIN_GAP_MS = 110;
+const PULSE_BG_MAX_SAMPLES = 300;
 const pulseCanvas = document.createElement('canvas');
 pulseCanvas.width = PULSE_ROI_W;
 pulseCanvas.height = PULSE_ROI_H;
@@ -1623,17 +1660,16 @@ function samplePulseGreen(box) {
   return g / n;
 }
 
-async function runPulseCheck(engine, measureMs = PULSE_MEASURE_MS) {
-  const t0 = performance.now();
-  const samples = [];
+async function runPulseCheck(engine, measureMs, samples, t0) {
+  const measureStart = performance.now();
   setStatus('Hold still', 'listening');
   promptNameEl.textContent = 'Hold still';
   while (faceChecking) {
-    const now = performance.now() - t0;
+    const now = performance.now() - measureStart;
     if (now > measureMs) break;
     const box = await detectStableFaceFrame(engine);
     const g = box && !box.stale ? samplePulseGreen(box) : null;
-    if (g !== null) samples.push({ g: Math.round(g * 100) / 100, t: Math.round(now) });
+    if (g !== null) samples.push({ g: Math.round(g * 100) / 100, t: Math.round(performance.now() - t0) });
     const remaining = Math.max(1, Math.ceil((measureMs - now) / 1000));
     promptHintEl.textContent = `Keep your face lit and steady — ${remaining}s left`;
     await sleep(PULSE_SAMPLE_MS);
@@ -1689,7 +1725,19 @@ async function runGuidedFaceCheck() {
   const yaws = [];
   const poses = [];
   const phaseSeries = [];
+  const pulseSeries = [];
   const startedAt = performance.now();
+  let lastPulseT = -1;
+  const collectPulse = (box) => {
+    if (!box || box.stale || pulseSeries.length >= PULSE_BG_MAX_SAMPLES) return;
+    const t = performance.now() - startedAt;
+    if (t - lastPulseT < PULSE_BG_MIN_GAP_MS) return;
+    const g = samplePulseGreen(box);
+    if (g !== null) {
+      pulseSeries.push({ g: Math.round(g * 100) / 100, t: Math.round(t) });
+      lastPulseT = t;
+    }
+  };
   const deadline = startedAt + 30000;
   recentFaceBox = null;
   recentFaceBoxAt = 0;
@@ -1721,6 +1769,7 @@ async function runGuidedFaceCheck() {
         if (centeredFrames > 0 && phaseSeries.length < 120) {
           pushFaceSeriesSample(phaseSeries, 'center_hold', startedAt, motionValue(box), box.keypoints);
         }
+        collectPulse(box);
       }
       const ok = inTarget(box);
       promptHintEl.textContent = !box
@@ -1759,6 +1808,7 @@ async function runGuidedFaceCheck() {
         phase: phaseId,
         motionValue,
         reached: phaseUi.reached,
+        collectPulse,
       });
       if (!moved) {
         throw new Error(`Face motion timed out. ${phaseUi.hint} Then try again.`);
@@ -1769,16 +1819,11 @@ async function runGuidedFaceCheck() {
     if (!faceChecking) return;
 
     promptEmojiEl.textContent = '💓';
-    const pulseSeries = await runPulseCheck(engine, flashPlan ? PULSE_MEASURE_MS : PULSE_MEASURE_MS_REDUCED);
+    const pulseTargetMs = flashPlan ? PULSE_MEASURE_MS : PULSE_MEASURE_MS_REDUCED;
+    const pulseElapsedMs = pulseSeries.length ? pulseSeries[pulseSeries.length - 1].t : 0;
+    const pulseTopUpMinMs = flashPlan ? PULSE_TOPUP_MIN_MS : PULSE_TOPUP_MIN_REDUCED_MS;
+    await runPulseCheck(engine, Math.max(pulseTopUpMinMs, pulseTargetMs - pulseElapsedMs), pulseSeries, startedAt);
     if (!faceChecking) return;
-
-    let pixelSeries = null;
-    if (flashPlan && flashPlan.length) {
-      promptEmojiEl.textContent = '💡';
-      progressEl.style.width = '100%';
-      pixelSeries = await runFlashPixelCheck(engine, flashPlan);
-      if (!faceChecking) return;
-    }
 
     if (centers.length < 8 || (requirePoseLiveness && yaws.length < 8)) {
       throw new Error('No face was detected. Make sure your face is lit and centered, then try again.');
@@ -1812,7 +1857,7 @@ async function runGuidedFaceCheck() {
       return entry;
     });
     const seriesDigest = await livenessSeriesDigest(livenessChallenge.challengeId, motionSeries);
-    const result = await apiJson('/api/liveness/verify', {
+    const verificationBody = {
       challengeId: livenessChallenge.challengeId,
       durationMs,
       faceFrames: centers.length,
@@ -1820,10 +1865,33 @@ async function runGuidedFaceCheck() {
       phases,
       motionSeries,
       seriesDigest,
-      pixelSeries,
       pulseSeries,
       legacyEngine,
-    });
+    };
+    let result;
+    try {
+      result = await apiJson('/api/liveness/verify', verificationBody);
+    } catch (error) {
+      if (!error.data?.flashAvailable || !flashPlan?.length) throw error;
+      const accepted = await askForFlashFallback();
+      if (!accepted) {
+        stopCamera();
+        showChoicePanel('back');
+        return;
+      }
+      promptEmojiEl.textContent = '💡';
+      progressEl.style.width = '100%';
+      const pixelSeries = await runFlashPixelCheck(engine, flashPlan);
+      if (!faceChecking) return;
+      setStatus('Checking…', 'listening');
+      promptNameEl.textContent = 'Checking…';
+      promptHintEl.textContent = 'Confirming the backup liveness check.';
+      result = await apiJson('/api/liveness/verify', {
+        ...verificationBody,
+        flashFallback: true,
+        pixelSeries,
+      });
+    }
     verificationToken = result.verificationToken;
     await confirmProtectedAction();
   } finally {

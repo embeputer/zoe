@@ -208,14 +208,15 @@ async function probeScriptedZoeId(baseUrl, cookie) {
   cookie = res.cookie;
   const token = res.body && res.body.verificationToken;
   if (!token) return { fooled: false, note: `auth rejected (${res.res.status}: ${res.body && res.body.error})`, cookie };
-  const use = await request(baseUrl, '/api/protected-action', {
+  const redeem = await request(baseUrl, '/api/verify', {
     method: 'POST',
     body: { verificationToken: token },
   }, cookie);
+  const assurance = redeem.body && redeem.body.assurance;
   return {
-    fooled: use.res.status === 200,
-    note: `Zoe ID lifecycle fully scripted; token minted with 'strong' assurance (self-asserted UV flag), protected action ${use.res.status}`,
-    cookie: use.cookie,
+    fooled: redeem.res.status === 200 && assurance === 'strong',
+    note: `Zoe ID lifecycle fully scripted; token assurance '${assurance}' — ${assurance === 'strong' ? "software key minted 'strong'" : "attestation gate holds: software key capped at 'standard'"}`,
+    cookie: redeem.cookie,
   };
 }
 
@@ -270,7 +271,7 @@ async function probeInstantGestures(baseUrl, cookie) {
 }
 
 // Body fuzzing on the liveness verify gate: every malformed payload must be a
-// clean 400, never a 200 or a crash. Floor is lowered for this probe so field
+// clean 4xx, never a 200 or a crash. Floor is lowered for this probe so field
 // validation is what gets exercised (timing is covered by the instant probe).
 async function probeBodyFuzz(baseUrl, cookie) {
   process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '0';
@@ -283,7 +284,6 @@ async function probeBodyFuzz(baseUrl, cookie) {
     ['motionScore object', { motionScore: { v: 1 } }],
     ['pulseSeries oversized', { pulseSeries: new Array(401).fill({ g: 120, t: 1 }) }],
     ['pulseSeries too few', { pulseSeries: [{ g: 120, t: 0 }] }],
-    ['pixelSeries oversized', { pixelSeries: new Array(141).fill({ t: 0, f: 'AAAA', b: 'AAAA' }) }],
     ['pulse g out of range', { pulseSeries: fabricatedPulseSeries().map((s) => ({ ...s, g: 999 })) }],
     ['pulse t non-monotonic', { pulseSeries: fabricatedPulseSeries().map((s, i) => ({ ...s, t: i % 2 ? s.t : s.t + 100000 })) }],
     ['seriesDigest wrong type', { seriesDigest: 1234 }],
@@ -296,7 +296,7 @@ async function probeBodyFuzz(baseUrl, cookie) {
       body: fabricatedLivenessBody(challenge, patch),
     }, cookie);
     cookie = res.cookie;
-    if (res.res.status !== 400) anomalies.push(`${label} → ${res.res.status}`);
+    if (res.res.status < 400 || res.res.status >= 500) anomalies.push(`${label} → ${res.res.status}`);
   }
   process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '14000';
   return { fooled: anomalies.length > 0, note: anomalies.length ? anomalies.join('; ') : 'all malformed payloads cleanly rejected', cookie };

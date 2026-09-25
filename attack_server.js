@@ -223,7 +223,24 @@ async function controlUncorrelatedPixels(baseUrl, cookie) {
     ...s,
     f: Buffer.alloc(324).fill(40).toString('base64'),
   }));
+  const flatPulse = fabricatedPulseSeries().map((s) => ({ ...s, g: 118 }));
   await sleep(2100);
+  // First let the pulse gate fail so the server explicitly opens the fallback.
+  res = await request(baseUrl, '/api/liveness/verify', {
+    method: 'POST',
+    body: JSON.stringify({
+      challengeId,
+      durationMs: 2400,
+      faceFrames: 30,
+      motionScore: 0.35,
+      motionSeries,
+      seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
+      pulseSeries: flatPulse,
+    }),
+  }, cookie);
+  if (res.res.status !== 422 || !res.body.flashAvailable) {
+    return { fooled: true, note: `flash fallback was not offered cleanly: ${res.res.status}`, cookie };
+  }
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
     body: JSON.stringify({
@@ -234,7 +251,8 @@ async function controlUncorrelatedPixels(baseUrl, cookie) {
       motionSeries,
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
       pixelSeries: flatPixels,
-      pulseSeries: fabricatedPulseSeries(),
+      pulseSeries: flatPulse,
+      flashFallback: true,
     }),
   }, cookie);
   return { fooled: res.res.status === 200, note: `flash-ignoring pixels: ${res.res.status}`, cookie };

@@ -28,7 +28,7 @@ If port `3000` is already in use:
 env PORT=3001 npm start
 ```
 
-Then open `http://127.0.0.1:3001` (or match your `PORT`).
+Then open `http://localhost:3001` (or match your `PORT`). Use `localhost`, not `127.0.0.1` — IP literals aren't valid WebAuthn relying-party IDs, so Zoe ID throws `SecurityError` on an IP host (APIs/curl work fine on 127.0.0.1).
 
 ## Environment Variables
 
@@ -42,11 +42,12 @@ Then open `http://127.0.0.1:3001` (or match your `PORT`).
 | `ZOE_ALLOWED_ORIGINS` | `http://127.0.0.1:3000`, `http://127.0.0.1:3001`, `http://localhost:3000`, `http://localhost:3001` | Comma-separated browser origins allowed on state-changing POST APIs |
 | `ZOE_RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window (ms) per IP / session bucket |
 | `ZOE_RATE_LIMIT_MAX_PER_IP` | `120` | Max POST API requests per IP per window |
-| `ZOE_RATE_LIMIT_MAX_PER_SESSION` | `0` | Max POST API requests per session per window (`0` disables session limit) |
+| `ZOE_RATE_LIMIT_MAX_PER_SESSION` | `60` | Max POST API requests per session per window (`0` disables session limit) |
 | `ZOE_SESSION_IDLE_TTL_MS` | `3600000` | Drop idle sessions after this many ms |
 | `ZOE_SWEEP_INTERVAL_MS` | `30000` | Minimum interval between in-memory expiry sweeps |
 | `ZOE_LOG_VERIFICATION_FAILURES` | off | Set to `1` to emit JSON lines for verification rejections (reason code only, no PII) |
 | `ZOE_DB_PATH` | `./zoe-data.sqlite3` | SQLite file for durable sessions, passkey credentials, and consumed token digests (`:memory:` disables persistence) |
+| `ZOE_FIDO_ROOT_PEMS` | embedded Apple + Yubico roots | JSON array of PEMs replacing the built-in attestation trust anchors (tests inject a generated root) |
 
 ### Production behavior
 
@@ -80,12 +81,12 @@ npm run attack:agent
 `attack_agent.js` probes the API-level surface an autonomous agent sees — no media fabrication needed, just protocol abuse. Measured results:
 
 - **BLOCKED — instant verification.** The server now compares `now() - challenge.createdAt` to a wall-clock floor (`ZOE_LIVENESS_MIN_ELAPSED_MS`, default 14s — the pulse stage's real duration; `ZOE_STEP_MIN_ELAPSED_MS`, default 180ms per gesture step). A "20-second" verification submitted in ~40ms is rejected, which also caps attempt rate at ~1 per real flow duration.
-- **FOOLED — Zoe ID is still scriptable, just slower.** `attestation: 'none'` + register accepting any SPKI key means a generated P-256 keypair registers behind a forged liveness token and mints `'strong'` assurance with self-asserted UP|UV flags — the floor only makes each attempt cost ≥14s. Closing it needs real attestation (packed/fido-u2f + AAGUID allowlist), not more statistics.
+- **BLOCKED — scripted Zoe ID caps at `'standard'`.** Registration now asks the authenticator for an attestation (`attestation: 'direct'`) and verifies it: a `packed`/`apple` x5c chain reaching an embedded FIDO root (Apple, Yubico) marks the credential `hardwareBacked`; `fmt 'none'`, self-attestation, and chains that don't reach a known root (Chrome/Android software keys emit self-signed leaves) still register but stay software. A generated P-256 keypair completes the whole Zoe ID lifecycle but redeems `assurance: 'standard'` — `'strong'` requires hardware attestation plus a user-verified (UV) assertion.
 - **BLOCKED — type coercion.** Payload field types are asserted (`typeof === 'number'`), not coerced — `"2400"` as a string is now a 400.
 - **INFO — session farming closed.** Anonymous requests mint memory-only sessions; a row is persisted only when the session gains real state (challenge, credential, token).
 - **BLOCKED — token double-redeem** across `/api/protected-action` + `/api/verify` (one wins, one 409s).
 - **BLOCKED — challenge binding.** Liveness challenges live in a per-session slot with unguessable ids; cross-session use and id guessing both 400.
-- **BLOCKED — rate limit.** First 429 lands at the 120/min IP cap; cookie rotation gains nothing, but distributed IPs bypass it and the per-session limiter ships disabled (`ZOE_RATE_LIMIT_MAX_PER_SESSION=0`).
+- **BLOCKED — rate limit.** First 429 lands at the 120/min IP cap; the per-session limiter is also on by default (60/min, `ZOE_RATE_LIMIT_MAX_PER_SESSION`), so cookie rotation gains nothing — distributed IPs still bypass it.
 
 The regression test starts a temporary local HTTP server and checks that:
 
@@ -101,8 +102,9 @@ The regression test starts a temporary local HTTP server and checks that:
 1. The browser asks the server for a challenge.
 2. The user chooses a primary verification method, such as hand gestures or face motion.
 3. The browser performs the local check and submits bounded evidence for that step.
-4. Face verification ends with two server-side liveness checks: an rPPG pulse stage (the client samples green-channel means over a forehead ROI for ~14s; the server runs spectral analysis for a physiologic-band heartbeat, 48–144 BPM, rejecting flat and clean-sine signals) followed by a flash challenge (the server issues a random color sequence, the screen flashes it, and the client uploads timestamped face-region pixel bursts the server checks for correlation, coverage, and sensor noise). The flash plan is slowed to ~1 flash/second for photosensitivity, and `prefers-reduced-motion` clients skip it entirely — the pulse check alone then carries the liveness gate.
-5. The server validates order, timing, replay state, pulse + pixel evidence, and session binding.
+4. Face verification uses rPPG as its default media gate: the client samples green-channel means over a forehead ROI in the background during centering and head turns, then adds a short hold-still top-up. The server analyzes the stillness tail for a physiologic-band heartbeat (48–144 BPM, rejecting flat and clean-sine signals).
+5. If the pulse signal is inconclusive, Zoe keeps the challenge open and explicitly offers a flash-reflection fallback. Flash never auto-starts: the user must accept a photosensitivity warning that also calls out poor-lighting and skin-tone accuracy limits. The server then checks timestamped face pixels against its random color plan for correlation, coverage, and sensor noise. `prefers-reduced-motion` clients are never offered this fallback.
+6. The server validates order, timing, replay state, pulse or explicitly accepted flash evidence, and session binding.
 6. After all steps pass, the server issues a short-lived signed token.
 7. The protected action accepts only that server-issued token, once.
 
@@ -112,7 +114,7 @@ Relying parties can redeem a token without the user's session cookie via `POST /
 
 The UI gives camera guidance when detection struggles. Users can choose a different primary method before verification:
 
-- **Zoe ID**: strongest repeat-use path. Approved users verify with a passkey through WebAuthn, and the server verifies the signed assertion.
+- **Zoe ID**: strongest repeat-use path. Approved users verify with a passkey through WebAuthn, and the server verifies the signed assertion. At registration the server also verifies the authenticator's attestation: credentials whose packed/apple x5c chain reaches an embedded FIDO root are marked hardware-backed, and only those (with a user-verified assertion) mint `assurance: 'strong'` tokens — everything else caps at `'standard'`.
 - **Face motion**: primary local face-motion check using MediaPipe Tasks Vision FaceDetector (cross-browser; works in Chrome, Safari, and Firefox under a strict CSP). The compatible short-range detector model is served locally from `models/`, and the browser verifies confidence, face-sized bounds, target-oval position, and eye/nose keypoint yaw before counting server-prompted head turns (`center_hold`, then left-first or right-first). The server issues the phase plan, validates phase order/metrics, and checks a `challengeId`-bound `seriesDigest` over the submitted `motionSeries`. Standard motion checks also include loose micro-jitter and path-tortuosity heuristics on hold and between-pose samples (not virtual-camera protection). It falls back to the browser `FaceDetector` API only when the MediaPipe runtime cannot load, using box motion because that fallback has no keypoints. It checks liveness-style motion, not identity.
 
 There is no emergency text/audio verification path. When camera detection takes a bit, Zoe shows passive camera guidance while the user keeps trying the selected method.

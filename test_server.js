@@ -7,6 +7,9 @@ process.env.ZOE_SECRET = process.env.ZOE_SECRET || 'zoe-test-secret';
 process.env.ZOE_LIVENESS_MIN_ELAPSED_MS = '0';
 process.env.ZOE_STEP_MIN_ELAPSED_MS = '0';
 process.env.ZOE_REDUCED_MOTION_MIN_ELAPSED_MS = '0';
+// Per-session limiter off for the suite (it exceeds it legitimately);
+// one unit case re-enables to assert it.
+process.env.ZOE_RATE_LIMIT_MAX_PER_SESSION = '0';
 const assert = require('assert');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
@@ -210,8 +213,33 @@ async function main() {
     }, cookie);
     assert.strictEqual(smoothStub.res.status, 400);
 
-    // Pixels that ignore the issued flash sequence must be rejected.
+    // Flash is a fallback only: valid pulse evidence succeeds without pixels.
+    const pulseOnlyChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const pulseOnly = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(pulseOnlyChallenge.body.challengeId, pulseOnlyChallenge.body.plan, pulseOnlyChallenge.body.flashPlan, {
+        pixelSeries: undefined,
+      })),
+    }, cookie);
+    assert.strictEqual(pulseOnly.res.status, 200);
+    assert.strictEqual(pulseOnly.body.usedFlashFallback, false);
+
+    // If pulse is inconclusive, the challenge stays open and advertises the
+    // explicit flash fallback rather than starting it automatically.
     const darkChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const flatPulse = samplePulseSeries().map((s) => ({ ...s, g: 118 }));
+    const flashOffer = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(darkChallenge.body.challengeId, darkChallenge.body.plan, darkChallenge.body.flashPlan, {
+        pixelSeries: undefined,
+        pulseSeries: flatPulse,
+      })),
+    }, cookie);
+    assert.strictEqual(flashOffer.res.status, 422);
+    assert.strictEqual(flashOffer.body.flashAvailable, true);
+
+    // Pixels that ignore the issued flash sequence must be rejected after the
+    // user opts into the fallback.
     const darkPixels = samplePixelSeries(darkChallenge.body.flashPlan).map((s) => ({
       ...s,
       f: Buffer.alloc(324).fill(40).toString('base64'),
@@ -220,21 +248,51 @@ async function main() {
       method: 'POST',
       body: JSON.stringify(livenessBody(darkChallenge.body.challengeId, darkChallenge.body.plan, darkChallenge.body.flashPlan, {
         pixelSeries: darkPixels,
+        pulseSeries: flatPulse,
+        flashFallback: true,
       })),
     }, cookie);
     assert.strictEqual(noFlash.res.status, 400);
 
+    // A valid flash fallback can verify the still-open challenge.
+    const flashSuccessChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const flashWithoutOffer = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(flashSuccessChallenge.body.challengeId, flashSuccessChallenge.body.plan, flashSuccessChallenge.body.flashPlan, {
+        pulseSeries: flatPulse,
+        flashFallback: true,
+      })),
+    }, cookie);
+    assert.strictEqual(flashWithoutOffer.res.status, 400);
+    const flashSuccessOffer = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(flashSuccessChallenge.body.challengeId, flashSuccessChallenge.body.plan, flashSuccessChallenge.body.flashPlan, {
+        pixelSeries: undefined,
+        pulseSeries: flatPulse,
+      })),
+    }, cookie);
+    assert.strictEqual(flashSuccessOffer.res.status, 422);
+    const flashSuccess = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(flashSuccessChallenge.body.challengeId, flashSuccessChallenge.body.plan, flashSuccessChallenge.body.flashPlan, {
+        pulseSeries: flatPulse,
+        flashFallback: true,
+      })),
+    }, cookie);
+    assert.strictEqual(flashSuccess.res.status, 200);
+    assert.strictEqual(flashSuccess.body.usedFlashFallback, true);
+    assert.strictEqual(flashSuccess.body.pulseBpm, null);
+
     // Pulse gates: flat signal, clean injected sine, and out-of-band
-    // frequencies must all be rejected.
+    // frequencies must all offer the flash fallback when one is available.
     const flatPulseChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
-    const flatPulse = samplePulseSeries().map((s) => ({ ...s, g: 118 }));
     const flatPulseRes = await request(baseUrl, '/api/liveness/verify', {
       method: 'POST',
       body: JSON.stringify(livenessBody(flatPulseChallenge.body.challengeId, flatPulseChallenge.body.plan, flatPulseChallenge.body.flashPlan, {
         pulseSeries: flatPulse,
       })),
     }, cookie);
-    assert.strictEqual(flatPulseRes.res.status, 400);
+    assert.strictEqual(flatPulseRes.res.status, 422);
 
     const sinePulseChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
     const sinePulse = [];
@@ -247,7 +305,7 @@ async function main() {
         pulseSeries: sinePulse,
       })),
     }, cookie);
-    assert.strictEqual(sinePulseRes.res.status, 400);
+    assert.strictEqual(sinePulseRes.res.status, 422);
 
     const offBandChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
     const offBandPulse = [];
@@ -260,7 +318,7 @@ async function main() {
         pulseSeries: offBandPulse,
       })),
     }, cookie);
-    assert.strictEqual(offBandRes.res.status, 400);
+    assert.strictEqual(offBandRes.res.status, 422);
 
     // Reduced motion: no flash plan is issued, pixels are not required, and
     // the pulse check alone carries the liveness gate — so it demands a
@@ -337,6 +395,198 @@ async function main() {
     const passkeyReset = await request(baseUrl, '/api/passkey/reset', { method: 'POST' }, cookie);
     assert.strictEqual(passkeyReset.res.status, 200);
     assert.strictEqual(passkeyReset.body.ok, true);
+
+    // ---- Attestation assurance gates ----
+    // Minimal CBOR encoder for building attestationObject fixtures.
+    const cborEncodeLen = (major, n) => {
+      if (n < 24) return Buffer.from([major | n]);
+      if (n < 256) return Buffer.from([major | 24, n]);
+      const b = Buffer.alloc(2); b.writeUInt16BE(n); return Buffer.concat([Buffer.from([major | 25]), b]);
+      const b4 = Buffer.alloc(4); b4.writeUInt32BE(n); return Buffer.concat([Buffer.from([major | 26]), b4]);
+    };
+    const cborEncode = (v) => {
+      if (typeof v === 'number' && Number.isInteger(v)) {
+        const mt = v < 0 ? 0x20 : 0x00;
+        const n = v < 0 ? -1 - v : v;
+        if (n < 24) return Buffer.from([mt | n]);
+        if (n < 256) return Buffer.from([mt | 24, n]);
+        const b = Buffer.alloc(2); b.writeUInt16BE(n); return Buffer.concat([Buffer.from([mt | 25]), b]);
+        const b4 = Buffer.alloc(4); b4.writeUInt32BE(n); return Buffer.concat([Buffer.from([mt | 26]), b4]);
+      }
+      if (typeof v === 'string') {
+        const b = Buffer.from(v, 'utf8');
+        return Buffer.concat([cborEncodeLen(0x60, b.length), b]);
+      }
+      if (Buffer.isBuffer(v)) return Buffer.concat([cborEncodeLen(0x40, v.length), v]);
+      if (Array.isArray(v)) return Buffer.concat([cborEncodeLen(0x80, v.length), ...v.map(cborEncode)]);
+      if (v && typeof v === 'object') {
+        const keys = Object.keys(v);
+        return Buffer.concat([
+          cborEncodeLen(0xa0, keys.length),
+          ...keys.flatMap((k) => [/^-?\d+$/.test(k) ? cborEncode(Number(k)) : cborEncode(k), cborEncode(v[k])]),
+        ]);
+      }
+      throw new Error(`cborEncode: unsupported ${typeof v}`);
+    };
+
+    const spkiToCose = (spkiDer) => {
+      const point = spkiDer.subarray(-65);
+      return cborEncode({ 1: 2, 3: -7, '-1': 1, '-2': point.subarray(1, 33), '-3': point.subarray(33, 65) });
+    };
+    const attAuthData = (credId, coseKey) => Buffer.concat([
+      crypto.createHash('sha256').update(new URL(baseUrl).hostname).digest(),
+      Buffer.from([0x45]), Buffer.alloc(4), Buffer.alloc(16),
+      (() => { const b = Buffer.alloc(2); b.writeUInt16BE(credId.length); return b; })(),
+      credId, coseKey,
+    ]);
+    const attestationObjectFor = (fmt, attStmt, authData) => Buffer.concat([
+      cborEncodeLen(0xa0, 3),
+      cborEncode('fmt'), cborEncode(fmt),
+      cborEncode('attStmt'), attStmt,
+      cborEncode('authData'), cborEncode(authData),
+    ]).toString('base64url');
+    // extrasFor(challenge) lets fixtures sign clientDataJSON carrying the issued challenge.
+    const registerWith = async (rawId, credSpki, extrasFor = () => ({})) => {
+      const gate = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+      const mint = await request(baseUrl, '/api/liveness/verify', {
+        method: 'POST',
+        body: JSON.stringify(livenessBody(gate.body.challengeId, gate.body.plan, gate.body.flashPlan)),
+      }, gate.cookie);
+      const opts = await request(baseUrl, '/api/passkey/register/options', {
+        method: 'POST',
+        body: JSON.stringify({ registrationVerificationToken: mint.body.verificationToken }),
+      }, mint.cookie);
+      cookie = opts.cookie;
+      const clientDataJSON = Buffer.from(JSON.stringify({ type: 'webauthn.create', challenge: opts.body.challenge, origin: baseUrl }));
+      const verify = await request(baseUrl, '/api/passkey/register/verify', {
+        method: 'POST',
+        body: JSON.stringify({
+          rawId, clientDataJSON: clientDataJSON.toString('base64url'),
+          publicKey: credSpki.toString('base64url'), alg: -7, ...extrasFor(clientDataJSON),
+        }),
+      }, cookie);
+      cookie = verify.cookie;
+      return { verify, clientDataJSON };
+    };
+    const authAssurance = async (rawId, privKey) => {
+      const opts = await request(baseUrl, '/api/passkey/auth/options', { method: 'POST' }, cookie);
+      cookie = opts.cookie;
+      const authData = Buffer.concat([
+        crypto.createHash('sha256').update(new URL(baseUrl).hostname).digest(),
+        Buffer.from([0x05]), Buffer.alloc(4),
+      ]);
+      const clientGet = Buffer.from(JSON.stringify({ type: 'webauthn.get', challenge: opts.body.challenge, origin: baseUrl }));
+      const sig = crypto.sign('SHA256', Buffer.concat([authData, crypto.createHash('sha256').update(clientGet).digest()]), privKey);
+      const verify = await request(baseUrl, '/api/passkey/auth/verify', {
+        method: 'POST',
+        body: JSON.stringify({
+          rawId, clientDataJSON: clientGet.toString('base64url'),
+          authenticatorData: authData.toString('base64url'), signature: sig.toString('base64url'),
+        }),
+      }, cookie);
+      cookie = verify.cookie;
+      const redeem = await request(baseUrl, '/api/verify', {
+        method: 'POST', body: JSON.stringify({ verificationToken: verify.body.verificationToken }),
+      });
+      return { verify, redeem };
+    };
+    const newCred = () => {
+      const { publicKey: pub, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+      const spki = pub.export({ format: 'der', type: 'spki' });
+      return { privateKey, spki, rawId: crypto.randomBytes(16).toString('base64url') };
+    };
+
+    // fmt 'none' attestation → registers but stays 'standard'.
+    {
+      const cred = newCred();
+      const authData = attAuthData(Buffer.from(cred.rawId, 'base64url'), spkiToCose(cred.spki));
+      const { verify } = await registerWith(cred.rawId, cred.spki, () => ({
+        attestationObject: attestationObjectFor('none', cborEncodeLen(0xa0, 0), authData),
+      }));
+      assert.strictEqual(verify.res.status, 201);
+      const { redeem } = await authAssurance(cred.rawId, cred.privateKey);
+      assert.strictEqual(redeem.body.assurance, 'standard');
+    }
+
+    // packed self-attestation (sig proves key possession, not hardware) → 'standard'.
+    {
+      const cred = newCred();
+      const authData = attAuthData(Buffer.from(cred.rawId, 'base64url'), spkiToCose(cred.spki));
+      const { verify } = await registerWith(cred.rawId, cred.spki, (clientDataJSON) => ({
+        attestationObject: attestationObjectFor('packed', cborEncode({
+          alg: -7,
+          sig: crypto.sign('SHA256', Buffer.concat([authData, crypto.createHash('sha256').update(clientDataJSON).digest()]), cred.privateKey),
+        }), authData),
+      }));
+      assert.strictEqual(verify.res.status, 201);
+      const { redeem } = await authAssurance(cred.rawId, cred.privateKey);
+      assert.strictEqual(redeem.body.assurance, 'standard');
+    }
+
+    // packed + x5c chain to an injected test root → 'strong'.
+    {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zoe-att-'));
+      const run = (args) => execFileSync('openssl', args, { cwd: dir });
+      run(['ecparam', '-genkey', '-name', 'prime256v1', '-out', 'root.key']);
+      run(['req', '-x509', '-new', '-key', 'root.key', '-out', 'root.pem', '-subj', '/CN=Zoe Test FIDO Root', '-days', '2']);
+      run(['ecparam', '-genkey', '-name', 'prime256v1', '-out', 'leaf.key']);
+      run(['req', '-new', '-key', 'leaf.key', '-out', 'leaf.csr', '-subj', '/CN=Zoe Test Attestation Leaf']);
+      run(['x509', '-req', '-in', 'leaf.csr', '-CA', 'root.pem', '-CAkey', 'root.key', '-CAcreateserial', '-out', 'leaf.pem', '-days', '2', '-sha256']);
+      const rootPem = fs.readFileSync(path.join(dir, 'root.pem'), 'utf8');
+      const leafDer = execFileSync('openssl', ['x509', '-in', 'leaf.pem', '-outform', 'DER'], { cwd: dir });
+      const leafKey = crypto.createPrivateKey(fs.readFileSync(path.join(dir, 'leaf.key'), 'utf8'));
+
+      const savedRoots = process.env.ZOE_FIDO_ROOT_PEMS;
+      process.env.ZOE_FIDO_ROOT_PEMS = JSON.stringify([rootPem]);
+      try {
+        const cred = newCred();
+        const authData = attAuthData(Buffer.from(cred.rawId, 'base64url'), spkiToCose(cred.spki));
+        const { verify } = await registerWith(cred.rawId, cred.spki, (clientDataJSON) => ({
+          attestationObject: attestationObjectFor('packed', cborEncode({
+            alg: -7,
+            sig: crypto.sign('SHA256', Buffer.concat([authData, crypto.createHash('sha256').update(clientDataJSON).digest()]), leafKey),
+            x5c: [leafDer],
+          }), authData),
+        }));
+        assert.strictEqual(verify.res.status, 201);
+        const { redeem } = await authAssurance(cred.rawId, cred.privateKey);
+        assert.strictEqual(redeem.body.assurance, 'strong');
+
+        // A well-formed chain that reaches no known root isn't an error — it
+        // registers like self-attestation and stays 'standard' (software keys
+        // like Chrome/Android emit self-signed leaves by design).
+        run(['req', '-x509', '-new', '-key', 'leaf.key', '-out', 'bad.pem', '-subj', '/CN=Mallory', '-days', '2']);
+        const badDer = execFileSync('openssl', ['x509', '-in', 'bad.pem', '-outform', 'DER'], { cwd: dir });
+        const cred2 = newCred();
+        const authData2 = attAuthData(Buffer.from(cred2.rawId, 'base64url'), spkiToCose(cred2.spki));
+        const { verify: badVerify } = await registerWith(cred2.rawId, cred2.spki, (clientDataJSON) => ({
+          attestationObject: attestationObjectFor('packed', cborEncode({
+            alg: -7,
+            sig: crypto.sign('SHA256', Buffer.concat([authData2, crypto.createHash('sha256').update(clientDataJSON).digest()]), leafKey),
+            x5c: [badDer],
+          }), authData2),
+        }));
+        assert.strictEqual(badVerify.res.status, 201);
+        const { redeem: badRedeem } = await authAssurance(cred2.rawId, cred2.privateKey);
+        assert.strictEqual(badRedeem.body.assurance, 'standard');
+
+        // But a garbage cert inside x5c is malformed, not merely untrusted.
+        const cred3 = newCred();
+        const authData3 = attAuthData(Buffer.from(cred3.rawId, 'base64url'), spkiToCose(cred3.spki));
+        const { verify: malformedVerify } = await registerWith(cred3.rawId, cred3.spki, (clientDataJSON) => ({
+          attestationObject: attestationObjectFor('packed', cborEncode({
+            alg: -7,
+            sig: crypto.sign('SHA256', Buffer.concat([authData3, crypto.createHash('sha256').update(clientDataJSON).digest()]), leafKey),
+            x5c: [Buffer.from('this is not a certificate')],
+          }), authData3),
+        }));
+        assert.strictEqual(malformedVerify.res.status, 400);
+      } finally {
+        if (savedRoots === undefined) delete process.env.ZOE_FIDO_ROOT_PEMS;
+        else process.env.ZOE_FIDO_ROOT_PEMS = savedRoots;
+      }
+    }
+
 
     const challengeResponse = await request(baseUrl, '/api/challenge', { method: 'POST' }, cookie);
     assert.strictEqual(challengeResponse.res.status, 201);
@@ -549,6 +799,19 @@ async function main() {
     const limited = checkRateLimit(testIp, null);
     assert.strictEqual(limited.limited, true);
     assert.strictEqual(limited.scope, 'ip');
+    resetRateLimitState();
+
+    // Session-scope cap: an IP under its cap must still be limited when one
+    // session exceeds the per-session window max.
+    process.env.ZOE_RATE_LIMIT_MAX_PER_SESSION = '3';
+    const sid = `test-sid-${Date.now()}`;
+    for (let i = 0; i < 3; i += 1) {
+      assert.strictEqual(checkRateLimit(`${testIp}-s`, sid).limited, false);
+    }
+    const sessionLimited = checkRateLimit(`${testIp}-s`, sid);
+    assert.strictEqual(sessionLimited.limited, true);
+    assert.strictEqual(sessionLimited.scope, 'session');
+    process.env.ZOE_RATE_LIMIT_MAX_PER_SESSION = '0';
     resetRateLimitState();
 
     // A fresh process on the same DB must still reject the consumed token and
