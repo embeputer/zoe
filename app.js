@@ -1339,7 +1339,7 @@ async function detectFaceFrame(engine) {
         const rawBox = detectionBox(detection, vw, vh);
         const box = calibratedFaceBox(rawBox, detection.keypoints, vw, vh);
         const pose = poseFromKeypoints(detection.keypoints, vw, vh);
-        if (keypointSpanOutsideBox(detection.keypoints, rawBox, vw, vh)) return null;
+        if (detectorBoxDisplaced(rawBox, detection.keypoints, vw, vh)) return null;
         return {
           ...box,
           score: detectionScore(detection),
@@ -1470,20 +1470,6 @@ function drawFaceGuide(box, opts = {}) {
   }
 
   if (opts.arrow === 'left' || opts.arrow === 'right') drawGuideArrow(opts.arrow, color);
-}
-
-// Distrust a detection whose landmark span sits outside its own raw box —
-// that's an inconsistent read (e.g. a shoulder edge scored as a face) and
-// fitting a box to it lands off the face on real cameras.
-function keypointSpanOutsideBox(keypoints, box, vw, vh) {
-  if (!keypoints || keypoints.length < 3 || !box || box.w < 1) return false;
-  const xs = keypoints.map((k) => k.x * vw);
-  const ys = keypoints.map((k) => k.y * vh);
-  const spanCx = (Math.min(...xs) + Math.max(...xs)) / 2;
-  const spanCy = (Math.min(...ys) + Math.max(...ys)) / 2;
-  const boxCx = box.x + box.w / 2;
-  const boxCy = box.y + box.h / 2;
-  return Math.abs(spanCx - boxCx) > box.w * 0.55 || Math.abs(spanCy - boxCy) > box.h * 0.55;
 }
 
 function pushFaceSeriesSample(phaseSeries, phase, flowStartedAt, motionValue) {

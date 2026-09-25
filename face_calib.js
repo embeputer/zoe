@@ -42,6 +42,24 @@ function calibratedFaceBox(box, keypoints, frameWidth, frameHeight) {
   }, keypoints, frameWidth, frameHeight);
 }
 
+// True when the keypoint span's center diverges from the box center by more
+// than half a box dimension — an inconsistent read (e.g. a shoulder edge
+// scored as a face) that landmark fitting would land off the face.
+function detectorBoxDisplaced(box, keypoints, frameWidth, frameHeight) {
+  const points = (keypoints || [])
+    .map((point) => pointToPixel(point, frameWidth, frameHeight))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (points.length < 3 || !box || box.w < 1) return false;
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const spanCx = (Math.min(...xs) + Math.max(...xs)) / 2;
+  const spanCy = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const boxCx = box.x + box.w / 2;
+  const boxCy = box.y + box.h / 2;
+  return Math.abs(spanCx - boxCx) > box.w * 0.55 || Math.abs(spanCy - boxCy) > box.h * 0.55;
+}
+
 // Fraction of the keypoint span lying outside the box on the worst axis —
 // 0 when the box fully contains the landmarks. When landmark fitting cannot
 // absorb a displaced detector box, this reports how much of the face's
@@ -83,6 +101,7 @@ if (typeof module === 'object' && module.exports) {
     pointToPixel,
     fitBoxToKeypoints,
     calibratedFaceBox,
+    detectorBoxDisplaced,
     keypointSpanOutsideBox,
     pulseRoi,
   };
