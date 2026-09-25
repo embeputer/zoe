@@ -718,29 +718,26 @@ button.ghost:hover {
 
 .verified {
   position: relative;
-  margin-top: 18px;
+  margin-top: 14px;
   display: block;
-  min-height: 172px;
+  min-height: 134px;
   text-align: left;
-  padding: 30px 20px;
-  background: var(--success-soft);
-  border: 1px solid #c6ead3;
-  border-radius: var(--radius);
+  padding: 18px 0 4px;
 }
 
 .verified-icon {
   position: absolute;
   left: 50%;
   top: 50%;
-  width: 64px;
-  height: 64px;
+  width: 54px;
+  height: 54px;
   border-radius: 50%;
   background: var(--success);
   display: grid;
   place-items: center;
   color: #fff;
   flex-shrink: 0;
-  box-shadow: 0 8px 20px rgba(21, 138, 84, 0.3);
+  box-shadow: 0 6px 16px rgba(21, 138, 84, 0.24);
   transform: translate(-50%, -50%);
   animation: verified-pop 0.35s cubic-bezier(0.2, 1.4, 0.4, 1) both;
   transition: left 0.48s var(--screen-ease), transform 0.48s var(--screen-ease);
@@ -763,13 +760,13 @@ button.ghost:hover {
 }
 
 .verified.settled .verified-icon {
-  left: 20px;
+  left: 0;
   transform: translate(0, -50%);
 }
 
 .verified-text {
-  min-height: 110px;
-  margin-left: 80px;
+  min-height: 98px;
+  margin-left: 70px;
   display: flex;
   flex-direction: column;
   justify-content: center;
@@ -785,7 +782,7 @@ button.ghost:hover {
 }
 
 .verified-text strong {
-  font-size: 17px;
+  font-size: 18px;
   font-weight: 750;
   color: var(--ink);
 }
