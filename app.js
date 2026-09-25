@@ -64,8 +64,6 @@ const flashOverlayEl = $('flash-overlay');
 const flashConsentEl = $('flash-consent');
 const flashConsentAcceptBtn = $('flash-consent-accept');
 const flashConsentDeclineBtn = $('flash-consent-decline');
-const flowStepsEl = $('flow-steps');
-const flowStepLabelEl = $('flow-step-label');
 const panelShellEl = $('panel-shell');
 const zoeIntroEl = $('zoe-intro');
 const zoeVerifyBtn = $('zoe-verify-btn');
@@ -383,24 +381,11 @@ const PANEL_TRANSITION_MS = 440;
 let panelTransitionTimer = null;
 let successSettleTimer = null;
 
-const FLOW_STEP_INDEX = { choice: 2, id: 2, verify: 3, success: 4 };
-
-function setFlowStep(mode) {
-  const n = FLOW_STEP_INDEX[mode] || 1;
-  if (flowStepLabelEl) flowStepLabelEl.textContent = `Step ${n} of 4`;
-  if (!flowStepsEl) return;
-  flowStepsEl.querySelectorAll('.step').forEach((el, i) => {
-    el.classList.toggle('active', i + 1 === n);
-    el.classList.toggle('done', i + 1 < n);
-  });
-}
-
 function setCardMode(mode) {
   cardEl.classList.toggle('choice-mode', mode === 'choice');
   cardEl.classList.toggle('id-mode', mode === 'id');
   cardEl.classList.toggle('verify-mode', mode === 'verify');
   cardEl.classList.toggle('success-mode', mode === 'success');
-  setFlowStep(mode);
 }
 
 function transitionToPanel(activePanel, mode, focusEl, direction = 'forward') {
@@ -1446,9 +1431,11 @@ function drawGuideArrow(direction, color) {
   const dir = direction === 'left' ? -1 : 1;
   ctx.save();
   ctx.strokeStyle = color;
-  ctx.lineWidth = 7;
+  ctx.lineWidth = 5;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
+  ctx.shadowColor = 'rgba(0,0,0,0.45)';
+  ctx.shadowBlur = 7;
   ctx.beginPath();
   ctx.moveTo(x - dir * size * 0.5, cy - size);
   ctx.lineTo(x + dir * size * 0.5, cy);
@@ -1457,13 +1444,13 @@ function drawGuideArrow(direction, color) {
   ctx.restore();
 }
 
-// Renders the camera feed, the target oval, the live face box, and an optional
+// Renders the camera feed, the face guide, the live face box, and an optional
 // directional arrow. `box` uses the same video-frame coordinates as the overlay.
 function drawFaceGuide(box, opts = {}) {
   const { width: W, height: H } = sizeCanvasToDisplay(canvasEl);
   const transform = videoToCanvasTransform(W, H, 'cover');
   const state = opts.state || 'neutral';
-  const color = state === 'good' ? '#36c275' : state === 'move' ? '#ffce4d' : 'rgba(255,255,255,0.85)';
+  const color = state === 'good' ? '#65dfa0' : 'rgba(255,255,255,0.92)';
 
   ctx.clearRect(0, 0, W, H);
 
@@ -1476,18 +1463,18 @@ function drawFaceGuide(box, opts = {}) {
   // Spotlight: dim everything except the face-center oval. The even-odd fill
   // paints the region outside the ellipse, leaving the oval interior bright.
   ctx.save();
-  ctx.fillStyle = 'rgba(8,10,18,0.6)';
+  ctx.fillStyle = 'rgba(8,10,18,0.42)';
   ctx.beginPath();
   ctx.rect(0, 0, W, H);
   ctx.ellipse(FACE_TARGET.cx * W, FACE_TARGET.cy * H, FACE_TARGET.rx * W, FACE_TARGET.ry * H, 0, 0, Math.PI * 2);
   ctx.fill('evenodd');
   ctx.restore();
 
-  // Target oval where the face should sit.
   ctx.save();
-  ctx.lineWidth = 4;
-  ctx.setLineDash([14, 10]);
+  ctx.lineWidth = 3;
   ctx.strokeStyle = color;
+  ctx.shadowColor = 'rgba(0,0,0,0.35)';
+  ctx.shadowBlur = 8;
   ctx.beginPath();
   ctx.ellipse(FACE_TARGET.cx * W, FACE_TARGET.cy * H, FACE_TARGET.rx * W, FACE_TARGET.ry * H, 0, 0, Math.PI * 2);
   ctx.stroke();
