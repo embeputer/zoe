@@ -64,6 +64,22 @@ function fabricatedPixelSeries(flashPlan) {
   return samples;
 }
 
+// Forged rPPG pulse: a fundamental + 2nd harmonic + slow drift + noise in the
+// physiologic band passes the spectral gates — raising attack cost again but
+// proving the check remains forgeable without server-side vision.
+function fabricatedPulseSeries() {
+  const samples = [];
+  const w1 = 2 * Math.PI * 1.17;
+  const w2 = 2 * Math.PI * 2.34;
+  const wd = 2 * Math.PI * 0.08;
+  for (let t = 0; t <= 14000; t += 95) {
+    const s = t / 1000;
+    const g = 118 + 3.5 * Math.sin(w1 * s) + 1.1 * Math.sin(w2 * s + 0.7) + 1.5 * Math.sin(wd * s + 1.2) + gaussian() * 2.2;
+    samples.push({ g: Math.round(g * 100) / 100, t });
+  }
+  return samples;
+}
+
 function fabricatedMotionSeries(plan) {
   const series = [];
   let t = 0;
@@ -131,6 +147,7 @@ async function attackFabricatedLiveness(baseUrl, cookie) {
       motionSeries,
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
       pixelSeries: flashPlan ? fabricatedPixelSeries(flashPlan) : undefined,
+      pulseSeries: fabricatedPulseSeries(),
     }),
   }, cookie);
   const token = res.body.verificationToken;
@@ -162,6 +179,7 @@ async function attackReplayedSeries(baseUrl, cookie) {
       motionSeries: noisy,
       seriesDigest: attackerSeriesDigest(res.body.challengeId, noisy),
       pixelSeries: res.body.flashPlan ? fabricatedPixelSeries(res.body.flashPlan) : undefined,
+      pulseSeries: fabricatedPulseSeries(),
     }),
   }, cookie);
   return {
@@ -207,6 +225,7 @@ async function controlUncorrelatedPixels(baseUrl, cookie) {
       motionSeries,
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
       pixelSeries: flatPixels,
+      pulseSeries: fabricatedPulseSeries(),
     }),
   }, cookie);
   return { fooled: res.res.status === 200, note: `flash-ignoring pixels: ${res.res.status}`, cookie };
@@ -227,6 +246,7 @@ async function controlCrossSession(baseUrl, cookie) {
       motionSeries,
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
       pixelSeries: flashPlan ? fabricatedPixelSeries(flashPlan) : undefined,
+      pulseSeries: fabricatedPulseSeries(),
     }),
   }, cookie);
   const token = res.body.verificationToken;
@@ -277,8 +297,8 @@ async function main() {
     const controls = results.filter((x) => x.name.startsWith('control'));
     console.log(`\n${fooled.length}/3 attacks fooled the server; controls blocked: ${controls.filter((x) => !x.fooled).length}/${controls.length}`);
     if (fooled.length) {
-      console.log('Conclusion: even pixel-verified flash liveness stays forgeable by a script that');
-      console.log('synthesizes matching pixels — closing the hole needs server-side media verification.');
+      console.log('Conclusion: even pulse-checked, pixel-verified flash liveness stays forgeable by a script that');
+      console.log('synthesizes matching signals — closing the hole needs server-side media verification.');
     }
   } finally {
     await new Promise((resolve) => server.close(resolve));

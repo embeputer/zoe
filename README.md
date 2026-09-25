@@ -71,7 +71,7 @@ npm test
 npm run attack
 ```
 
-`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera, no MediaPipe — including synthesized pixel streams that match the issued flash sequence. It reports which checks a scripted client fools and documents the honest ceiling of client-side evidence: even pixel-verified flash liveness stays forgeable by a script that synthesizes matching pixels. Closing that hole needs server-side media verification (e.g. a PAD model on uploaded frames) or hardware attestation.
+`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera, no MediaPipe — including synthesized pixel streams that match the issued flash sequence and pulse series with a physiologic-band spectral peak. It reports which checks a scripted client fools and documents the honest ceiling of client-side evidence: even pulse-checked, pixel-verified flash liveness stays forgeable by a script that synthesizes matching signals. Closing that hole needs server-side media verification (e.g. a PAD model on uploaded frames) or hardware attestation.
 
 The regression test starts a temporary local HTTP server and checks that:
 
@@ -87,8 +87,8 @@ The regression test starts a temporary local HTTP server and checks that:
 1. The browser asks the server for a challenge.
 2. The user chooses a primary verification method, such as hand gestures or face motion.
 3. The browser performs the local check and submits bounded evidence for that step.
-4. Face verification ends with a flash challenge: the server issues a random color sequence, the screen flashes it, and the client uploads timestamped face-region pixel bursts the server checks for correlation, coverage, and sensor noise.
-5. The server validates order, timing, replay state, pixel evidence, and session binding.
+4. Face verification ends with two server-side liveness checks: an rPPG pulse stage (the client samples green-channel means over a forehead ROI for ~14s; the server runs spectral analysis for a physiologic-band heartbeat, 48–144 BPM, rejecting flat and clean-sine signals) followed by a flash challenge (the server issues a random color sequence, the screen flashes it, and the client uploads timestamped face-region pixel bursts the server checks for correlation, coverage, and sensor noise). The flash plan is slowed to ~1 flash/second for photosensitivity, and `prefers-reduced-motion` clients skip it entirely — the pulse check alone then carries the liveness gate.
+5. The server validates order, timing, replay state, pulse + pixel evidence, and session binding.
 6. After all steps pass, the server issues a short-lived signed token.
 7. The protected action accepts only that server-issued token, once.
 

@@ -43,7 +43,7 @@ const CHALLENGE_TTL_MS = 90 * 1000;
 const MIN_STEP_DURATION_MS = 180;
 const MAX_STEP_DURATION_MS = 12 * 1000;
 const MIN_HOLD_FRAMES = 8;
-const LIVENESS_CHALLENGE_TTL_MS = 90 * 1000;
+const LIVENESS_CHALLENGE_TTL_MS = 150 * 1000;
 const LIVENESS_TRANSITION_MS_MIN = 150;
 const LIVENESS_TRANSITION_MS_MAX = 14 * 1000;
 const LIVENESS_HOLD_JITTER_MIN = 0.00035;
@@ -63,10 +63,13 @@ const FLASH_BG_PIXEL_BYTES = 4 * 1 * 3;
 const MAX_PIXEL_SAMPLES = 140;
 const FLASH_COUNT = 4;
 const FLASH_LEAD_MS = 400;
-const FLASH_DURATION_MIN_MS = 220;
-const FLASH_DURATION_SPAN_MS = 120;
-const FLASH_GAP_MIN_MS = 250;
-const FLASH_GAP_SPAN_MS = 350;
+// Photosensitivity safety (WCAG-style): a flash cycle is at least ~860ms, so
+// the sequence stays under ~1.2 flashes/second — well clear of the >3/second
+// risk band — and reduced-motion users skip the plan entirely.
+const FLASH_DURATION_MIN_MS = 480;
+const FLASH_DURATION_SPAN_MS = 160;
+const FLASH_GAP_MIN_MS = 380;
+const FLASH_GAP_SPAN_MS = 220;
 const FLASH_BASELINE_LEAD_MS = 60;
 const FLASH_LAG_SLACK_MS = 120;
 const FLASH_MIN_BASELINE_SAMPLES = 3;
@@ -77,6 +80,20 @@ const FLASH_DELTA_RATIO_MAX = 1.6;
 const FLASH_NOISE_L1_MIN = 0.3;
 const FLASH_NOISE_L1_MAX = 90;
 const FLASH_DISTINCT_FRAMES_MIN = 0.6;
+
+const PULSE_MIN_SAMPLES = 90;
+const PULSE_MAX_SAMPLES = 400;
+const PULSE_MIN_SPAN_MS = 9000;
+const PULSE_MIN_HZ = 0.8;
+const PULSE_MAX_HZ = 2.4;
+const PULSE_STD_MIN = 0.4;
+const PULSE_PEAK_RATIO_MIN = 3;
+const PULSE_LOBE_BINS = 5;
+// A real pulse concentrates a solid share of band power in the peak's main
+// lobe (±5 bins ≈ ±0.125Hz) but not all of it: white noise spreads too thin,
+// a clean injected sine concentrates ~everything. Both bounds reject fakes.
+const PULSE_LOBE_FRACTION_MIN = 0.45;
+const PULSE_LOBE_FRACTION_MAX = 0.97;
 const PASSKEY_CHALLENGE_TTL_MS = 2 * 60 * 1000;
 const APP_NAME = 'Zoe';
 const COOKIE_NAME = 'zoe_sid';
@@ -656,6 +673,78 @@ function validatePixelSeries(pixelSeries, flashPlan) {
   return null;
 }
 
+// rPPG pulse check: detrended green-channel means sampled over a forehead ROI
+// should hold a spectral peak in the physiologic band (48-144 BPM) — strong
+// enough to be a real signal, but spread enough not to be a clean injected
+// sine wave. Returns { bpm } on success or { error } on rejection.
+function validatePulseSeries(pulseSeries) {
+  if (!Array.isArray(pulseSeries) || pulseSeries.length < PULSE_MIN_SAMPLES || pulseSeries.length > PULSE_MAX_SAMPLES) {
+    return { error: 'Pulse series is invalid.' };
+  }
+  const sig = [];
+  let lastT = -1;
+  for (const s of pulseSeries) {
+    const g = Number(s && s.g);
+    const t = Number(s && s.t);
+    if (!Number.isFinite(g) || g < 0 || g > 255) return { error: 'Pulse samples are invalid.' };
+    if (!Number.isFinite(t) || t < 0 || t > 120000 || t < lastT) return { error: 'Pulse sample timing is invalid.' };
+    lastT = t;
+    sig.push({ g, t });
+  }
+  const span = sig[sig.length - 1].t - sig[0].t;
+  if (span < PULSE_MIN_SPAN_MS) return { error: 'Pulse measurement was too short.' };
+
+  const mean = sig.reduce((a, s) => a + s.g, 0) / sig.length;
+  const xs = sig.map((s) => s.g - mean);
+  const std = Math.sqrt(xs.reduce((a, v) => a + v * v, 0) / xs.length);
+  if (std < PULSE_STD_MIN) return { error: 'Pulse signal was flat — no living tissue detected.' };
+
+  // Median sample interval gives the effective sample rate.
+  const dts = [];
+  for (let i = 1; i < sig.length; i++) dts.push(sig[i].t - sig[i - 1].t);
+  dts.sort((a, b) => a - b);
+  const fs = 1000 / Math.max(1, dts[Math.floor(dts.length / 2)]);
+  if (fs < 4) return { error: 'Pulse sampling rate is too low.' };
+
+  // Hann-windowed DFT magnitudes over the physiologic band.
+  const n = xs.length;
+  const windowed = xs.map((v, i) => v * (0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1))));
+  const binHz = 0.025;
+  const loBin = Math.ceil(0.5 / binHz);
+  const hiBin = Math.floor(3.2 / binHz);
+  const peakLo = Math.ceil(PULSE_MIN_HZ / binHz);
+  const peakHi = Math.floor(PULSE_MAX_HZ / binHz);
+  const powers = new Float64Array(hiBin + 1);
+  let peakIdx = -1;
+  let peakPower = 0;
+  let bandPower = 0;
+  for (let b = loBin; b <= hiBin; b++) {
+    let re = 0;
+    let im = 0;
+    const w = (2 * Math.PI * b * binHz) / fs;
+    for (let i = 0; i < n; i++) {
+      re += windowed[i] * Math.cos(w * i);
+      im -= windowed[i] * Math.sin(w * i);
+    }
+    const p = re * re + im * im;
+    powers[b] = p;
+    bandPower += p;
+    if (b >= peakLo && b <= peakHi && p > peakPower) {
+      peakPower = p;
+      peakIdx = b;
+    }
+  }
+  if (peakIdx < 0 || bandPower <= 0) return { error: 'No pulse found in the signal.' };
+  const meanBand = bandPower / (hiBin - loBin + 1);
+  if (peakPower / meanBand < PULSE_PEAK_RATIO_MIN) return { error: 'No clear heartbeat found in the signal.' };
+  let lobePower = 0;
+  for (let b = peakIdx - PULSE_LOBE_BINS; b <= peakIdx + PULSE_LOBE_BINS; b++) lobePower += powers[b] || 0;
+  const lobeFraction = lobePower / bandPower;
+  if (lobeFraction < PULSE_LOBE_FRACTION_MIN) return { error: 'Pulse signal looks like noise.' };
+  if (lobeFraction > PULSE_LOBE_FRACTION_MAX) return { error: 'Pulse signal looks synthetic.' };
+  return { bpm: Math.round(peakIdx * binHz * 60) };
+}
+
 function computeLivenessSeriesDigest(challengeId, motionSeries) {
   return crypto.createHash('sha256').update(`${challengeId}\n${JSON.stringify(motionSeries)}`).digest('hex');
 }
@@ -1172,10 +1261,16 @@ async function handleApi(req, res, pathname) {
   }
 
   if (req.method === 'POST' && pathname === '/api/liveness/challenge') {
+    let challengeBody = {};
+    try {
+      challengeBody = await readJson(req);
+    } catch (err) {
+      challengeBody = {};
+    }
     const created = now();
     const challengeId = randomId();
     const plan = createLivenessPlan();
-    const flashPlan = createFlashPlan();
+    const flashPlan = challengeBody.reducedMotion === true ? null : createFlashPlan();
     session.livenessChallenge = {
       id: challengeId,
       plan,
@@ -1240,10 +1335,18 @@ async function handleApi(req, res, pathname) {
       return sendJson(res, 400, { error: phaseError });
     }
 
-    const pixelError = validatePixelSeries(body.pixelSeries, pending.flashPlan);
-    if (pixelError) {
-      logVerificationFailure('liveness_pixels_rejected', pathname);
-      return sendJson(res, 400, { error: pixelError });
+    if (pending.flashPlan) {
+      const pixelError = validatePixelSeries(body.pixelSeries, pending.flashPlan);
+      if (pixelError) {
+        logVerificationFailure('liveness_pixels_rejected', pathname);
+        return sendJson(res, 400, { error: pixelError });
+      }
+    }
+
+    const pulseResult = validatePulseSeries(body.pulseSeries);
+    if (pulseResult.error) {
+      logVerificationFailure('liveness_pulse_rejected', pathname);
+      return sendJson(res, 400, { error: pulseResult.error });
     }
 
     if (pending.seriesDigests.has(seriesDigest)) {
@@ -1258,6 +1361,7 @@ async function handleApi(req, res, pathname) {
       verified: true,
       verificationToken: token,
       tokenExpiresAt: now() + TOKEN_TTL_MS,
+      pulseBpm: pulseResult.bpm,
     });
   }
 

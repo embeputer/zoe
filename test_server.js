@@ -84,6 +84,21 @@ function samplePixelSeries(flashPlan) {
   return samples;
 }
 
+// Green-channel means with a physiologic-band pulse (fundamental + harmonic +
+// drift + noise) — shaped like a real rPPG signal.
+function samplePulseSeries() {
+  const samples = [];
+  const w1 = 2 * Math.PI * 1.17;
+  const w2 = 2 * Math.PI * 2.34;
+  const wd = 2 * Math.PI * 0.08;
+  for (let t = 0; t <= 14000; t += 95) {
+    const s = t / 1000;
+    const g = 118 + 3.5 * Math.sin(w1 * s) + 1.1 * Math.sin(w2 * s + 0.7) + 1.5 * Math.sin(wd * s + 1.2) + gaussian() * 2.2;
+    samples.push({ g: Math.round(g * 100) / 100, t });
+  }
+  return samples;
+}
+
 function livenessBody(challengeId, plan, flashPlan, overrides = {}) {
   const motionSeries = sampleMotionSeries(plan);
   return {
@@ -95,6 +110,7 @@ function livenessBody(challengeId, plan, flashPlan, overrides = {}) {
     motionSeries,
     seriesDigest: computeLivenessSeriesDigest(challengeId, motionSeries),
     pixelSeries: flashPlan ? samplePixelSeries(flashPlan) : undefined,
+    pulseSeries: samplePulseSeries(),
     ...overrides,
   };
 }
@@ -203,6 +219,61 @@ async function main() {
       })),
     }, cookie);
     assert.strictEqual(noFlash.res.status, 400);
+
+    // Pulse gates: flat signal, clean injected sine, and out-of-band
+    // frequencies must all be rejected.
+    const flatPulseChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const flatPulse = samplePulseSeries().map((s) => ({ ...s, g: 118 }));
+    const flatPulseRes = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(flatPulseChallenge.body.challengeId, flatPulseChallenge.body.plan, flatPulseChallenge.body.flashPlan, {
+        pulseSeries: flatPulse,
+      })),
+    }, cookie);
+    assert.strictEqual(flatPulseRes.res.status, 400);
+
+    const sinePulseChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const sinePulse = [];
+    for (let t = 0; t <= 14000; t += 95) {
+      sinePulse.push({ g: 118 + 4 * Math.sin(2 * Math.PI * 1.1 * (t / 1000)), t });
+    }
+    const sinePulseRes = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(sinePulseChallenge.body.challengeId, sinePulseChallenge.body.plan, sinePulseChallenge.body.flashPlan, {
+        pulseSeries: sinePulse,
+      })),
+    }, cookie);
+    assert.strictEqual(sinePulseRes.res.status, 400);
+
+    const offBandChallenge = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+    const offBandPulse = [];
+    for (let t = 0; t <= 14000; t += 95) {
+      offBandPulse.push({ g: 118 + 5 * Math.sin(2 * Math.PI * 0.2 * (t / 1000)) + 2 * Math.sin(2 * Math.PI * 3.1 * (t / 1000) + 0.9), t });
+    }
+    const offBandRes = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(offBandChallenge.body.challengeId, offBandChallenge.body.plan, offBandChallenge.body.flashPlan, {
+        pulseSeries: offBandPulse,
+      })),
+    }, cookie);
+    assert.strictEqual(offBandRes.res.status, 400);
+
+    // Reduced motion: no flash plan is issued, pixels are not required,
+    // and the pulse check alone carries the liveness gate.
+    const reducedChallenge = await request(baseUrl, '/api/liveness/challenge', {
+      method: 'POST',
+      body: JSON.stringify({ reducedMotion: true }),
+    }, cookie);
+    assert.strictEqual(reducedChallenge.res.status, 201);
+    assert.strictEqual(reducedChallenge.body.flashPlan, null);
+    const reducedVerify = await request(baseUrl, '/api/liveness/verify', {
+      method: 'POST',
+      body: JSON.stringify(livenessBody(reducedChallenge.body.challengeId, reducedChallenge.body.plan, null, {
+        pixelSeries: undefined,
+      })),
+    }, cookie);
+    assert.strictEqual(reducedVerify.res.status, 200);
+    assert.ok(reducedVerify.body.pulseBpm > 0);
 
     const noPasskey = await request(baseUrl, '/api/passkey/auth/options', { method: 'POST' }, cookie);
     assert.strictEqual(noPasskey.res.status, 409);
