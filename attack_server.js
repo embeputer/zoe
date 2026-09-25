@@ -42,6 +42,28 @@ function fabricatedStepEvidence() {
   };
 }
 
+// Forged pixel stream: baseline-lit frames with synthetic sensor noise,
+// shifted toward each issued flash color inside its window. Proves the pixel
+// check raises attack cost but remains forgeable without server-side vision.
+function fabricatedPixelSeries(flashPlan) {
+  const baseline = [40, 45, 50];
+  const last = flashPlan[flashPlan.length - 1];
+  const endMs = last.o + last.d + 300;
+  const samples = [];
+  for (let t = 0; t <= endMs; t += 75) {
+    const active = flashPlan.find((f) => t >= f.o && t <= f.o + f.d);
+    const mean = active ? baseline.map((v, i) => v + active.c[i] * 0.5) : baseline;
+    const f = Buffer.alloc(324);
+    for (let i = 0; i < f.length; i++) {
+      f[i] = Math.max(0, Math.min(255, Math.round(mean[i % 3] + gaussian() * 6)));
+    }
+    const b = Buffer.alloc(12);
+    for (let i = 0; i < b.length; i++) b[i] = Math.max(0, Math.min(255, 30 + gaussian() * 3));
+    samples.push({ t, f: f.toString('base64'), b: b.toString('base64') });
+  }
+  return samples;
+}
+
 function fabricatedMotionSeries(plan) {
   const series = [];
   let t = 0;
@@ -97,7 +119,7 @@ async function attackFabricatedGestures(baseUrl, cookie) {
 async function attackFabricatedLiveness(baseUrl, cookie) {
   let res = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
   cookie = res.cookie;
-  const { challengeId, plan } = res.body;
+  const { challengeId, plan, flashPlan } = res.body;
   const motionSeries = fabricatedMotionSeries(plan);
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
@@ -108,6 +130,7 @@ async function attackFabricatedLiveness(baseUrl, cookie) {
       motionScore: 0.35,
       motionSeries,
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
+      pixelSeries: flashPlan ? fabricatedPixelSeries(flashPlan) : undefined,
     }),
   }, cookie);
   const token = res.body.verificationToken;
@@ -138,6 +161,7 @@ async function attackReplayedSeries(baseUrl, cookie) {
       motionScore: 0.35,
       motionSeries: noisy,
       seriesDigest: attackerSeriesDigest(res.body.challengeId, noisy),
+      pixelSeries: res.body.flashPlan ? fabricatedPixelSeries(res.body.flashPlan) : undefined,
     }),
   }, cookie);
   return {
@@ -163,10 +187,35 @@ async function controlPasskeyGate(baseUrl, cookie) {
   return { fooled: res.res.status === 200, note: `status ${res.res.status}`, cookie };
 }
 
+async function controlUncorrelatedPixels(baseUrl, cookie) {
+  let res = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
+  cookie = res.cookie;
+  const { challengeId, plan, flashPlan } = res.body;
+  const motionSeries = fabricatedMotionSeries(plan);
+  // Pixels that never respond to the issued flash sequence must be rejected.
+  const flatPixels = fabricatedPixelSeries(flashPlan).map((s) => ({
+    ...s,
+    f: Buffer.alloc(324).fill(40).toString('base64'),
+  }));
+  res = await request(baseUrl, '/api/liveness/verify', {
+    method: 'POST',
+    body: JSON.stringify({
+      challengeId,
+      durationMs: 2400,
+      faceFrames: 30,
+      motionScore: 0.35,
+      motionSeries,
+      seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
+      pixelSeries: flatPixels,
+    }),
+  }, cookie);
+  return { fooled: res.res.status === 200, note: `flash-ignoring pixels: ${res.res.status}`, cookie };
+}
+
 async function controlCrossSession(baseUrl, cookie) {
   let res = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
   cookie = res.cookie;
-  const { challengeId, plan } = res.body;
+  const { challengeId, plan, flashPlan } = res.body;
   const motionSeries = fabricatedMotionSeries(plan);
   res = await request(baseUrl, '/api/liveness/verify', {
     method: 'POST',
@@ -177,6 +226,7 @@ async function controlCrossSession(baseUrl, cookie) {
       motionScore: 0.35,
       motionSeries,
       seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
+      pixelSeries: flashPlan ? fabricatedPixelSeries(flashPlan) : undefined,
     }),
   }, cookie);
   const token = res.body.verificationToken;
@@ -216,6 +266,10 @@ async function main() {
     cookie = r.cookie;
     report('replayed series + fresh noise', r.fooled, r.note);
 
+    r = await controlUncorrelatedPixels(baseUrl, cookie);
+    cookie = r.cookie;
+    report('control: pixels that ignore the flash', r.fooled, r.note);
+
     r = await controlCrossSession(baseUrl, cookie);
     report('control: token reuse across sessions', r.fooled, r.note);
 
@@ -223,8 +277,8 @@ async function main() {
     const controls = results.filter((x) => x.name.startsWith('control'));
     console.log(`\n${fooled.length}/3 attacks fooled the server; controls blocked: ${controls.filter((x) => !x.fooled).length}/${controls.length}`);
     if (fooled.length) {
-      console.log('Conclusion: server-side evidence checks gate *statistics of submitted numbers*, not real media.');
-      console.log('A scripted client mints valid verification tokens with no camera, face, or hand present.');
+      console.log('Conclusion: even pixel-verified flash liveness stays forgeable by a script that');
+      console.log('synthesizes matching pixels — closing the hole needs server-side media verification.');
     }
   } finally {
     await new Promise((resolve) => server.close(resolve));

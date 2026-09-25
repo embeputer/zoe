@@ -57,7 +57,26 @@ const MAX_LANDMARK_SAMPLES = 24;
 const MAX_MOTION_SERIES = 120;
 const LIVENESS_PLAN_LEFT_FIRST = ['center_hold', 'center_to_left', 'left_to_right'];
 const LIVENESS_PLAN_RIGHT_FIRST = ['center_hold', 'center_to_right', 'right_to_left'];
-const MAX_BODY_BYTES = 32 * 1024;
+const MAX_BODY_BYTES = 128 * 1024;
+const FLASH_FACE_PIXEL_BYTES = 12 * 9 * 3;
+const FLASH_BG_PIXEL_BYTES = 4 * 1 * 3;
+const MAX_PIXEL_SAMPLES = 140;
+const FLASH_COUNT = 4;
+const FLASH_LEAD_MS = 400;
+const FLASH_DURATION_MIN_MS = 220;
+const FLASH_DURATION_SPAN_MS = 120;
+const FLASH_GAP_MIN_MS = 250;
+const FLASH_GAP_SPAN_MS = 350;
+const FLASH_BASELINE_LEAD_MS = 60;
+const FLASH_LAG_SLACK_MS = 120;
+const FLASH_MIN_BASELINE_SAMPLES = 3;
+const FLASH_MIN_SAMPLES_PER_FLASH = 2;
+const FLASH_COSINE_MIN = 0.55;
+const FLASH_DELTA_RATIO_MIN = 0.04;
+const FLASH_DELTA_RATIO_MAX = 1.6;
+const FLASH_NOISE_L1_MIN = 0.3;
+const FLASH_NOISE_L1_MAX = 90;
+const FLASH_DISTINCT_FRAMES_MIN = 0.6;
 const PASSKEY_CHALLENGE_TTL_MS = 2 * 60 * 1000;
 const APP_NAME = 'Zoe';
 const COOKIE_NAME = 'zoe_sid';
@@ -510,6 +529,131 @@ function validateEvidence(challenge, body) {
 
 function createLivenessPlan() {
   return crypto.randomInt(2) === 0 ? [...LIVENESS_PLAN_LEFT_FIRST] : [...LIVENESS_PLAN_RIGHT_FIRST];
+}
+
+const FLASH_COLORS = [
+  [255, 64, 64],
+  [64, 160, 255],
+  [72, 220, 120],
+  [255, 190, 60],
+  [190, 110, 255],
+  [60, 220, 220],
+];
+
+// A per-challenge random screen-flash sequence: the screen lights the user's
+// face and the client uploads timestamped face-region pixels, so the server
+// can check reflected light tracks a stimulus only this session knew.
+function createFlashPlan() {
+  const colors = [...FLASH_COLORS];
+  for (let i = colors.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [colors[i], colors[j]] = [colors[j], colors[i]];
+  }
+  let onset = FLASH_LEAD_MS;
+  return colors.slice(0, FLASH_COUNT).map((color) => {
+    const durationMs = FLASH_DURATION_MIN_MS + crypto.randomInt(FLASH_DURATION_SPAN_MS + 1);
+    const flash = { c: color, o: onset, d: durationMs };
+    onset += durationMs + FLASH_GAP_MIN_MS + crypto.randomInt(FLASH_GAP_SPAN_MS + 1);
+    return flash;
+  });
+}
+
+function pixelMeanChannels(buffers) {
+  const acc = [0, 0, 0];
+  let count = 0;
+  for (const buf of buffers) {
+    for (let i = 0; i + 2 < buf.length; i += 3) {
+      acc[0] += buf[i];
+      acc[1] += buf[i + 1];
+      acc[2] += buf[i + 2];
+    }
+    count += buf.length / 3;
+  }
+  return acc.map((v) => v / Math.max(1, count));
+}
+
+function decodePixelField(value, expectedBytes) {
+  if (typeof value !== 'string') return null;
+  const buf = Buffer.from(value, 'base64');
+  return buf.length === expectedBytes ? buf : null;
+}
+
+function validatePixelSeries(pixelSeries, flashPlan) {
+  if (!Array.isArray(flashPlan) || !flashPlan.length) return 'Flash liveness plan is missing.';
+  if (!Array.isArray(pixelSeries) || pixelSeries.length < 8 || pixelSeries.length > MAX_PIXEL_SAMPLES) {
+    return 'Pixel liveness series is invalid.';
+  }
+
+  const samples = [];
+  let lastT = -1;
+  for (const sample of pixelSeries) {
+    const t = Number(sample && sample.t);
+    if (!Number.isFinite(t) || t < 0 || t > 30000 || t < lastT) return 'Pixel sample timing is invalid.';
+    lastT = t;
+    const entry = { t };
+    if (sample.f !== undefined) {
+      const f = decodePixelField(sample.f, FLASH_FACE_PIXEL_BYTES);
+      if (!f) return 'Pixel sample face data is invalid.';
+      entry.f = f;
+    }
+    if (sample.b !== undefined) {
+      const b = decodePixelField(sample.b, FLASH_BG_PIXEL_BYTES);
+      if (!b) return 'Pixel sample background data is invalid.';
+      entry.b = b;
+    }
+    samples.push(entry);
+  }
+
+  const firstOnset = flashPlan[0].o;
+  const lastEnd = flashPlan[flashPlan.length - 1].o + flashPlan[flashPlan.length - 1].d;
+  if (samples[samples.length - 1].t < lastEnd - 40) return 'Pixel samples do not cover the flash sequence.';
+
+  const baselineSamples = samples.filter((s) => s.f && s.t < firstOnset - FLASH_BASELINE_LEAD_MS);
+  if (baselineSamples.length < FLASH_MIN_BASELINE_SAMPLES) return 'Pixel baseline before the flash sequence is too sparse.';
+  const baseline = pixelMeanChannels(baselineSamples.map((s) => s.f));
+
+  // Baseline frames must carry real sensor noise: identical consecutive frames
+  // or zero temporal variation is a synthesized stream, not a camera.
+  let l1Sum = 0;
+  let differing = 0;
+  for (let i = 1; i < baselineSamples.length; i++) {
+    const prev = baselineSamples[i - 1].f;
+    const cur = baselineSamples[i].f;
+    let diff = 0;
+    let any = false;
+    for (let j = 0; j < cur.length; j++) {
+      const d = Math.abs(cur[j] - prev[j]);
+      diff += d;
+      if (d) any = true;
+    }
+    l1Sum += diff / cur.length;
+    if (any) differing += 1;
+  }
+  const meanL1 = l1Sum / (baselineSamples.length - 1);
+  if (meanL1 < FLASH_NOISE_L1_MIN || meanL1 > FLASH_NOISE_L1_MAX) {
+    return 'Pixel stream does not look like real camera noise.';
+  }
+  if (differing / (baselineSamples.length - 1) < FLASH_DISTINCT_FRAMES_MIN) {
+    return 'Pixel stream repeats identical frames.';
+  }
+
+  for (const flash of flashPlan) {
+    const expected = flash.c;
+    const window = samples.filter((s) => s.f && s.t >= flash.o - 30 && s.t <= flash.o + flash.d + FLASH_LAG_SLACK_MS);
+    if (window.length < FLASH_MIN_SAMPLES_PER_FLASH) return 'Pixel sampling missed a flash window.';
+    const observed = pixelMeanChannels(window.map((s) => s.f));
+    const delta = observed.map((v, i) => v - baseline[i]);
+    const deltaMag = Math.hypot(...delta);
+    const expectedMag = Math.hypot(...expected);
+    const cosine = deltaMag > 1e-6 && expectedMag > 1e-6
+      ? delta.reduce((sum, v, i) => sum + v * expected[i], 0) / (deltaMag * expectedMag)
+      : 0;
+    const ratio = deltaMag / expectedMag;
+    if (cosine < FLASH_COSINE_MIN || ratio < FLASH_DELTA_RATIO_MIN || ratio > FLASH_DELTA_RATIO_MAX) {
+      return 'Face pixels did not reflect the issued flash sequence.';
+    }
+  }
+  return null;
 }
 
 function computeLivenessSeriesDigest(challengeId, motionSeries) {
@@ -1031,9 +1175,11 @@ async function handleApi(req, res, pathname) {
     const created = now();
     const challengeId = randomId();
     const plan = createLivenessPlan();
+    const flashPlan = createFlashPlan();
     session.livenessChallenge = {
       id: challengeId,
       plan,
+      flashPlan,
       createdAt: created,
       expiresAt: created + LIVENESS_CHALLENGE_TTL_MS,
       consumedAt: null,
@@ -1042,6 +1188,7 @@ async function handleApi(req, res, pathname) {
     return sendJson(res, 201, {
       challengeId,
       plan,
+      flashPlan,
       expiresAt: session.livenessChallenge.expiresAt,
     });
   }
@@ -1091,6 +1238,12 @@ async function handleApi(req, res, pathname) {
     if (phaseError) {
       logVerificationFailure('liveness_phases_rejected', pathname);
       return sendJson(res, 400, { error: phaseError });
+    }
+
+    const pixelError = validatePixelSeries(body.pixelSeries, pending.flashPlan);
+    if (pixelError) {
+      logVerificationFailure('liveness_pixels_rejected', pathname);
+      return sendJson(res, 400, { error: pixelError });
     }
 
     if (pending.seriesDigests.has(seriesDigest)) {
@@ -1219,4 +1372,6 @@ module.exports = {
   deriveLivenessPhasesFromMotionSeries,
   validateHandLandmarkGeometry,
   verifyAuthenticatorData,
+  createFlashPlan,
+  validatePixelSeries,
 };

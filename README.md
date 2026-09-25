@@ -71,7 +71,7 @@ npm test
 npm run attack
 ```
 
-`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera, no MediaPipe — reporting which checks a scripted client fools. It documents the honest ceiling of client-side evidence checks: the server validates statistics of submitted numbers, not real media.
+`attack_server.js` spins up the real server and submits fully fabricated evidence — no camera, no MediaPipe — including synthesized pixel streams that match the issued flash sequence. It reports which checks a scripted client fools and documents the honest ceiling of client-side evidence: even pixel-verified flash liveness stays forgeable by a script that synthesizes matching pixels. Closing that hole needs server-side media verification (e.g. a PAD model on uploaded frames) or hardware attestation.
 
 The regression test starts a temporary local HTTP server and checks that:
 
@@ -87,9 +87,10 @@ The regression test starts a temporary local HTTP server and checks that:
 1. The browser asks the server for a challenge.
 2. The user chooses a primary verification method, such as hand gestures or face motion.
 3. The browser performs the local check and submits bounded evidence for that step.
-4. The server validates order, timing, replay state, and session binding.
-5. After all steps pass, the server issues a short-lived signed token.
-6. The protected action accepts only that server-issued token, once.
+4. Face verification ends with a flash challenge: the server issues a random color sequence, the screen flashes it, and the client uploads timestamped face-region pixel bursts the server checks for correlation, coverage, and sensor noise.
+5. The server validates order, timing, replay state, pixel evidence, and session binding.
+6. After all steps pass, the server issues a short-lived signed token.
+7. The protected action accepts only that server-issued token, once.
 
 Relying parties can redeem a token without the user's session cookie via `POST /api/verify` with `{ "verificationToken": "..." }`. It validates the signature and expiry, enforces one-use, and returns `{ valid, action, method, assurance, expiresAt }`. A second redemption returns `409`. Production deployments should additionally authenticate the calling party (e.g. a shared RP secret).
 
@@ -104,4 +105,4 @@ There is no emergency text/audio verification path. When camera detection takes 
 
 ## Security Notes
 
-This patch fixes the original client-side trust-boundary problem, but it is still a demo. For high-value production use, add server-side media verification, abuse monitoring, durable storage, passkey credentials stored on user accounts instead of in memory, rate limits backed by a shared datastore (this demo uses in-memory limits only), secret management via your platform, CSRF/origin allowlists tuned to your deployment (`ZOE_ALLOWED_ORIGINS`), and a fully designed accessibility policy.
+This patch fixes the original client-side trust-boundary problem and adds a pixel-verified flash challenge to face checks, but it is still a demo — the attack harness proves a script synthesizing matching pixels still fools it. For high-value production use, add server-side media verification, abuse monitoring, durable storage, passkey credentials stored on user accounts instead of in memory, rate limits backed by a shared datastore (this demo uses in-memory limits only), secret management via your platform, CSRF/origin allowlists tuned to your deployment (`ZOE_ALLOWED_ORIGINS`), and a fully designed accessibility policy.
