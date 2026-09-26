@@ -68,6 +68,8 @@ function bestFace() {
     const candidate = { x: box.originX, y: box.originY, w: box.width, h: box.height };
     const calibrated = calibratedFaceBox(candidate, detection.keypoints, video.videoWidth, video.videoHeight);
     calibrated.score = score;
+    calibrated.keypoints = detection.keypoints || null;
+    calibrated.rawBox = candidate;
     if (!best || calibrated.score > best.score) best = calibrated;
   }
   currentFace = best;
@@ -91,7 +93,19 @@ function drawFace(face) {
   overlayContext.setLineDash([]);
   if (face) {
     overlayContext.strokeStyle = '#56e39f';
-    overlayContext.strokeRect(face.x, face.y, face.w, face.h);
+    // The overlay canvas is CSS-mirrored (scaleX(-1)), so detector-space rects
+    // must be drawn mirrored to land on the face the user sees.
+    overlayContext.strokeRect(width - face.x - face.w, face.y, face.w, face.h);
+    if (Array.isArray(face.keypoints)) {
+      overlayContext.fillStyle = '#5b8cff';
+      for (const point of face.keypoints) {
+        const px = point.x <= 1 ? point.x * width : point.x;
+        const py = point.y <= 1 ? point.y * height : point.y;
+        overlayContext.beginPath();
+        overlayContext.arc(width - px, py, Math.max(3, width / 160), 0, Math.PI * 2);
+        overlayContext.fill();
+      }
+    }
   }
 }
 
@@ -222,7 +236,18 @@ async function runFlashTest() {
   const baselineStarted = performance.now();
   const baselineSamples = await collectWindow(1200);
   const baselineDuration = performance.now() - baselineStarted;
-  baseline.textContent = `${baselineSamples.length} samples / ${(baselineDuration / 1000).toFixed(1)}s`;
+  // Ambient luminance of the same face crop production samples — screen
+  // flashes move reflected chroma by a fixed amount, so bright ambient light
+  // (daylight, sunlit windows) swamps the delta and Zoe's check cannot pass.
+  const AMBIENT_LUMINANCE_MAX = 140;
+  const lums = baselineSamples
+    .filter((s) => Array.isArray(s))
+    .map((s) => s[0] * 0.2126 + s[1] * 0.7152 + s[2] * 0.0722);
+  const ambientLum = lums.length ? lums.reduce((a, b) => a + b, 0) / lums.length : null;
+  baseline.textContent = `${baselineSamples.length} samples / ${(baselineDuration / 1000).toFixed(1)}s`
+    + (ambientLum !== null
+      ? ` · ambient luminance ${Math.round(ambientLum)}${ambientLum > AMBIENT_LUMINANCE_MAX ? ' — too bright for the flash check (production blocks it)' : ''}`
+      : '');
   const results = [];
   for (const color of FLASH_COLORS) {
     flashButton.textContent = `Testing ${color.name.toLowerCase()}`;
