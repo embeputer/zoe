@@ -1,5 +1,9 @@
 // Adversarial harness: measures which server checks a fully scripted client can
 // pass without a camera, a face, a hand, or MediaPipe. Run with `npm run attack`.
+//
+// Every probe reports tri-state: 'fooled' (the attack worked), 'blocked' with
+// the stage that stopped it (the probed check genuinely ran), or 'not-probed'
+// (an earlier gate killed the request — never silently upgraded to 'blocked').
 process.env.ZOE_DB_PATH = ':memory:';
 // Wall-clock floors stay on but are shortened for runtime — the harness still
 // has to burn real seconds per attempt, not mint instantly.
@@ -71,7 +75,53 @@ function fabricatedMediaEvidence(challengeId) {
   };
 }
 
-function fabricatedStepEvidence() {
+// Packed-hand fixtures (server's 12-point layout) synthesized per gesture —
+// geometry valid by construction, so this probes whether the server accepts
+// landmark claims that never came from a camera.
+function packedHandFixture(state = {}) {
+  const finger = (pipX, extended) => [[pipX, 0.62, 0], [pipX, extended ? 0.48 : 0.7, 0]];
+  const hand = [
+    [0.5, 0.75, 0],
+    [0.42, 0.72, 0],
+    [0.48, 0.68, 0],
+    state.thumb ? [0.3, 0.65, 0] : [0.45, 0.71, 0],
+  ];
+  for (const [pipX, extended] of [[0.48, state.index], [0.52, state.middle], [0.56, state.ring], [0.6, state.pinky]]) {
+    hand.push(...finger(pipX, extended));
+  }
+  return hand;
+}
+
+const FABRICATED_GESTURE_STATES = {
+  wave: { thumb: true, index: true, middle: true, ring: true, pinky: true },
+  fist: {},
+  open_palm: { thumb: true, index: true, middle: true, ring: true, pinky: true },
+  peace: { index: true, middle: true },
+  point: { index: true },
+  three: { index: true, middle: true, ring: true },
+  rock: { index: true, pinky: true },
+  call_me: { thumb: true, pinky: true },
+};
+
+function fabricatedLandmarkSamples(gestureId) {
+  if (gestureId === 'ily') {
+    const left = packedHandFixture({ index: true, middle: true, ring: true, pinky: true });
+    left[0] = [0.4, 0.75, 0];
+    left[3] = [0.5, 0.5, 0];
+    left[5] = [0.5, 0.42, 0];
+    const right = left.map(([x, y, z]) => [1 - x, y, z]);
+    return [{ hands: [left, right] }];
+  }
+  if (gestureId === 'ok') {
+    const hand = packedHandFixture({ index: true, middle: true, ring: true, pinky: true });
+    hand[3] = [0.46, 0.5, 0];
+    hand[5] = [0.48, 0.51, 0];
+    return [{ hands: [hand] }];
+  }
+  return [{ hands: [packedHandFixture(FABRICATED_GESTURE_STATES[gestureId] || {})] }];
+}
+
+function fabricatedStepEvidence(gestureId) {
   return {
     startedAt: 1000,
     matchedAt: 1450,
@@ -80,7 +130,7 @@ function fabricatedStepEvidence() {
     holdFrames: 8,
     landmarkDigest: crypto.randomBytes(8).toString('hex'),
     motionDigest: crypto.randomBytes(8).toString('hex'),
-    // landmarkSamples intentionally omitted: server-side hand geometry only runs when present.
+    landmarkSamples: fabricatedLandmarkSamples(gestureId),
     motionStats: { holdJitterRms: 0.003, formingMotion: 0.002 },
   };
 }
@@ -141,9 +191,62 @@ function fabricatedMotionSeries(plan) {
 }
 
 const results = [];
-function report(name, fooled, note) {
-  results.push({ name, fooled, note });
-  console.log(`${fooled ? 'FOOLED ' : 'BLOCKED'}  ${name} — ${note}`);
+function report(name, outcome, note) {
+  results.push({ name, outcome });
+  const label = outcome === 'fooled' ? 'FOOLED   ' : outcome === 'blocked' ? 'BLOCKED  ' : 'NOT-PROBED';
+  console.log(`${label} ${name} — ${note}`);
+}
+
+// Which pipeline gate rejected a liveness verify, classified from the server's
+// own rejection reason. A probe killed upstream of its target is 'not-probed'.
+function livenessRejectStage(res, body) {
+  const status = res.status;
+  const err = (body && body.error) || '';
+  if (status === 429) return /media attempts/.test(err) ? 'media-attempt cap' : 'rate limit';
+  if (status === 503) return 'analyzer unavailable';
+  if (status === 409) return 'challenge consumed';
+  if (status === 410) return 'challenge expiry';
+  if (status === 422) return 'pulse analysis'; // pulse rejected, flash offered
+  if (/missing or invalid/.test(err)) return 'challenge binding';
+  if (/too quickly/.test(err)) return 'wall-clock floor';
+  if (/Face check timing/.test(err)) return 'duration gate';
+  if (/not visible for long enough/.test(err)) return 'face-presence gate';
+  if (/too small to count as liveness/.test(err)) return 'motion-score gate';
+  if (/motion digest/i.test(err)) return 'motion-digest check';
+  if (/motion series/i.test(err)) return 'motion-series checks';
+  if (/Camera media/.test(err)) return 'media validation';
+  if (/photo or screen/.test(err)) return 'presentation analysis';
+  if (/Replay face motion/.test(err)) return 'replay set';
+  if (/Pulse|heartbeat/.test(err)) return 'pulse analysis';
+  if (/flash|Flash|pixel|Pixel/.test(err)) return 'flash-pixel analysis';
+  if (/phase|Head turn|uniform|synthetic|smooth|abrupt|too sparse/.test(err)) return 'phase-metric checks';
+  return `HTTP ${status}`;
+}
+
+// Mint a real token through the fabricated hand-gesture flow — the one mint
+// path that still accepts client-generated evidence. Used by probes whose
+// target sits behind token minting; if the gesture surface ever closes they
+// correctly report not-probed.
+async function mintGestureToken(baseUrl, cookie) {
+  let res = await request(baseUrl, '/api/challenge', { method: 'POST' }, cookie);
+  cookie = res.cookie;
+  let body = res.body;
+  const totalSteps = (body && body.totalSteps) || 3;
+  for (let i = 0; i < totalSteps && body && body.step; i += 1) {
+    await sleep(200); // per-step wall-clock floor (180ms default)
+    res = await request(baseUrl, '/api/step', {
+      method: 'POST',
+      body: JSON.stringify({
+        challengeId: body.challengeId,
+        stepIndex: body.step.index,
+        gestureId: body.step.id,
+        evidence: fabricatedStepEvidence(body.step.id),
+      }),
+    }, cookie);
+    cookie = res.cookie;
+    body = res.body;
+  }
+  return { token: body && body.verificationToken, status: res.res.status, cookie };
 }
 
 async function attackFabricatedGestures(baseUrl, cookie) {
@@ -158,20 +261,22 @@ async function attackFabricatedGestures(baseUrl, cookie) {
         challengeId: challenge.challengeId,
         stepIndex: challenge.step.index,
         gestureId: challenge.step.id,
-        evidence: fabricatedStepEvidence(),
+        evidence: fabricatedStepEvidence(challenge.step.id),
       }),
     }, cookie);
     challenge = res.body;
   }
   const token = challenge.verificationToken;
-  if (!token) return { fooled: false, note: `no token issued (last status ${res.res.status})`, cookie };
+  if (!token) return { outcome: 'not-probed', note: `no token issued (last status ${res.res.status}) — the forgeable mint path itself is closed`, cookie };
   const use = await request(baseUrl, '/api/protected-action', {
     method: 'POST',
     body: JSON.stringify({ verificationToken: token }),
   }, cookie);
   return {
-    fooled: use.res.status === 200,
-    note: use.res.status === 200 ? 'protected action accepted with zero camera frames' : `token issued but rejected (${use.res.status})`,
+    outcome: use.res.status === 200 ? 'fooled' : 'blocked',
+    note: use.res.status === 200
+      ? 'protected action accepted with zero camera frames'
+      : `blocked at token gate: token issued but rejected (${use.res.status})`,
     cookie,
   };
 }
@@ -197,14 +302,17 @@ async function attackFabricatedLiveness(baseUrl, cookie) {
     }),
   }, cookie);
   const token = res.body.verificationToken;
-  if (!token) return { fooled: false, note: `rejected (${res.res.status}: ${res.body.error || '?'})`, cookie };
+  if (!token) {
+    const stage = livenessRejectStage(res.res, res.body);
+    return { outcome: 'blocked', note: `blocked at ${stage} (${res.res.status}: ${res.body.error || '?'})`, cookie };
+  }
   const use = await request(baseUrl, '/api/protected-action', {
     method: 'POST',
     body: JSON.stringify({ verificationToken: token }),
   }, cookie);
   return {
-    fooled: use.res.status === 200,
-    note: use.res.status === 200 ? 'protected action accepted from a synthetic motionSeries' : `token issued but rejected (${use.res.status})`,
+    outcome: use.res.status === 200 ? 'fooled' : 'blocked',
+    note: use.res.status === 200 ? 'protected action accepted from a synthetic motionSeries' : `blocked at token gate: token issued but rejected (${use.res.status})`,
     cookie,
   };
 }
@@ -230,9 +338,11 @@ async function attackReplayedSeries(baseUrl, cookie) {
       ...fabricatedMediaEvidence(res.body.challengeId),
     }),
   }, cookie);
+  const fooled = res.res.status === 200 && !!res.body.verificationToken;
+  const stage = fooled ? null : livenessRejectStage(res.res, res.body);
   return {
-    fooled: res.res.status === 200 && !!res.body.verificationToken,
-    note: res.res.status === 200 ? 'a recorded template + per-run noise mints a fresh token every time' : `rejected (${res.res.status})`,
+    outcome: fooled ? 'fooled' : 'blocked',
+    note: fooled ? 'a recorded template + per-run noise mints a fresh token every time' : `blocked at ${stage} (${res.res.status})`,
     cookie,
   };
 }
@@ -242,7 +352,11 @@ async function controlProtectedAction(baseUrl, cookie) {
     method: 'POST',
     body: JSON.stringify({ verificationToken: 'verified=true' }),
   }, cookie);
-  return { fooled: res.res.status !== 401, note: `status ${res.res.status}`, cookie: res.cookie };
+  return {
+    outcome: res.res.status === 401 ? 'blocked' : 'fooled',
+    note: res.res.status === 401 ? 'blocked at token gate (401)' : `status ${res.res.status} — token gate missing`,
+    cookie: res.cookie,
+  };
 }
 
 async function controlPasskeyGate(baseUrl, cookie) {
@@ -250,7 +364,11 @@ async function controlPasskeyGate(baseUrl, cookie) {
     method: 'POST',
     body: JSON.stringify({}),
   }, cookie);
-  return { fooled: res.res.status === 200, note: `status ${res.res.status}`, cookie };
+  return {
+    outcome: res.res.status === 401 ? 'blocked' : 'fooled',
+    note: res.res.status === 401 ? 'blocked at registration gate (401)' : `status ${res.res.status} — registration gate missing`,
+    cookie,
+  };
 }
 
 async function controlUncorrelatedPixels(baseUrl, cookie) {
@@ -280,10 +398,10 @@ async function controlUncorrelatedPixels(baseUrl, cookie) {
     }),
   }, cookie);
   if (res.res.status !== 422 || !res.body.flashAvailable) {
-    const blockedByPad = res.res.status === 400 && /photo or screen/.test(res.body.error || '');
+    const stage = livenessRejectStage(res.res, res.body);
     return {
-      fooled: !blockedByPad,
-      note: blockedByPad ? 'blocked earlier by server-side camera analysis' : `flash fallback was not offered cleanly: ${res.res.status}`,
+      outcome: 'not-probed',
+      note: `flash/pixel check unreachable — rejected upstream at ${stage} (${res.res.status})`,
       cookie,
     };
   }
@@ -302,36 +420,34 @@ async function controlUncorrelatedPixels(baseUrl, cookie) {
       ...fabricatedMediaEvidence(challengeId),
     }),
   }, cookie);
-  return { fooled: res.res.status === 200, note: `flash-ignoring pixels: ${res.res.status}`, cookie };
+  const fooled = res.res.status === 200;
+  const stage = fooled ? null : livenessRejectStage(res.res, res.body);
+  return {
+    outcome: fooled ? 'fooled' : 'blocked',
+    note: fooled ? 'pixels that ignored the flash minted a token' : `blocked at ${stage}: flash-ignoring pixels (${res.res.status})`,
+    cookie,
+  };
 }
 
 async function controlCrossSession(baseUrl, cookie) {
-  let res = await request(baseUrl, '/api/liveness/challenge', { method: 'POST' }, cookie);
-  cookie = res.cookie;
-  const { challengeId, plan, flashPlan } = res.body;
-  const motionSeries = fabricatedMotionSeries(plan);
-  await sleep(2100); // wall-clock floor: >=2s (shortened from the 14s default)
-  res = await request(baseUrl, '/api/liveness/verify', {
-    method: 'POST',
-    body: JSON.stringify({
-      challengeId,
-      durationMs: 2400,
-      faceFrames: 30,
-      motionScore: 0.35,
-      motionSeries,
-      seriesDigest: attackerSeriesDigest(challengeId, motionSeries),
-      pixelSeries: flashPlan ? fabricatedPixelSeries(flashPlan) : undefined,
-      pulseSeries: fabricatedPulseSeries(),
-      ...fabricatedMediaEvidence(challengeId),
-    }),
-  }, cookie);
-  const token = res.body.verificationToken;
-  if (!token) return { fooled: false, note: 'could not mint token to test', cookie };
+  // Mint through the fabricated gesture path — the one surface that still
+  // issues tokens to scripted clients — so the cross-session check runs.
+  const mint = await mintGestureToken(baseUrl, cookie);
+  cookie = mint.cookie;
+  if (!mint.token) {
+    return { outcome: 'not-probed', note: `no token to test — gesture mint rejected (${mint.status})`, cookie };
+  }
   const other = await request(baseUrl, '/api/protected-action', {
     method: 'POST',
-    body: JSON.stringify({ verificationToken: token }),
+    body: JSON.stringify({ verificationToken: mint.token }),
   }); // fresh session, no cookie
-  return { fooled: other.res.status === 200, note: `cross-session use: ${other.res.status}`, cookie };
+  return {
+    outcome: other.res.status === 200 ? 'fooled' : 'blocked',
+    note: other.res.status === 200
+      ? 'token minted in one session redeemed in another'
+      : `blocked at token gate: cross-session use ${other.res.status}`,
+    cookie,
+  };
 }
 
 async function main() {
@@ -345,41 +461,47 @@ async function main() {
 
     let r = await controlProtectedAction(baseUrl, cookie);
     cookie = r.cookie;
-    report('control: protected action without token', r.fooled, r.note);
+    report('control: protected action without token', r.outcome, r.note);
 
     r = await controlPasskeyGate(baseUrl, cookie);
-    report('control: passkey registration without verification', r.fooled, r.note);
+    report('control: passkey registration without verification', r.outcome, r.note);
 
     r = await attackFabricatedGestures(baseUrl, cookie);
     cookie = r.cookie;
-    report('fabricated gesture challenge', r.fooled, r.note);
+    report('fabricated gesture challenge', r.outcome, r.note);
 
     r = await attackFabricatedLiveness(baseUrl, cookie);
     cookie = r.cookie;
-    report('fabricated face liveness', r.fooled, r.note);
+    report('fabricated face liveness', r.outcome, r.note);
 
     r = await attackReplayedSeries(baseUrl, cookie);
     cookie = r.cookie;
-    report('replayed series + fresh noise', r.fooled, r.note);
+    report('replayed series + fresh noise', r.outcome, r.note);
 
     r = await controlUncorrelatedPixels(baseUrl, cookie);
     cookie = r.cookie;
-    report('control: pixels that ignore the flash', r.fooled, r.note);
+    report('control: pixels that ignore the flash', r.outcome, r.note);
 
     r = await controlCrossSession(baseUrl, cookie);
-    report('control: token reuse across sessions', r.fooled, r.note);
+    report('control: token reuse across sessions', r.outcome, r.note);
 
-    const fooled = results.filter((x) => x.fooled && !x.name.startsWith('control'));
+    const attacks = results.filter((x) => !x.name.startsWith('control'));
     const controls = results.filter((x) => x.name.startsWith('control'));
-    console.log(`\n${fooled.length}/3 attacks fooled the server; controls blocked: ${controls.filter((x) => !x.fooled).length}/${controls.length}`);
-    const faceAttacksFooled = fooled.some((result) => (
+    const fooledAttacks = attacks.filter((x) => x.outcome === 'fooled');
+    const unexercisedAttacks = attacks.filter((x) => x.outcome === 'not-probed');
+    const heldControls = controls.filter((x) => x.outcome === 'blocked');
+    const fooledControls = controls.filter((x) => x.outcome === 'fooled');
+    const unprobedControls = controls.filter((x) => x.outcome === 'not-probed');
+    console.log(`\n${fooledAttacks.length}/${attacks.length} attacks fooled the server` + (unexercisedAttacks.length ? ` (${unexercisedAttacks.length} not probed)` : ''));
+    console.log(`controls: ${heldControls.length} held, ${fooledControls.length} fooled, ${unprobedControls.length} not probed` + (unprobedControls.length ? ` (${unprobedControls.map((x) => x.name).join('; ')})` : ''));
+    const faceAttacksFooled = fooledAttacks.some((result) => (
       result.name === 'fabricated face liveness' || result.name === 'replayed series + fresh noise'
     ));
     if (!faceAttacksFooled) {
       console.log('Conclusion: server-side face detection and presentation analysis blocked both scripted face attacks.');
     }
-    if (fooled.some((result) => result.name === 'fabricated gesture challenge')) {
-      console.log('The hand-gesture path remains forgeable because it still accepts bounded client-generated evidence.');
+    if (fooledAttacks.some((result) => result.name === 'fabricated gesture challenge')) {
+      console.log('The hand-gesture path remains forgeable to geometrically valid synthesized landmark claims — no camera pixel evidence is bound to it.');
     }
   } finally {
     await new Promise((resolve) => server.close(resolve));

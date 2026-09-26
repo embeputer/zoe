@@ -5,8 +5,11 @@ const path = require('path');
 const { DatabaseSync } = require('node:sqlite');
 const {
   computePresentationDigest,
+  computeFlashDigest,
   validatePresentationFrames,
+  validateFlashFrames,
   analyzePresentationFrames,
+  faceSignals,
 } = require('./face_pad');
 
 const PORT = Number(process.env.PORT || 3000);
@@ -108,12 +111,12 @@ const PULSE_LOBE_BINS = 5;
 // a clean injected sine concentrates ~everything. Both bounds reject fakes.
 const PULSE_LOBE_FRACTION_MIN = 0.45;
 const PULSE_LOBE_FRACTION_MAX = 0.97;
-const PASSKEY_CHALLENGE_TTL_MS = 2 * 60 * 1000;
+const PASSKEY_CHALLENGE_TTL_MS = 10 * 60 * 1000;
 const APP_NAME = 'Zoe';
 const COOKIE_NAME = 'zoe_sid';
 
 function resolveSecret() {
-  const fromEnv = process.env.ZOE_SECRET || process.env.REALHANDS_SECRET;
+  const fromEnv = process.env.ZOE_SECRET;
   if (fromEnv) return fromEnv;
   if (REQUIRE_SECRET) {
     console.error('ZOE_SECRET is required when NODE_ENV=production or ZOE_REQUIRE_SECRET=1.');
@@ -172,6 +175,12 @@ db.exec(`
     digest TEXT PRIMARY KEY,
     used_at INTEGER NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS issued_tokens (
+    digest TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    exp INTEGER NOT NULL
+  );
 `);
 try {
   db.exec('ALTER TABLE credentials ADD COLUMN hardware_backed INTEGER NOT NULL DEFAULT 0');
@@ -186,8 +195,8 @@ for (const row of db.prepare('SELECT id, created_at, last_seen_at FROM sessions'
     lastSeenAt: row.last_seen_at,
     issuedTokens: new Map(),
     credentials: new Map(),
-    passkeyRegisterChallenge: null,
-    passkeyAuthChallenge: null,
+    passkeyRegisterChallenges: new Map(),
+    passkeyAuthChallenges: new Map(),
     livenessChallenge: null,
     persisted: true,
   });
@@ -212,9 +221,14 @@ for (const row of db.prepare('SELECT digest FROM used_tokens').all()) {
 const persistSessionStmt = db.prepare('INSERT OR REPLACE INTO sessions (id, created_at, last_seen_at) VALUES (?, ?, ?)');
 const persistCredentialStmt = db.prepare('INSERT OR REPLACE INTO credentials (session_id, id, public_key, alg, sign_count, created_at, hardware_backed) VALUES (?, ?, ?, ?, ?, ?, ?)');
 const persistUsedTokenStmt = db.prepare('INSERT OR IGNORE INTO used_tokens (digest, used_at) VALUES (?, ?)');
+const persistIssuedTokenStmt = db.prepare('INSERT OR REPLACE INTO issued_tokens (digest, session_id, payload_json, exp) VALUES (?, ?, ?, ?)');
+const getIssuedTokenStmt = db.prepare('SELECT session_id, payload_json, exp FROM issued_tokens WHERE digest = ?');
+const deleteIssuedTokenStmt = db.prepare('DELETE FROM issued_tokens WHERE digest = ?');
 const deleteSessionStmt = db.prepare('DELETE FROM sessions WHERE id = ?');
 const deleteSessionCredentialsStmt = db.prepare('DELETE FROM credentials WHERE session_id = ?');
+const deleteSessionIssuedTokensStmt = db.prepare('DELETE FROM issued_tokens WHERE session_id = ?');
 const pruneUsedTokensStmt = db.prepare('DELETE FROM used_tokens WHERE used_at < ?');
+const pruneIssuedTokensStmt = db.prepare('DELETE FROM issued_tokens WHERE exp < ?');
 
 function persistSession(session) {
   persistSessionStmt.run(session.id, session.createdAt, session.lastSeenAt);
@@ -229,9 +243,37 @@ function persistUsedToken(digest) {
   persistUsedTokenStmt.run(digest, now());
 }
 
+// Issued-token digests persist so redemption survives a restart: the in-memory
+// session.issuedTokens map is the fast path, this table is the fallback when
+// the session entry was reloaded without its issued tokens.
+function persistIssuedToken(digest, sessionId, payload) {
+  persistIssuedTokenStmt.run(digest, sessionId, JSON.stringify(payload), payload.exp);
+}
+
+function getIssuedToken(digest) {
+  const row = getIssuedTokenStmt.get(digest);
+  if (!row) return null;
+  if (now() > row.exp) {
+    deleteIssuedToken(digest);
+    return null;
+  }
+  let payload = null;
+  try {
+    payload = JSON.parse(row.payload_json);
+  } catch {
+    payload = null;
+  }
+  return { sessionId: row.session_id, payload, exp: row.exp };
+}
+
+function deleteIssuedToken(digest) {
+  deleteIssuedTokenStmt.run(digest);
+}
+
 function deletePersistedSession(sessionId) {
   deleteSessionStmt.run(sessionId);
   deleteSessionCredentialsStmt.run(sessionId);
+  deleteSessionIssuedTokensStmt.run(sessionId);
 }
 
 function now() {
@@ -340,6 +382,13 @@ function sweepExpiredState(force = false) {
   }
 
   pruneUsedTokensStmt.run(t - TOKEN_TTL_MS);
+  pruneIssuedTokensStmt.run(t);
+  for (const [ip, bucket] of rateLimitByIp) {
+    if (t >= bucket.resetAt) rateLimitByIp.delete(ip);
+  }
+  for (const [sid, bucket] of rateLimitBySession) {
+    if (t >= bucket.resetAt) rateLimitBySession.delete(sid);
+  }
   for (const [sid, session] of sessions) {
     if (t - session.lastSeenAt > SESSION_IDLE_TTL_MS) {
       sessions.delete(sid);
@@ -349,11 +398,11 @@ function sweepExpiredState(force = false) {
     for (const [digest, payload] of session.issuedTokens) {
       if (t > payload.exp) session.issuedTokens.delete(digest);
     }
-    if (session.passkeyRegisterChallenge && t - session.passkeyRegisterChallenge.createdAt > PASSKEY_CHALLENGE_TTL_MS) {
-      session.passkeyRegisterChallenge = null;
+    for (const [challenge, pending] of session.passkeyRegisterChallenges) {
+      if (t - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) session.passkeyRegisterChallenges.delete(challenge);
     }
-    if (session.passkeyAuthChallenge && t - session.passkeyAuthChallenge.createdAt > PASSKEY_CHALLENGE_TTL_MS) {
-      session.passkeyAuthChallenge = null;
+    for (const [challenge, pending] of session.passkeyAuthChallenges) {
+      if (t - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) session.passkeyAuthChallenges.delete(challenge);
     }
     if (session.livenessChallenge && t > session.livenessChallenge.expiresAt) {
       session.livenessChallenge = null;
@@ -361,7 +410,7 @@ function sweepExpiredState(force = false) {
   }
 }
 
-function enforcePostSecurity(req, res, pathname, session) {
+function enforcePostSecurity(req, res, pathname, sessionId) {
   if (req.method !== 'POST' || !STATE_CHANGING_POST_PATHS.has(pathname)) return true;
 
   // /api/verify is the relying-party redemption endpoint: the caller is a
@@ -374,7 +423,7 @@ function enforcePostSecurity(req, res, pathname, session) {
     return false;
   }
 
-  const rateLimit = checkRateLimit(clientIp(req), session.id);
+  const rateLimit = checkRateLimit(clientIp(req), sessionId);
   if (rateLimit.limited) {
     sendJson(res, 429, {
       error: 'Too many requests. Please slow down and try again.',
@@ -422,7 +471,11 @@ function parseCookies(header = '') {
   for (const part of header.split(';')) {
     const [rawName, ...rawValue] = part.trim().split('=');
     if (!rawName || !rawValue.length) continue;
-    out.set(rawName, decodeURIComponent(rawValue.join('=')));
+    try {
+      out.set(rawName, decodeURIComponent(rawValue.join('=')));
+    } catch {
+      // Skip malformed percent-encoding instead of throwing.
+    }
   }
   return out;
 }
@@ -438,12 +491,12 @@ function getSession(req, res) {
       lastSeenAt: now(),
       issuedTokens: new Map(),
       credentials: new Map(),
-      passkeyRegisterChallenge: null,
-      passkeyAuthChallenge: null,
+      passkeyRegisterChallenges: new Map(),
+      passkeyAuthChallenges: new Map(),
       livenessChallenge: null,
       persisted: false,
     });
-    res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600`);
+    res.setHeader('Set-Cookie', `${COOKIE_NAME}=${encodeURIComponent(sid)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600${secureCookieSuffix(req)}`);
   } else {
     const session = sessions.get(sid);
     session.lastSeenAt = now();
@@ -454,6 +507,12 @@ function getSession(req, res) {
   return sessions.get(sid);
 }
 
+function secureCookieSuffix(req) {
+  const forwardedHttps = req.headers['x-forwarded-proto'] === 'https';
+  const tlsSocket = Boolean(req.socket && req.socket.encrypted);
+  return forwardedHttps || tlsSocket || process.env.ZOE_SECURE_COOKIES === '1' ? '; Secure' : '';
+}
+
 function securityHeaders(res) {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('Referrer-Policy', 'no-referrer');
@@ -461,7 +520,7 @@ function securityHeaders(res) {
   res.setHeader('Permissions-Policy', 'camera=(self), microphone=()');
   res.setHeader(
     'Content-Security-Policy',
-    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data: blob:; connect-src 'self' https://cdn.jsdelivr.net; media-src 'self' blob:; worker-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; media-src 'self' blob:; worker-src 'self' blob:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
   );
 }
 
@@ -575,11 +634,8 @@ function validateEvidence(challenge, body) {
     }
   }
 
-  const landmarkSamples = evidence.landmarkSamples;
-  if (landmarkSamples !== undefined) {
-    const geometryError = validateHandLandmarkGeometry(expectedGesture, landmarkSamples);
-    if (geometryError) return geometryError;
-  }
+  const geometryError = validateHandLandmarkGeometry(expectedGesture, evidence.landmarkSamples);
+  if (geometryError) return geometryError;
 
   challenge.evidenceDigests.add(digest);
   return null;
@@ -592,9 +648,9 @@ function createLivenessPlan() {
 const FLASH_COLORS = [
   [255, 64, 64],
   [64, 160, 255],
-  [72, 220, 120],
+  [60, 220, 60],
   [255, 190, 60],
-  [190, 110, 255],
+  [180, 60, 255],
   [60, 220, 220],
 ];
 
@@ -659,11 +715,6 @@ function validatePixelSeries(pixelSeries, flashPlan) {
       const f = decodePixelField(sample.f, FLASH_FACE_PIXEL_BYTES);
       if (!f) return 'Pixel sample face data is invalid.';
       entry.f = f;
-    }
-    if (sample.b !== undefined) {
-      const b = decodePixelField(sample.b, FLASH_BG_PIXEL_BYTES);
-      if (!b) return 'Pixel sample background data is invalid.';
-      entry.b = b;
     }
     samples.push(entry);
   }
@@ -808,8 +859,134 @@ function validatePulseSeries(pulseSeries, reducedMotion) {
   return { bpm: Math.round(peakIdx * binHz * 60) };
 }
 
-function computeLivenessSeriesDigest(challengeId, motionSeries) {
-  return crypto.createHash('sha256').update(`${challengeId}\n${JSON.stringify(motionSeries)}`).digest('hex');
+// The submitted pulse and pixel claims must agree with the camera frames'
+// actual pixels — recomputed here from the JPEGs, so fabrication has to
+// produce real changing pixel data, not just plausible numbers.
+const PULSE_FRAME_MIN_MATCH = 4;
+const PULSE_FRAME_CORR_MIN = 0.35;
+const PULSE_FRAME_SIGN_MIN = 0.66;
+
+function chromaOf({ r, g, b }) {
+  const s = r + g + b;
+  return s > 0 ? [r / s, g / s, b / s] : [1 / 3, 1 / 3, 1 / 3];
+}
+
+function detrended(xs) {
+  const n = xs.length;
+  const mean = xs.reduce((a, v) => a + v, 0) / n;
+  const xm = (n - 1) / 2;
+  let num = 0;
+  let den = 0;
+  for (let i = 0; i < n; i += 1) {
+    num += (i - xm) * (xs[i] - mean);
+    den += (i - xm) * (i - xm);
+  }
+  const slope = den > 0 ? num / den : 0;
+  return xs.map((v, i) => v - mean - slope * (i - xm));
+}
+
+// Recompute each frame's face-region green mean, interpolate the submitted
+// pulse at those timestamps, and require the two traces to move together.
+function validatePulseFrameBinding(pulseSeries, frameSignalsList) {
+  if (!Array.isArray(pulseSeries) || !pulseSeries.length) return 'Pulse series is invalid.';
+  const usable = frameSignalsList.filter((f) => f.signals);
+  if (usable.length < PULSE_FRAME_MIN_MATCH) return 'Camera frames did not cover the pulse window.';
+  const byT = pulseSeries.map((s) => s.t);
+  // Claims are noisy singletons at ~10Hz while a frame is an instantaneous
+  // mean; compare each frame against the local claim average (±140ms) so a
+  // single noisy sample can't decorrelate an honest trace.
+  const pulseAt = (t) => {
+    let sum = 0;
+    let count = 0;
+    for (let i = 0; i < byT.length; i += 1) {
+      if (byT[i] < t - 140) continue;
+      if (byT[i] > t + 140) break;
+      sum += pulseSeries[i].g;
+      count += 1;
+    }
+    if (count) return sum / count;
+    let lo = 0;
+    let hi = byT.length - 1;
+    if (t <= byT[0]) return pulseSeries[0].g;
+    if (t >= byT[hi]) return pulseSeries[hi].g;
+    while (hi - lo > 1) {
+      const mid = (lo + hi) >> 1;
+      if (byT[mid] <= t) lo = mid; else hi = mid;
+    }
+    const span = byT[hi] - byT[lo] || 1;
+    return pulseSeries[lo].g + ((pulseSeries[hi].g - pulseSeries[lo].g) * (t - byT[lo])) / span;
+  };
+  const span0 = byT[0];
+  const span1 = byT[byT.length - 1];
+  const inWindow = usable.filter((f) => f.t >= span0 - 200 && f.t <= span1 + 200);
+  if (inWindow.length < PULSE_FRAME_MIN_MATCH) return 'Camera frames did not cover the pulse window.';
+  const frameG = detrended(inWindow.map((f) => f.signals.g));
+  const claimedG = detrended(inWindow.map((f) => pulseAt(f.t)));
+  const n = frameG.length;
+  const dot = frameG.reduce((a, v, i) => a + v * claimedG[i], 0);
+  const magA = Math.sqrt(frameG.reduce((a, v) => a + v * v, 0));
+  const magB = Math.sqrt(claimedG.reduce((a, v) => a + v * v, 0));
+  const corr = magA > 1e-6 && magB > 1e-6 ? dot / (magA * magB) : 0;
+  let signs = 0;
+  let signN = 0;
+  for (let i = 1; i < n; i += 1) {
+    const dF = frameG[i] - frameG[i - 1];
+    const dC = claimedG[i] - claimedG[i - 1];
+    if (Math.abs(dF) < 1e-4 || Math.abs(dC) < 1e-4) continue;
+    signN += 1;
+    if (Math.sign(dF) === Math.sign(dC)) signs += 1;
+  }
+  const signAgree = signN >= 4 ? signs / signN : 0;
+  if (corr >= PULSE_FRAME_CORR_MIN || signAgree >= PULSE_FRAME_SIGN_MIN) return null;
+  return 'Pulse claim does not match the camera pixels.';
+}
+
+// Recompute chroma of each flash-tagged frame and require per-flash deltas to
+// track the issued plan — same cosine/ratio rule as validatePixelSeries, but
+// measured from the JPEGs rather than client-claimed rows.
+function validateFlashFrameBinding(flashFrames, flashPlan) {
+  const signalOf = (f) => faceSignals(f.image, f.face);
+  const baselineFrames = flashFrames.filter((d) => d.f === -1);
+  const baselineChroma = chromaOf(meanSignals(baselineFrames.map(signalOf)));
+  for (let i = 0; i < flashPlan.length; i += 1) {
+    const during = flashFrames.filter((d) => d.f === i);
+    const observed = chromaOf(meanSignals(during.map(signalOf)));
+    const expected = chromaOf({ r: flashPlan[i].c[0], g: flashPlan[i].c[1], b: flashPlan[i].c[2] });
+    const delta = observed.map((v, k) => v - baselineChroma[k]);
+    const expectedDelta = expected.map((v) => v - 1 / 3);
+    const deltaMag = Math.hypot(...delta);
+    const expectedMag = Math.hypot(...expectedDelta);
+    const cosine = deltaMag > 1e-6 && expectedMag > 1e-6
+      ? delta.reduce((sum, v, k) => sum + v * expectedDelta[k], 0) / (deltaMag * expectedMag)
+      : 0;
+    const ratio = deltaMag / expectedMag;
+    if (cosine < FLASH_CHROMA_COSINE_MIN || ratio < FLASH_CHROMA_RATIO_MIN || ratio > FLASH_CHROMA_RATIO_MAX) {
+      return 'Flash camera pixels did not reflect the issued sequence.';
+    }
+  }
+  return null;
+}
+
+function meanSignals(list) {
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  let n = 0;
+  for (const s of list) {
+    if (!s) continue;
+    r += s.r;
+    g += s.g;
+    b += s.b;
+    n += 1;
+  }
+  return n ? { r: r / n, g: g / n, b: b / n } : { r: 0, g: 0, b: 0 };
+}
+
+function computeLivenessSeriesDigest(challengeId, motionSeries, pulseSeries) {
+  return crypto
+    .createHash('sha256')
+    .update(`${challengeId}\n${JSON.stringify(motionSeries)}\n${JSON.stringify(pulseSeries || [])}`)
+    .digest('hex');
 }
 
 function validateMotionSeriesAgainstPlan(motionSeries, plan) {
@@ -874,14 +1051,32 @@ function thumbExtendedPacked(hand) {
   return sideExtent && tipNotFolded && ipAboveBase;
 }
 
-function handMatchesThree(hand) {
-  if (!Array.isArray(hand) || hand.length < HAND_EVIDENCE_LM_COUNT) return false;
-  const index = fingerExtendedPacked(hand, H.indexTip, H.indexPip);
-  const middle = fingerExtendedPacked(hand, H.middleTip, H.middlePip);
-  const ring = fingerExtendedPacked(hand, H.ringTip, H.ringPip);
-  const pinky = fingerExtendedPacked(hand, H.pinkyTip, H.pinkyPip);
-  const thumb = thumbExtendedPacked(hand);
-  return !thumb && index && middle && ring && !pinky;
+function handFingerState(hand) {
+  return {
+    thumb: thumbExtendedPacked(hand),
+    index: fingerExtendedPacked(hand, H.indexTip, H.indexPip),
+    middle: fingerExtendedPacked(hand, H.middleTip, H.middlePip),
+    ring: fingerExtendedPacked(hand, H.ringTip, H.ringPip),
+    pinky: fingerExtendedPacked(hand, H.pinkyTip, H.pinkyPip),
+  };
+}
+
+// Per-gesture finger-extension expectations; thumb is ignored where the pose
+// leaves it ambiguous. `ok` and `ily` have dedicated matchers below.
+const SINGLE_HAND_GESTURE_MATCHERS = {
+  wave: (f) => f.thumb && f.index && f.middle && f.ring && f.pinky,
+  fist: (f) => !f.thumb && !f.index && !f.middle && !f.ring && !f.pinky,
+  open_palm: (f) => f.thumb && f.index && f.middle && f.ring && f.pinky,
+  peace: (f) => f.index && f.middle && !f.ring && !f.pinky,
+  point: (f) => f.index && !f.middle && !f.ring && !f.pinky,
+  three: (f) => !f.thumb && f.index && f.middle && f.ring && !f.pinky,
+  rock: (f) => f.index && f.pinky && !f.middle && !f.ring,
+  call_me: (f) => f.thumb && f.pinky && !f.index && !f.middle && !f.ring,
+};
+
+function handMatchesOk(f, hand) {
+  const tipsTouch = dist3dLandmark(hand[H.thumbTip], hand[H.indexTip]) < 0.08;
+  return tipsTouch && f.middle && f.ring && f.pinky;
 }
 
 function handsMatchHeart(hands) {
@@ -963,19 +1158,22 @@ function validateMotionSeriesCoverage(motionSeries, plan) {
 }
 
 function validateHandLandmarkGeometry(gestureId, samples) {
-  if (!Array.isArray(samples)) return 'Landmark evidence is invalid.';
+  if (!Array.isArray(samples) || !samples.length) return 'Hand landmark evidence is required.';
   if (samples.length > MAX_LANDMARK_SAMPLES) return 'Landmark evidence is too large.';
-  if (!samples.length) return null;
 
   const relevant = samples.filter((sample) => sample && Array.isArray(sample.hands) && sample.hands.length);
-  if (!relevant.length) return null;
+  if (!relevant.length) return 'Hand landmark evidence is required.';
 
-  if (gestureId === 'three') {
-    const ok = relevant.some((sample) => sample.hands[0] && handMatchesThree(sample.hands[0]));
-    if (!ok) return 'Hand geometry does not match the requested gesture.';
-  }
   if (gestureId === 'ily') {
     const ok = relevant.some((sample) => handsMatchHeart(sample.hands));
+    if (!ok) return 'Hand geometry does not match the requested gesture.';
+    return null;
+  }
+  const matcher = gestureId === 'ok' ? handMatchesOk : SINGLE_HAND_GESTURE_MATCHERS[gestureId];
+  if (matcher) {
+    const ok = relevant.some((sample) => sample.hands.some((hand) => (
+      Array.isArray(hand) && hand.length >= HAND_EVIDENCE_LM_COUNT && matcher(handFingerState(hand), hand)
+    )));
     if (!ok) return 'Hand geometry does not match the requested gesture.';
   }
   return null;
@@ -1035,10 +1233,11 @@ function validateLivenessPhases(phases, plan, { legacy = false } = {}) {
 function issueVerificationToken(session, source, method = 'gesture', assurance = 'standard') {
   persistSession(session);
   const iat = now();
+  // The payload is RP-visible: no session id or challenge id — binding stays
+  // server-side via issuedTokens/issued_tokens, so a token can't link the
+  // live zoe_sid cookie or a stable credential/challenge across relying parties.
   const payload = {
     type: 'zoe.verification',
-    sid: session.id,
-    challengeId: source.id,
     action: 'demo.protected-action',
     method,
     assurance,
@@ -1047,14 +1246,15 @@ function issueVerificationToken(session, source, method = 'gesture', assurance =
     exp: iat + TOKEN_TTL_MS,
   };
   const token = signPayload(payload);
-  session.issuedTokens.set(crypto.createHash('sha256').update(token).digest('base64url'), payload);
+  const digest = crypto.createHash('sha256').update(token).digest('base64url');
+  session.issuedTokens.set(digest, payload);
+  persistIssuedToken(digest, session.id, payload);
   return token;
 }
 
 function consumeVerificationToken(session, token, allowed) {
   const payload = verifySignedPayload(token);
   if (!payload || payload.type !== 'zoe.verification') return { error: 'Invalid verification token.' };
-  if (payload.sid !== session.id) return { error: 'Token is not bound to this session.', status: 403 };
   if (payload.action !== 'demo.protected-action') return { error: 'Token is not valid for this action.', status: 403 };
   if (now() > payload.exp) return { error: 'Verification token expired.' };
 
@@ -1065,11 +1265,19 @@ function consumeVerificationToken(session, token, allowed) {
 
   const digest = crypto.createHash('sha256').update(token).digest('base64url');
   if (usedTokenDigests.has(digest)) return { error: 'Verification token was already used.', status: 409 };
-  if (!session.issuedTokens.has(digest)) return { error: 'Token was not issued to this session.', status: 403 };
+  // Session binding is server-side: the digest must have been issued to this
+  // session (in-memory fast path, durable table after a restart).
+  const issued = session.issuedTokens.has(digest)
+    ? { sessionId: session.id }
+    : getIssuedToken(digest);
+  if (!issued || issued.sessionId !== session.id) {
+    return { error: 'Token is not bound to this session.', status: 403 };
+  }
 
   usedTokenDigests.add(digest);
   persistUsedToken(digest);
   session.issuedTokens.delete(digest);
+  deleteIssuedToken(digest);
   return { payload };
 }
 
@@ -1077,6 +1285,17 @@ function decodeCredentialPart(value) {
   if (typeof value !== 'string') return null;
   try {
     return Buffer.from(value, 'base64url');
+  } catch {
+    return null;
+  }
+}
+
+function presentedClientChallenge(value) {
+  const bytes = decodeCredentialPart(value);
+  if (!bytes) return null;
+  try {
+    const challenge = JSON.parse(bytes.toString('utf8')).challenge;
+    return typeof challenge === 'string' && challenge ? challenge : null;
   } catch {
     return null;
   }
@@ -1308,6 +1527,36 @@ function certChainsToRoot(x5cDers) {
   }
 }
 
+const APPLE_NONCE_EXTENSION_DER = Buffer.from('06092a864886f763640802', 'hex');
+
+// Apple anonymous attestation carries no signature: trust comes from the
+// credCert chaining to a FIDO root, the leaf certifying THIS credential key,
+// and the Apple nonce extension (sha256(authData||clientDataHash)) binding the
+// cert to this exact attestation. Without all three a harvested real Apple
+// chain could be stapled onto an attacker-generated credential key.
+function appleAttestationBacked(x5cDers, credential, signedData) {
+  if (!x5cDers.length) return false;
+  let leaf;
+  try {
+    leaf = new crypto.X509Certificate(x5cDers[0]);
+  } catch {
+    return false;
+  }
+  let leafSpki;
+  try {
+    leafSpki = leaf.publicKey.export({ format: 'der', type: 'spki' });
+  } catch {
+    return false;
+  }
+  if (!leafSpki.equals(Buffer.from(credential.publicKey, 'base64url'))) return false;
+  const nonce = crypto.createHash('sha256').update(signedData).digest();
+  const raw = leaf.raw;
+  const oidIndex = raw.indexOf(APPLE_NONCE_EXTENSION_DER);
+  if (oidIndex === -1) return false;
+  const nonceMarker = Buffer.concat([Buffer.from([0x04, 0x20]), nonce]);
+  return raw.indexOf(nonceMarker, oidIndex) !== -1 && certChainsToRoot(x5cDers);
+}
+
 function verifyAttestationSignature(alg, signedData, publicKeySource, signature) {
   const key = typeof publicKeySource === 'string'
     ? crypto.createPublicKey({ key: Buffer.from(publicKeySource, 'base64url'), format: 'der', type: 'spki' })
@@ -1393,7 +1642,20 @@ function verifyAttestation(attestationObjectB64, clientDataJSONBytes, origin, ex
     }
   } else if (fmt === 'apple') {
     const x5c = Array.isArray(attStmt && attStmt.x5c) ? attStmt.x5c : [];
-    hardwareBacked = x5c.length > 0 && certChainsToRoot(x5c);
+    const sig = attStmt && attStmt.sig;
+    if (!Buffer.isBuffer(sig)) {
+      return { error: 'Passkey attestation signature did not verify.' };
+    }
+    let leaf;
+    try {
+      leaf = new crypto.X509Certificate(x5c[0]);
+    } catch {
+      return { error: 'Passkey attestation certificate is malformed.' };
+    }
+    if (!verifyAttestationSignature(attStmt && attStmt.alg, signedData, leaf.publicKey, sig)) {
+      return { error: 'Passkey attestation signature did not verify.' };
+    }
+    hardwareBacked = appleAttestationBacked(x5c, credential, signedData);
   } else if (fmt !== 'none') {
     return { error: 'Passkey attestation format is not supported.' };
   }
@@ -1409,11 +1671,25 @@ function verifyAttestation(attestationObjectB64, clientDataJSONBytes, origin, ex
 
 async function handleApi(req, res, pathname, services = {}) {
   sweepExpiredState();
-  const session = getSession(req, res);
-  if (!enforcePostSecurity(req, res, pathname, session)) return;
+  // Sessions mint lazily: endpoints that need session state call session(),
+  // while non-session endpoints (e.g. /api/verify) never mint a cookie.
+  let requestSession = null;
+  const session = () => {
+    if (!requestSession) requestSession = getSession(req, res);
+    return requestSession;
+  };
+  // Rate limiting uses the already-established session id when the cookie maps
+  // to a live session; otherwise it falls back to per-IP limiting — it must
+  // never mint a session of its own.
+  const rateLimitSessionId = () => {
+    const sid = parseCookies(req.headers.cookie).get(COOKIE_NAME);
+    const existing = sid ? sessions.get(sid) : null;
+    return existing ? existing.id : null;
+  };
+  if (!enforcePostSecurity(req, res, pathname, rateLimitSessionId())) return;
 
   if (req.method === 'POST' && pathname === '/api/challenge') {
-    const challenge = createChallenge(session);
+    const challenge = createChallenge(session());
     return sendJson(res, 201, {
       challengeId: challenge.id,
       totalSteps: challenge.steps.length,
@@ -1431,7 +1707,7 @@ async function handleApi(req, res, pathname, services = {}) {
     }
 
     const challenge = challenges.get(body.challengeId);
-    if (!challenge || challenge.sessionId !== session.id) return sendJson(res, 404, { error: 'Unknown challenge.' });
+    if (!challenge || challenge.sessionId !== session().id) return sendJson(res, 404, { error: 'Unknown challenge.' });
     if (challenge.consumedAt) return sendJson(res, 409, { error: 'Challenge was already consumed.' });
     if (now() > challenge.expiresAt) return sendJson(res, 410, { error: 'Challenge expired.' });
 
@@ -1450,7 +1726,7 @@ async function handleApi(req, res, pathname, services = {}) {
       challenge.consumedAt = now();
       return sendJson(res, 200, {
         verified: true,
-        verificationToken: issueVerificationToken(session, challenge, 'gesture', 'standard'),
+        verificationToken: issueVerificationToken(session(), challenge, 'gesture', 'standard'),
         tokenExpiresAt: now() + TOKEN_TTL_MS,
       });
     }
@@ -1473,7 +1749,7 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const gate = consumeVerificationToken(session, body.registrationVerificationToken, {
+    const gate = consumeVerificationToken(session(), body.registrationVerificationToken, {
       methods: ['gesture', 'face-motion'],
       assurances: ['standard'],
     });
@@ -1483,14 +1759,14 @@ async function handleApi(req, res, pathname, services = {}) {
     }
 
     const challenge = randomId(32);
-    session.passkeyRegisterChallenge = { challenge, createdAt: now(), verifiedBy: gate.payload.method };
-    persistSession(session);
+    session().passkeyRegisterChallenges.set(challenge, { createdAt: now(), verifiedBy: gate.payload.method });
+    persistSession(session());
     return sendJson(res, 200, {
       challenge,
       rp: { name: APP_NAME },
       user: {
-        id: session.id,
-        name: `zoe-${session.id.slice(0, 8)}`,
+        id: session().id,
+        name: `zoe-${session().id.slice(0, 8)}`,
         displayName: 'Zoe user',
       },
       pubKeyCredParams: [
@@ -1503,7 +1779,7 @@ async function handleApi(req, res, pathname, services = {}) {
         residentKey: 'preferred',
         userVerification: 'preferred',
       },
-      excludeCredentials: Array.from(session.credentials.keys()).map((id) => ({ type: 'public-key', id })),
+      excludeCredentials: Array.from(session().credentials.keys()).map((id) => ({ type: 'public-key', id })),
     });
   }
 
@@ -1511,8 +1787,8 @@ async function handleApi(req, res, pathname, services = {}) {
     // Demo-only escape hatch for local testing. Registration no longer calls this:
     // users must verify before adding a new Zoe ID passkey, and existing passkeys
     // are preserved instead of being silently cleared.
-    session.passkeyRegisterChallenge = null;
-    session.passkeyAuthChallenge = null;
+    session().passkeyRegisterChallenges.clear();
+    session().passkeyAuthChallenges.clear();
     return sendJson(res, 200, { ok: true });
   }
 
@@ -1524,9 +1800,14 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const pending = session.passkeyRegisterChallenge;
-    if (!pending || now() - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) return sendJson(res, 410, { error: 'Passkey registration expired.' });
-    const client = parseClientData(body.clientDataJSON, 'webauthn.create', pending.challenge);
+    const registerChallenge = presentedClientChallenge(body.clientDataJSON);
+    const pending = registerChallenge ? session().passkeyRegisterChallenges.get(registerChallenge) : null;
+    if (!pending) return sendJson(res, 410, { error: 'Passkey registration expired.' });
+    if (now() - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) {
+      session().passkeyRegisterChallenges.delete(registerChallenge);
+      return sendJson(res, 410, { error: 'Passkey registration expired.' });
+    }
+    const client = parseClientData(body.clientDataJSON, 'webauthn.create', registerChallenge);
     if (!client) return sendJson(res, 400, { error: 'Passkey registration challenge did not verify.' });
 
     const rawId = typeof body.rawId === 'string' ? body.rawId : null;
@@ -1545,7 +1826,7 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: 'Browser did not provide a usable passkey public key.' });
     }
 
-    session.credentials.set(rawId, {
+    session().credentials.set(rawId, {
       id: rawId,
       publicKey,
       alg,
@@ -1553,22 +1834,22 @@ async function handleApi(req, res, pathname, services = {}) {
       createdAt: now(),
       hardwareBacked,
     });
-    persistSession(session);
-    persistCredential(session.id, session.credentials.get(rawId));
-    session.passkeyRegisterChallenge = null;
+    persistSession(session());
+    persistCredential(session().id, session().credentials.get(rawId));
+    session().passkeyRegisterChallenges.delete(registerChallenge);
     return sendJson(res, 201, { ok: true, credentialId: rawId });
   }
 
   if (req.method === 'POST' && pathname === '/api/passkey/auth/options') {
-    if (!session.credentials.size) return sendJson(res, 409, { error: 'No passkey is registered in this session yet.' });
+    if (!session().credentials.size) return sendJson(res, 409, { error: 'No passkey is registered in this session() yet.' });
     const challenge = randomId(32);
-    session.passkeyAuthChallenge = { challenge, createdAt: now() };
-    persistSession(session);
+    session().passkeyAuthChallenges.set(challenge, { createdAt: now() });
+    persistSession(session());
     return sendJson(res, 200, {
       challenge,
       timeout: 60000,
       userVerification: 'preferred',
-      allowCredentials: Array.from(session.credentials.keys()).map((id) => ({ type: 'public-key', id })),
+      allowCredentials: Array.from(session().credentials.keys()).map((id) => ({ type: 'public-key', id })),
     });
   }
 
@@ -1580,12 +1861,17 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const pending = session.passkeyAuthChallenge;
-    if (!pending || now() - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) return sendJson(res, 410, { error: 'Passkey challenge expired.' });
-    const credential = session.credentials.get(body.rawId);
+    const authChallenge = presentedClientChallenge(body.clientDataJSON);
+    const pending = authChallenge ? session().passkeyAuthChallenges.get(authChallenge) : null;
+    if (!pending) return sendJson(res, 410, { error: 'Passkey challenge expired.' });
+    if (now() - pending.createdAt > PASSKEY_CHALLENGE_TTL_MS) {
+      session().passkeyAuthChallenges.delete(authChallenge);
+      return sendJson(res, 410, { error: 'Passkey challenge expired.' });
+    }
+    const credential = session().credentials.get(body.rawId);
     if (!credential) return sendJson(res, 404, { error: 'Unknown passkey credential.' });
 
-    const client = parseClientData(body.clientDataJSON, 'webauthn.get', pending.challenge);
+    const client = parseClientData(body.clientDataJSON, 'webauthn.get', authChallenge);
     const authenticatorData = decodeCredentialPart(body.authenticatorData);
     const signature = decodeCredentialPart(body.signature);
     if (!client || !authenticatorData || !signature) return sendJson(res, 400, { error: 'Passkey response was incomplete.' });
@@ -1603,13 +1889,13 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 401, { error: 'Passkey replay was detected.' });
     }
     credential.signCount = signCount || credential.signCount;
-    persistCredential(session.id, credential);
-    session.passkeyAuthChallenge = null;
+    persistCredential(session().id, credential);
+    session().passkeyAuthChallenges.delete(authChallenge);
     // 'strong' requires a real authenticator: verified hardware attestation at
     // registration AND user verification on this assertion. Software keys and
     // fmt:'none' credentials cap at 'standard'.
     const assurance = credential.hardwareBacked && authData.userVerified ? 'strong' : 'standard';
-    const token = issueVerificationToken(session, { id: `passkey:${credential.id}` }, 'passkey', assurance);
+    const token = issueVerificationToken(session(), { id: `passkey:${credential.id}` }, 'passkey', assurance);
     return sendJson(res, 200, { verified: true, verificationToken: token, tokenExpiresAt: now() + TOKEN_TTL_MS });
   }
 
@@ -1624,7 +1910,7 @@ async function handleApi(req, res, pathname, services = {}) {
     const challengeId = randomId();
     const plan = createLivenessPlan();
     const flashPlan = challengeBody.reducedMotion === true ? null : createFlashPlan();
-    session.livenessChallenge = {
+    session().livenessChallenge = {
       id: challengeId,
       plan,
       flashPlan,
@@ -1634,12 +1920,12 @@ async function handleApi(req, res, pathname, services = {}) {
       consumedAt: null,
       seriesDigests: new Set(),
     };
-    persistSession(session);
+    persistSession(session());
     return sendJson(res, 201, {
       challengeId,
       plan,
       flashPlan,
-      expiresAt: session.livenessChallenge.expiresAt,
+      expiresAt: session().livenessChallenge.expiresAt,
     });
   }
 
@@ -1651,11 +1937,11 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const pending = session.livenessChallenge;
+    const pending = session().livenessChallenge;
     if (!pending || body.challengeId !== pending.id) {
       return sendJson(res, 400, { error: 'Face liveness challenge is missing or invalid.' });
     }
-    if (pending.consumedAt) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
+    if (pending.consumedAt || pending.verifying) return sendJson(res, 409, { error: 'Face liveness challenge was already used.' });
     if (now() > pending.expiresAt) return sendJson(res, 410, { error: 'Face liveness challenge expired.' });
 
     const minElapsedMs = pending.reducedMotion === true ? Math.max(livenessMinElapsedMs(), reducedMotionMinElapsedMs()) : livenessMinElapsedMs();
@@ -1684,9 +1970,10 @@ async function handleApi(req, res, pathname, services = {}) {
     if (seriesPlanError) return sendJson(res, 400, { error: seriesPlanError });
     const coverageError = validateMotionSeriesCoverage(motionSeries, pending.plan);
     if (coverageError) return sendJson(res, 400, { error: coverageError });
-    const expectedDigest = computeLivenessSeriesDigest(pending.id, motionSeries);
+    const pulseSeriesBody = body.pulseSeries;
+    const expectedDigest = computeLivenessSeriesDigest(pending.id, motionSeries, pulseSeriesBody);
     if (expectedDigest !== seriesDigest) {
-      return sendJson(res, 400, { error: 'Face motion digest does not match the submitted series.' });
+      return sendJson(res, 400, { error: 'Face evidence digest does not match the submitted series.' });
     }
 
     const derivedPhases = deriveLivenessPhasesFromMotionSeries(motionSeries, pending.plan);
@@ -1708,12 +1995,21 @@ async function handleApi(req, res, pathname, services = {}) {
     if (pending.presentationDigest) {
       presentationResult = pending.presentationResult;
     } else {
+      pending.mediaAttempts = (pending.mediaAttempts || 0) + 1;
+      if (pending.mediaAttempts > 3) {
+        pending.consumedAt = now();
+        session().livenessChallenge = null;
+        return sendJson(res, 429, { error: 'Too many camera media attempts on this challenge.' });
+      }
       try {
         const analyzer = services.analyzePresentationFrames || analyzePresentationFrames;
+        pending.verifying = true;
         presentationResult = await analyzer(mediaValidation.frames);
       } catch (err) {
         console.error('Face presentation analysis failed:', err.message);
         return sendJson(res, 503, { error: 'Face presentation analysis is temporarily unavailable.' });
+      } finally {
+        pending.verifying = false;
       }
     }
     if (!presentationResult || presentationResult.real !== true) {
@@ -1723,7 +2019,14 @@ async function handleApi(req, res, pathname, services = {}) {
     pending.presentationDigest = body.mediaDigest;
     pending.presentationResult = presentationResult;
 
-    const pulseResult = validatePulseSeries(body.pulseSeries, pending.reducedMotion);
+    // The claimed pulse must agree with the frames' own pixels — recomputed
+    // green means over the face region, interpolated against the submitted
+    // series. Fabricated series can't match real (or static) camera data.
+    const pulseFrameSignals = mediaValidation.frames.map((f) => ({ t: f.t, signals: faceSignals(f.image, f.face) }));
+    const pulseBindingError = validatePulseFrameBinding(body.pulseSeries, pulseFrameSignals);
+    const pulseResult = pulseBindingError
+      ? { error: pulseBindingError }
+      : validatePulseSeries(body.pulseSeries, pending.reducedMotion);
     if (pulseResult.error) {
       logVerificationFailure('liveness_pulse_rejected', pathname);
       if (!pending.flashPlan) {
@@ -1744,6 +2047,16 @@ async function handleApi(req, res, pathname, services = {}) {
         logVerificationFailure('liveness_pixels_rejected', pathname);
         return sendJson(res, 400, { error: pixelError });
       }
+      const flashFramesValidation = validateFlashFrames(pending.id, body.flashFrames, body.flashDigest, pending.flashPlan);
+      if (flashFramesValidation.error) {
+        logVerificationFailure('liveness_flash_frames_rejected', pathname);
+        return sendJson(res, 400, { error: flashFramesValidation.error });
+      }
+      const flashBindingError = validateFlashFrameBinding(flashFramesValidation.frames, pending.flashPlan);
+      if (flashBindingError) {
+        logVerificationFailure('liveness_flash_frames_rejected', pathname);
+        return sendJson(res, 400, { error: flashBindingError });
+      }
     }
 
     if (pending.seriesDigests.has(seriesDigest)) {
@@ -1751,9 +2064,9 @@ async function handleApi(req, res, pathname, services = {}) {
     }
     pending.seriesDigests.add(seriesDigest);
     pending.consumedAt = now();
-    session.livenessChallenge = null;
+    session().livenessChallenge = null;
 
-    const token = issueVerificationToken(session, { id: `face:${pending.id}` }, 'face-motion', 'standard');
+    const token = issueVerificationToken(session(), { id: `face:${pending.id}` }, 'face-motion', 'standard');
     return sendJson(res, 200, {
       verified: true,
       verificationToken: token,
@@ -1780,8 +2093,14 @@ async function handleApi(req, res, pathname, services = {}) {
 
     usedTokenDigests.add(digest);
     persistUsedToken(digest);
-    const issuingSession = sessions.get(payload.sid);
-    if (issuingSession) issuingSession.issuedTokens.delete(digest);
+    // The payload no longer carries the session id: resolve the issuer through
+    // the persisted issued-token digest so the pending entry is released too.
+    const issued = getIssuedToken(digest);
+    if (issued) {
+      const issuingSession = sessions.get(issued.sessionId);
+      if (issuingSession) issuingSession.issuedTokens.delete(digest);
+      deleteIssuedToken(digest);
+    }
 
     return sendJson(res, 200, {
       valid: true,
@@ -1800,7 +2119,7 @@ async function handleApi(req, res, pathname, services = {}) {
       return sendJson(res, 400, { error: err.message });
     }
 
-    const gate = consumeVerificationToken(session, body.verificationToken);
+    const gate = consumeVerificationToken(session(), body.verificationToken);
     if (gate.error) {
       logVerificationFailure('protected_action_gate', pathname);
       return sendJson(res, gate.status || 401, { error: gate.error });
@@ -1815,25 +2134,50 @@ function contentType(filePath) {
   const ext = path.extname(filePath);
   if (ext === '.html') return 'text/html; charset=utf-8';
   if (ext === '.css') return 'text/css; charset=utf-8';
-  if (ext === '.js') return 'application/javascript; charset=utf-8';
+  if (ext === '.js' || ext === '.mjs') return 'application/javascript; charset=utf-8';
   if (ext === '.json') return 'application/json; charset=utf-8';
+  if (ext === '.wasm') return 'application/wasm';
   if (ext === '.tflite' || ext === '.task') return 'application/octet-stream';
   if (ext === '.png') return 'image/png';
   return 'application/octet-stream';
 }
 
+const STATIC_FILES = new Set([
+  '/index.html', '/styles.css', '/app.js', '/face_calib.js',
+  '/models/blaze_face_short_range.tflite',
+]);
+const DEBUG_FILES = new Set(['/debug.html', '/debug.css', '/debug.js', '/debug_metrics.js']);
+const VENDOR_FILES = new Set([
+  '/vendor/mediapipe/hands/hands.js',
+  '/vendor/mediapipe/hands/hands.binarypb',
+  '/vendor/mediapipe/hands/hands_solution_packed_assets_loader.js',
+  '/vendor/mediapipe/hands/hands_solution_packed_assets.data',
+  '/vendor/mediapipe/hands/hands_solution_simd_wasm_bin.js',
+  '/vendor/mediapipe/hands/hands_solution_simd_wasm_bin.wasm',
+  '/vendor/mediapipe/hands/hands_solution_wasm_bin.js',
+  '/vendor/mediapipe/hands/hands_solution_wasm_bin.wasm',
+  '/vendor/mediapipe/hands/hand_landmark_full.tflite',
+  '/vendor/mediapipe/hands/hand_landmark_lite.tflite',
+  '/vendor/mediapipe/camera_utils/camera_utils.js',
+  '/vendor/mediapipe/drawing_utils/drawing_utils.js',
+  '/vendor/mediapipe/tasks-vision/vision_bundle.mjs',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_internal.js',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_internal.wasm',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_nosimd_internal.js',
+  '/vendor/mediapipe/tasks-vision/wasm/vision_wasm_nosimd_internal.wasm',
+]);
+
 function serveStatic(req, res, pathname) {
   const requested = pathname === '/' ? '/index.html' : pathname;
-  if (
-    process.env.ZOE_DEBUG !== '1'
-    && ['/debug.html', '/debug.css', '/debug.js', '/debug_metrics.js'].includes(requested)
-  ) {
+  const debugAllowed = DEBUG_FILES.has(requested) && process.env.ZOE_DEBUG === '1';
+  if (!STATIC_FILES.has(requested) && !VENDOR_FILES.has(requested) && !debugAllowed) {
     securityHeaders(res);
     res.writeHead(404);
     return res.end('Not found');
   }
   const filePath = path.resolve(__dirname, `.${requested}`);
-  if (!filePath.startsWith(__dirname) || !['.html', '.css', '.js', '.tflite', '.task', '.png'].includes(path.extname(filePath))) {
+  const rel = path.relative(__dirname, filePath);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
     securityHeaders(res);
     res.writeHead(404);
     return res.end('Not found');
@@ -1875,6 +2219,7 @@ if (require.main === module) {
 
 module.exports = {
   createServer,
+  sessions,
   checkRateLimit,
   resetRateLimitState,
   validateStateChangingOrigin,
@@ -1890,4 +2235,6 @@ module.exports = {
   validatePixelSeries,
   computePresentationDigest,
   validatePresentationFrames,
+  computeFlashDigest,
+  validateFlashFrames,
 };

@@ -83,7 +83,6 @@ const mobileIdBtn = $('mobile-id-btn');
 const cameraHelpEl = $('camera-help');
 const cameraHelpTextEl = $('camera-help-text');
 const bootLoaderEl = $('boot-loader');
-const checkEls = Array.from(document.querySelectorAll('.check'));
 
 const LM = {
   thumbTip: 4, thumbIp: 3, thumbMcp: 2, thumbCmc: 1,
@@ -218,7 +217,7 @@ function detectWave(lm) {
 
 async function initMediaPipe() {
   handsModel = new Hands({
-    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/${file}`,
+    locateFile: (file) => `/vendor/mediapipe/hands/${file}`,
   });
   handsModel.setOptions({
     maxNumHands: 2,
@@ -230,10 +229,10 @@ async function initMediaPipe() {
 }
 
 // MediaPipe Tasks Vision: cross-browser face detection that runs under a strict
-// CSP (only needs 'wasm-unsafe-eval'). The WASM runtime loads from the CDN; the
-// model is vendored locally so no extra connect-src origin is required.
-const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
-const TASKS_VISION_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
+// CSP (only needs 'wasm-unsafe-eval'). The runtime and WASM files are vendored
+// locally, and so is the model, so no extra connect-src origin is required.
+const TASKS_VISION_URL = '/vendor/mediapipe/tasks-vision/vision_bundle.mjs';
+const TASKS_VISION_WASM = '/vendor/mediapipe/tasks-vision/wasm';
 const FACE_DETECTOR_MODEL_URL = '/models/blaze_face_short_range.tflite';
 
 // Use the dedicated FaceDetector as the acceptance gate because it exposes a
@@ -284,13 +283,28 @@ async function startCamera() {
   canvasEl.height = videoEl.videoHeight || 480;
 }
 
+// Hung requests must not deadlock the UI: every call gets a hard timeout so
+// callers' error handling always runs and resets submitting/checking state.
+const API_TIMEOUT_MS = 15000;
 async function apiJson(path, body) {
-  const response = await fetch(path, {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body || {}),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+  let response;
+  try {
+    response = await fetch(path, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body || {}),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    throw new Error(err.name === 'AbortError'
+      ? 'The server did not respond in time. Check your connection and try again.'
+      : 'Could not reach the server. Check your connection and try again.');
+  } finally {
+    clearTimeout(timeout);
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(data.error || `Request failed (${response.status}).`);
@@ -466,12 +480,6 @@ function showSuccessPanel() {
   }, prefersReducedMotion() ? 0 : 850);
 }
 
-function showIntroPanel() {
-  zoeIdReturnTarget = 'choice';
-  zoeVerifyBtn.disabled = false;
-  transitionToPanel(zoeIntroEl, null, zoeVerifyBtn, 'back');
-}
-
 function continueFromIntro() {
   if (isMobileLayout()) {
     selectPrimaryMethod('face');
@@ -504,24 +512,6 @@ function showPrompt(step) {
   promptHintEl.textContent = step.hint;
 }
 
-function updateChecklistUI() {
-  checkEls.forEach((el, i) => {
-    el.classList.remove('active', 'done');
-    el.hidden = selectedPrimaryMethod === 'face' || i >= totalSteps;
-    if (selectedPrimaryMethod === 'face') return;
-    const label = el.querySelector('.label');
-    if (i < completedSteps) {
-      el.classList.add('done');
-      label.textContent = 'Verified';
-    } else if (currentStep && i === currentStep.index) {
-      el.classList.add('active');
-      label.textContent = currentStep.name;
-    } else {
-      label.textContent = 'Locked';
-    }
-  });
-}
-
 function selectPrimaryMethod(method) {
   selectedPrimaryMethod = method;
   const isFace = method === 'face';
@@ -537,7 +527,6 @@ function selectPrimaryMethod(method) {
     ? 'Keep your face in frame. Zoe checks motion, not identity.'
     : '';
   progressEl.style.width = '0%';
-  updateChecklistUI();
   setStatus('Idle', 'idle');
 }
 
@@ -698,8 +687,8 @@ async function digestString(value) {
   return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function livenessSeriesDigest(challengeId, motionSeries) {
-  return digestString(`${challengeId}\n${JSON.stringify(motionSeries)}`);
+async function livenessSeriesDigest(challengeId, motionSeries, pulseSeries) {
+  return digestString(`${challengeId}\n${JSON.stringify(motionSeries)}\n${JSON.stringify(pulseSeries || [])}`);
 }
 
 async function presentationFramesDigest(challengeId, mediaFrames) {
@@ -747,15 +736,19 @@ async function submitCurrentStep() {
     if (handMotionLooksSynthetic(evidence.motionStats)) {
       throw new Error('Hand motion looked too static. Relax your wrist and try the gesture again.');
     }
+    const challengeAtSend = currentChallengeId;
+    const stepAtSend = currentStep;
     const result = await apiJson('/api/step', {
       challengeId: currentChallengeId,
       stepIndex: currentStep.index,
       gestureId: currentStep.id,
       evidence,
     });
+    // A stale response must not overwrite a newer challenge/step the user
+    // already moved on to.
+    if (currentChallengeId !== challengeAtSend || currentStep !== stepAtSend) return;
 
     completedSteps++;
-    updateChecklistUI();
 
     if (result.verified) {
       verificationToken = result.verificationToken;
@@ -767,10 +760,15 @@ async function submitCurrentStep() {
     lastAcceptedHandShape = acceptedHandShape;
     awaitingHandPoseChange = Boolean(lastAcceptedHandShape);
     cooldownUntil = performance.now() + COOLDOWN_MS;
+    // Bind the step this cooldown belongs to: if a newer flow superseded it
+    // before the timer fires, it must not wipe the new step's evidence.
+    const scheduledStep = currentStep;
+    const scheduledCooldown = cooldownUntil;
     setTimeout(() => {
-      showPrompt(currentStep);
+      if (currentStep !== scheduledStep || cooldownUntil !== scheduledCooldown) return;
+      cooldownUntil = 0;
+      showPrompt(scheduledStep);
       resetStepEvidence();
-      updateChecklistUI();
       setStatus('Listening...', 'listening');
       submittingStep = false;
     }, COOLDOWN_MS);
@@ -823,7 +821,6 @@ async function startVerification() {
 
   resetStepEvidence();
   hideCameraHelp();
-  updateChecklistUI();
   showPrompt(currentStep);
   setStatus('Listening...', 'listening');
   setStartButton('Verification in progress', true);
@@ -1232,9 +1229,6 @@ const FACE_MAX_ASPECT = 1.7;
 // tight: a real face should be in the oval, not down on the shoulder line.
 const FACE_OVAL_SCALE_X = 1.25;
 const FACE_OVAL_SCALE_Y = 0.95;
-const FACE_BOX_SHIFT_X = -0.75;
-const FACE_BOX_SHIFT_Y = -0.55;
-const FACE_BOX_HEIGHT_SCALE = 1.02;
 // Face-box acceptance offsets are expressed as detected-box multipliers, not
 // fixed pixels or fixed frame percentages, so they scale with camera distance.
 const FACE_CENTER_GATE_X = 0.75;
@@ -1279,47 +1273,8 @@ function detectionBox(detection, vw, vh) {
   return { x, y, w, h };
 }
 
-function fitBoxToKeypoints(box, keypoints, vw, vh) {
-  const points = (keypoints || [])
-    .map((point) => pointToPixel(point, vw, vh))
-    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
-  if (points.length < 3) return box;
-
-  const xs = points.map((point) => point.x);
-  const ys = points.map((point) => point.y);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
-  const w = Math.min(vw, Math.max(box.w, maxX - minX + box.w * 0.16));
-  const h = Math.min(vh, Math.max(box.h, maxY - minY + box.h * 0.16));
-  const x = Math.min(Math.max(0, (minX + maxX - w) / 2), Math.max(0, vw - w));
-  const y = Math.min(Math.max(0, (minY + maxY - h) / 2), Math.max(0, vh - h));
-  return { ...box, x, y, w, h };
-}
-
-function calibratedFaceBox(box, vw, vh, keypoints) {
-  // In this camera/model setup Blaze's raw box tracks the face pattern but is
-  // consistently displaced down/right on the displayed frame. Keep all detector
-  // calibration centralized here so drawing and motion checks share one box.
-  const w = box.w;
-  const h = box.h * FACE_BOX_HEIGHT_SCALE;
-  const x = box.x + box.w * FACE_BOX_SHIFT_X;
-  const y = box.y + box.h * FACE_BOX_SHIFT_Y;
-  return fitBoxToKeypoints({
-    x: Math.min(Math.max(0, x), Math.max(0, vw - w)),
-    y: Math.min(Math.max(0, y), Math.max(0, vh - h)),
-    w,
-    h,
-  }, keypoints, vw, vh);
-}
-
-function pointToPixel(point, vw, vh) {
-  return {
-    x: point.x <= 1 ? point.x * vw : point.x,
-    y: point.y <= 1 ? point.y * vh : point.y,
-  };
-}
+// Face-box calibration (fitBoxToKeypoints, calibratedFaceBox, pointToPixel,
+// pulseRoi) is shared with the camera lab via face_calib.js globals.
 
 function poseFromKeypoints(keypoints, vw, vh) {
   if (!keypoints || keypoints.length < 3) return null;
@@ -1382,16 +1337,17 @@ async function detectFaceFrame(engine) {
     candidates = detections
       .map((detection) => {
         const rawBox = detectionBox(detection, vw, vh);
-        const box = calibratedFaceBox(rawBox, vw, vh, detection.keypoints);
+        const box = calibratedFaceBox(rawBox, detection.keypoints, vw, vh);
         const pose = poseFromKeypoints(detection.keypoints, vw, vh);
+        if (detectorBoxDisplaced(rawBox, detection.keypoints, vw, vh)) return null;
         return {
           ...box,
           score: detectionScore(detection),
           detection,
-          rawBox,
           pose,
         };
-      });
+      })
+      .filter(Boolean);
   } else {
     const faces = await legacyFaceDetector.detect(videoEl).catch(() => []);
     candidates = faces.map((f) => ({
@@ -1516,27 +1472,13 @@ function drawFaceGuide(box, opts = {}) {
   if (opts.arrow === 'left' || opts.arrow === 'right') drawGuideArrow(opts.arrow, color);
 }
 
-function quantizedFaceShapeExtras(keypoints) {
-  if (!keypoints || keypoints.length < 6) return {};
-  const mouth = keypoints[3];
-  const earA = keypoints[4];
-  const earB = keypoints[5];
-  const nose = keypoints[2];
-  if (!mouth || !earA || !earB || !nose) return {};
-  const mouthW = Math.hypot(mouth.x - nose.x, mouth.y - nose.y);
-  const earSpan = Math.hypot(earA.x - earB.x, earA.y - earB.y);
-  return { m: quantize(mouthW), e: quantize(earSpan) };
-}
-
-function pushFaceSeriesSample(phaseSeries, phase, flowStartedAt, motionValue, keypoints) {
+function pushFaceSeriesSample(phaseSeries, phase, flowStartedAt, motionValue) {
   if (phaseSeries.length >= 120) return;
-  const sample = {
+  phaseSeries.push({
     phase,
     t: Math.round(performance.now() - flowStartedAt),
     v: quantize(motionValue),
-  };
-  Object.assign(sample, quantizedFaceShapeExtras(keypoints));
-  phaseSeries.push(sample);
+  });
 }
 
 function faceMotionPhaseConfig(phaseId, requirePoseLiveness) {
@@ -1597,7 +1539,7 @@ async function runFaceMotionPhase(engine, centers, sizes, yaws, poses, phaseSeri
         }
         if (opts.phase && phaseSeries.length < 120) {
           const motionValue = opts.motionValue(box);
-          pushFaceSeriesSample(phaseSeries, opts.phase, opts.flowStartedAt, motionValue, box.keypoints);
+          pushFaceSeriesSample(phaseSeries, opts.phase, opts.flowStartedAt, motionValue);
         }
         if (opts.collectPulse) opts.collectPulse(box);
       }
@@ -1681,12 +1623,8 @@ function sampleFlashPixels(box) {
     if (w > 8 && h > 8) {
       flashFaceCtx.drawImage(videoEl, x, y, w, h, 0, 0, FLASH_FACE_W, FLASH_FACE_H);
       sample.f = bytesToB64(rgbBytes(flashFaceCtx, FLASH_FACE_W, FLASH_FACE_H));
-      sample.fb = [quantize(box.cx), quantize(box.cy), quantize(box.w)];
     }
   }
-  const bgH = Math.max(4, Math.round(vh * 0.06));
-  flashBgCtx.drawImage(videoEl, 0, 0, vw, bgH, 0, 0, FLASH_BG_W, FLASH_BG_H);
-  sample.b = bytesToB64(rgbBytes(flashBgCtx, FLASH_BG_W, FLASH_BG_H));
   return sample;
 }
 
@@ -1707,19 +1645,22 @@ const PULSE_TOPUP_MIN_MS = 9500;
 const PULSE_TOPUP_MIN_REDUCED_MS = 18500;
 const PULSE_BG_MIN_GAP_MS = 110;
 const PULSE_BG_MAX_SAMPLES = 300;
-const PRESENTATION_FRAME_WIDTH = 320;
-const PRESENTATION_FRAME_HEIGHT = 240;
-const PRESENTATION_FRAME_MIN_COUNT = 3;
-const PRESENTATION_FRAME_COUNT = 5;
-const PRESENTATION_FRAME_MIN_GAP_MS = 700;
+// Frames are face crops — the camera never sends the whole scene. They're
+// also the pixels the server recomputes pulse/flash claims against, so they
+// spread across the pulse window at ~2fps rather than clustering at the end.
+const PRESENTATION_CROP_SIZE = 192;
+const PRESENTATION_CROP_MARGIN = 1.8;
+const PRESENTATION_FRAME_MIN_COUNT = 6;
+const PRESENTATION_FRAME_COUNT = 14;
+const PRESENTATION_FRAME_MIN_GAP_MS = 520;
 const PRESENTATION_CAPTURE_GRACE_MS = 3000;
 const pulseCanvas = document.createElement('canvas');
 pulseCanvas.width = PULSE_ROI_W;
 pulseCanvas.height = PULSE_ROI_H;
 const pulseCtx = pulseCanvas.getContext('2d', { willReadFrequently: true });
 const presentationCanvas = document.createElement('canvas');
-presentationCanvas.width = PRESENTATION_FRAME_WIDTH;
-presentationCanvas.height = PRESENTATION_FRAME_HEIGHT;
+presentationCanvas.width = PRESENTATION_CROP_SIZE;
+presentationCanvas.height = PRESENTATION_CROP_SIZE;
 const presentationCtx = presentationCanvas.getContext('2d');
 
 // rPPG: forehead skin pixels shift green very slightly with each heartbeat.
@@ -1730,12 +1671,9 @@ function samplePulseGreen(box) {
   const vw = Math.max(1, videoEl.videoWidth || 640);
   const vh = Math.max(1, videoEl.videoHeight || 480);
   const pb = box.pixelBox;
-  const w = Math.min(pb.w * 0.44, vw);
-  const h = Math.min(pb.h * 0.16, vh);
-  const x = Math.max(0, Math.min(pb.x + pb.w / 2 - w / 2, vw - w));
-  const y = Math.max(0, Math.min(pb.y + pb.h * 0.05, vh - h));
-  if (w < 6 || h < 4) return null;
-  pulseCtx.drawImage(videoEl, x, y, w, h, 0, 0, PULSE_ROI_W, PULSE_ROI_H);
+  const roi = pulseRoi(pb, vw, vh);
+  if (roi.w < 6 || roi.h < 4) return null;
+  pulseCtx.drawImage(videoEl, roi.x, roi.y, roi.w, roi.h, 0, 0, PULSE_ROI_W, PULSE_ROI_H);
   const data = pulseCtx.getImageData(0, 0, PULSE_ROI_W, PULSE_ROI_H).data;
   let g = 0;
   const n = data.length / 4;
@@ -1743,25 +1681,31 @@ function samplePulseGreen(box) {
   return g / n;
 }
 
-function capturePresentationFrame(box, startedAt) {
+function capturePresentationFrame(box, startedAt, flashTag) {
   if (!box || box.stale || !box.pixelBox || videoEl.videoWidth < 1 || videoEl.videoHeight < 1) return null;
   const vw = videoEl.videoWidth;
   const vh = videoEl.videoHeight;
   const pb = box.pixelBox;
-  presentationCtx.drawImage(videoEl, 0, 0, vw, vh, 0, 0, PRESENTATION_FRAME_WIDTH, PRESENTATION_FRAME_HEIGHT);
+  const side = Math.min(Math.max(pb.w, pb.h) * PRESENTATION_CROP_MARGIN, vw, vh);
+  const cx = pb.x + pb.w / 2;
+  const cy = pb.y + pb.h / 2;
+  const sx = Math.max(0, Math.min(cx - side / 2, vw - side));
+  const sy = Math.max(0, Math.min(cy - side / 2, vh - side));
+  presentationCtx.drawImage(videoEl, sx, sy, side, side, 0, 0, PRESENTATION_CROP_SIZE, PRESENTATION_CROP_SIZE);
+  // Face box is reported relative to the crop, not the whole scene.
   const face = [
-    Math.max(0, Math.min(1, pb.x / vw)),
-    Math.max(0, Math.min(1, pb.y / vh)),
-    Math.max(0, Math.min(1, pb.w / vw)),
-    Math.max(0, Math.min(1, pb.h / vh)),
+    Math.max(0, Math.min(1, (pb.x - sx) / side)),
+    Math.max(0, Math.min(1, (pb.y - sy) / side)),
+    Math.max(0, Math.min(1, pb.w / side)),
+    Math.max(0, Math.min(1, pb.h / side)),
   ].map((value) => Math.round(value * 10000) / 10000);
-  if (face[0] + face[2] > 1) face[2] = Math.round((1 - face[0]) * 10000) / 10000;
-  if (face[1] + face[3] > 1) face[3] = Math.round((1 - face[1]) * 10000) / 10000;
-  return {
+  const frame = {
     t: Math.round(performance.now() - startedAt),
     face,
     image: presentationCanvas.toDataURL('image/jpeg', 0.72).split(',')[1],
   };
+  if (Number.isInteger(flashTag)) frame.f = flashTag;
+  return frame;
 }
 
 function faceReadyForStillCapture(box, requirePoseLiveness) {
@@ -1820,6 +1764,8 @@ async function runFlashPixelCheck(engine, flashPlan) {
   const last = flashPlan[flashPlan.length - 1];
   const endMs = last.o + last.d + 320;
   const samples = [];
+  const flashFrames = [];
+  const lastFrameAtByTag = new Map();
   setStatus('Hold still', 'listening');
   promptNameEl.textContent = 'Hold still';
   promptHintEl.textContent = 'Keep your face in view while the screen flashes.';
@@ -1832,11 +1778,29 @@ async function runFlashPixelCheck(engine, flashPlan) {
     const sample = sampleFlashPixels(box);
     sample.t = Math.round(now);
     samples.push(sample);
+    // Face crops tagged to the issued plan let the server verify the camera
+    // pixels themselves tracked the flashes — not just claimed pixel rows.
+    const flashIndex = active ? flashPlan.indexOf(active) : -1;
+    const tagEligible = flashIndex >= 0
+      ? now > active.o + 120 && now < active.o + active.d - 40
+      : now < flashPlan[0].o - 100;
+    if (tagEligible && box && !box.stale) {
+      const taken = flashFrames.filter((fr) => fr.f === flashIndex).length;
+      const cap = flashIndex === -1 ? 2 : 3;
+      const lastAt = lastFrameAtByTag.get(flashIndex) ?? -Infinity;
+      if (taken < cap && now - lastAt >= 140) {
+        const frame = capturePresentationFrame(box, t0, flashIndex);
+        if (frame) {
+          flashFrames.push(frame);
+          lastFrameAtByTag.set(flashIndex, now);
+        }
+      }
+    }
     drawFaceGuide(box, { state: box && !box.stale ? 'good' : 'neutral' });
     await sleep(70);
   }
   setFlashOverlay(null);
-  return samples;
+  return { pixelSeries: samples, flashFrames };
 }
 
 async function runGuidedFaceCheck() {
@@ -1903,7 +1867,7 @@ async function runGuidedFaceCheck() {
           poses.push(box.pose.pose);
         }
         if (centeredFrames > 0 && phaseSeries.length < 120) {
-          pushFaceSeriesSample(phaseSeries, 'center_hold', startedAt, motionValue(box), box.keypoints);
+          pushFaceSeriesSample(phaseSeries, 'center_hold', startedAt, motionValue(box));
         }
         collectPulse(box);
       }
@@ -1996,20 +1960,14 @@ async function runGuidedFaceCheck() {
     const durationMs = Math.min(15000, Math.max(900, Math.round(performance.now() - startedAt)));
     const centerMotion = Math.max(...centers) - Math.min(...centers);
     const sizeMotion = Math.max(...sizes) - Math.min(...sizes);
-    const motionSeries = phaseSeries.map((sample) => {
-      const entry = { p: sample.phase, t: sample.t, v: sample.v };
-      if (Number.isFinite(sample.m)) entry.m = sample.m;
-      if (Number.isFinite(sample.e)) entry.e = sample.e;
-      return entry;
-    });
-    const seriesDigest = await livenessSeriesDigest(livenessChallenge.challengeId, motionSeries);
+    const motionSeries = phaseSeries.map((sample) => ({ p: sample.phase, t: sample.t, v: sample.v }));
+    const seriesDigest = await livenessSeriesDigest(livenessChallenge.challengeId, motionSeries, pulseSeries);
     const mediaDigest = await presentationFramesDigest(livenessChallenge.challengeId, mediaFrames);
     const verificationBody = {
       challengeId: livenessChallenge.challengeId,
       durationMs,
       faceFrames: centers.length,
       motionScore: Math.max(yawRange, centerMotion, sizeMotion),
-      phases,
       motionSeries,
       seriesDigest,
       pulseSeries,
@@ -2030,15 +1988,18 @@ async function runGuidedFaceCheck() {
       }
       promptEmojiEl.textContent = '💡';
       progressEl.style.width = '100%';
-      const pixelSeries = await runFlashPixelCheck(engine, flashPlan);
+      const { pixelSeries, flashFrames } = await runFlashPixelCheck(engine, flashPlan);
       if (!faceChecking) return;
       setStatus('Checking…', 'listening');
       promptNameEl.textContent = 'Checking…';
       promptHintEl.textContent = 'Confirming the backup liveness check.';
+      const flashDigest = await digestString(`${livenessChallenge.challengeId}\nflash\n${JSON.stringify(flashFrames)}`);
       result = await apiJson('/api/liveness/verify', {
         ...verificationBody,
         flashFallback: true,
         pixelSeries,
+        flashFrames,
+        flashDigest,
       });
     }
     verificationToken = result.verificationToken;

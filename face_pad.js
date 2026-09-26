@@ -3,16 +3,19 @@ const path = require('path');
 const jpeg = require('jpeg-js');
 const ort = require('onnxruntime-node');
 
-const FRAME_WIDTH = 320;
-const FRAME_HEIGHT = 240;
+// Frames are face-cropped squares on the client (the camera never sends the
+// whole scene), so both dimensions float within bounds instead of matching a
+// fixed size.
+const MIN_FRAME_DIM = 64;
+const MAX_FRAME_DIM = 320;
 const MODEL_SIZE = 128;
 const MIN_FRAMES = 3;
-const MAX_FRAMES = 5;
+const MAX_FRAMES = 16;
 const MAX_FRAME_BYTES = 90 * 1024;
-const MAX_TOTAL_FRAME_BYTES = 400 * 1024;
+const MAX_TOTAL_FRAME_BYTES = 700 * 1024;
 const MIN_FRAME_GAP_MS = 300;
-const MIN_FRAME_SPAN_MS = 1200;
-const MIN_FACE_SOURCE_PX = 64;
+const MIN_FRAME_SPAN_MS = 2500;
+const MIN_FACE_SOURCE_PX = 48;
 const REAL_LOGIT_THRESHOLD = 0.5;
 const REQUIRED_REAL_RUN = 3;
 const DETECTOR_SIZE = 640;
@@ -69,8 +72,7 @@ function validateFaceBox(face) {
   if (!face.every((value) => typeof value === 'number' && Number.isFinite(value))) return false;
   const [x, y, width, height] = face;
   if (x < 0 || y < 0 || width <= 0 || height <= 0 || x + width > 1 || y + height > 1) return false;
-  if (width > 0.85 || height > 0.95) return false;
-  return width * FRAME_WIDTH >= MIN_FACE_SOURCE_PX && height * FRAME_HEIGHT >= MIN_FACE_SOURCE_PX;
+  return width <= 0.95 && height <= 0.98;
 }
 
 function validatePresentationFrames(challengeId, mediaFrames, mediaDigest) {
@@ -108,7 +110,13 @@ function validatePresentationFrames(challengeId, mediaFrames, mediaDigest) {
       return { error: 'Camera media frame size is invalid.' };
     }
     const dimensions = jpegDimensions(bytes);
-    if (!dimensions || dimensions.width !== FRAME_WIDTH || dimensions.height !== FRAME_HEIGHT) {
+    if (
+      !dimensions
+      || dimensions.width < MIN_FRAME_DIM
+      || dimensions.height < MIN_FRAME_DIM
+      || dimensions.width > MAX_FRAME_DIM
+      || dimensions.height > MAX_FRAME_DIM
+    ) {
       return { error: 'Camera media frame dimensions are invalid.' };
     }
     imageDigests.add(crypto.createHash('sha256').update(bytes).digest('hex'));
@@ -118,8 +126,15 @@ function validatePresentationFrames(challengeId, mediaFrames, mediaDigest) {
     } catch {
       return { error: 'Camera media frame could not be decoded.' };
     }
-    if (image.width !== FRAME_WIDTH || image.height !== FRAME_HEIGHT || image.data.length !== FRAME_WIDTH * FRAME_HEIGHT * 4) {
+    if (
+      image.width !== dimensions.width
+      || image.height !== dimensions.height
+      || image.data.length !== image.width * image.height * 4
+    ) {
       return { error: 'Camera media frame decoded incorrectly.' };
+    }
+    if (frame.face[2] * image.width < MIN_FACE_SOURCE_PX || frame.face[3] * image.height < MIN_FACE_SOURCE_PX) {
+      return { error: 'Camera media face is too small.' };
     }
     decodedFrames.push({ t, face: frame.face, image });
   }
@@ -129,6 +144,103 @@ function validatePresentationFrames(challengeId, mediaFrames, mediaDigest) {
   }
   if (imageDigests.size < MIN_FRAMES) return { error: 'Camera media repeated the same frame.' };
   return { frames: decodedFrames };
+}
+
+// Flash-fallback frames: face crops tagged with the issued flash index (or -1
+// for a pre-sequence baseline). The server recomputes their chroma deltas and
+// checks the camera pixels actually tracked the plan — a fabricated pixel
+// series can't fake this without real changing pixels.
+const FLASH_FRAME_MIN_PER_COLOR = 2;
+const FLASH_FRAME_MIN_GAP_MS = 120;
+const FLASH_FRAME_MAX_T_MS = 15000;
+const FLASH_FRAME_MAX_TOTAL_BYTES = 300 * 1024;
+
+function computeFlashDigest(challengeId, flashFrames) {
+  return crypto
+    .createHash('sha256')
+    .update(`${challengeId}\nflash\n${JSON.stringify(flashFrames)}`)
+    .digest('hex');
+}
+
+function validateFlashFrames(challengeId, flashFrames, flashDigest, flashPlan) {
+  if (!Array.isArray(flashFrames) || !flashFrames.length) {
+    return { error: 'Flash camera frames are missing.' };
+  }
+  if (flashFrames.length > 2 + flashPlan.length * 3) {
+    return { error: 'Flash camera frame count is invalid.' };
+  }
+  if (!/^[a-f0-9]{64}$/.test(flashDigest || '')) {
+    return { error: 'Flash camera digest is invalid.' };
+  }
+  if (computeFlashDigest(challengeId, flashFrames) !== flashDigest) {
+    return { error: 'Flash camera media is not bound to this challenge.' };
+  }
+
+  const decoded = [];
+  let previousT = -1;
+  let totalBytes = 0;
+  for (const frame of flashFrames) {
+    const t = Number(frame && frame.t);
+    const f = Number(frame && frame.f);
+    if (!Number.isFinite(t) || t < 0 || t > FLASH_FRAME_MAX_T_MS || t <= previousT) {
+      return { error: 'Flash camera frame timing is invalid.' };
+    }
+    if (t - previousT < FLASH_FRAME_MIN_GAP_MS) {
+      return { error: 'Flash camera frames are too close together.' };
+    }
+    previousT = t;
+    if (!Number.isInteger(f) || f < -1 || f >= flashPlan.length) {
+      return { error: 'Flash camera frame tag is invalid.' };
+    }
+    if (!validateFaceBox(frame.face)) return { error: 'Flash camera face box is invalid.' };
+    if (typeof frame.image !== 'string' || frame.image.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(frame.image)) {
+      return { error: 'Flash camera frame is invalid.' };
+    }
+    const bytes = Buffer.from(frame.image, 'base64');
+    totalBytes += bytes.length;
+    if (bytes.length < 1024 || bytes.length > MAX_FRAME_BYTES || totalBytes > FLASH_FRAME_MAX_TOTAL_BYTES) {
+      return { error: 'Flash camera frame size is invalid.' };
+    }
+    const dimensions = jpegDimensions(bytes);
+    if (!dimensions || dimensions.width < MIN_FRAME_DIM || dimensions.height < MIN_FRAME_DIM
+      || dimensions.width > MAX_FRAME_DIM || dimensions.height > MAX_FRAME_DIM) {
+      return { error: 'Flash camera frame dimensions are invalid.' };
+    }
+    let image;
+    try {
+      image = jpeg.decode(bytes, { useTArray: true, formatAsRGBA: true });
+    } catch {
+      return { error: 'Flash camera frame could not be decoded.' };
+    }
+    if (image.data.length !== image.width * image.height * 4) {
+      return { error: 'Flash camera frame decoded incorrectly.' };
+    }
+    if (frame.face[2] * image.width < MIN_FACE_SOURCE_PX || frame.face[3] * image.height < MIN_FACE_SOURCE_PX) {
+      return { error: 'Flash camera face is too small.' };
+    }
+    decoded.push({ t, f, face: frame.face, image });
+  }
+
+  const baselines = decoded.filter((d) => d.f === -1);
+  if (!baselines.length) return { error: 'Flash camera baseline is missing.' };
+  for (let i = 0; i < flashPlan.length; i += 1) {
+    if (decoded.filter((d) => d.f === i).length < FLASH_FRAME_MIN_PER_COLOR) {
+      return { error: 'Flash camera coverage missed a color.' };
+    }
+  }
+  // Frame timestamps must agree with the issued plan windows.
+  const planT0 = flashPlan[0].o;
+  for (const d of decoded) {
+    if (d.f === -1) {
+      if (d.t > planT0 - 40) return { error: 'Flash camera baseline is inside a flash window.' };
+    } else {
+      const flash = flashPlan[d.f];
+      if (d.t < flash.o + 60 || d.t > flash.o + flash.d + 60) {
+        return { error: 'Flash camera frames do not match the issued plan.' };
+      }
+    }
+  }
+  return { frames: decoded };
 }
 
 function reflectedIndex(value, size) {
@@ -183,6 +295,34 @@ function preprocessFrame(frame, output, batchIndex, face = frame.face) {
   }
 }
 
+// Mean channels over the frame's claimed face region — the server-side
+// counterpart of the client's pulse/flash claims. These come from the JPEG
+// pixels themselves, so a fabricated series must agree with real camera data.
+function faceSignals(image, face) {
+  const [nx, ny, nw, nh] = face;
+  const x0 = Math.max(0, Math.floor(nx * image.width));
+  const y0 = Math.max(0, Math.floor(ny * image.height));
+  const x1 = Math.min(image.width, Math.ceil((nx + nw) * image.width));
+  const y1 = Math.min(image.height, Math.ceil((ny + nh) * image.height));
+  if (x1 - x0 < 8 || y1 - y0 < 8) return null;
+  let r = 0;
+  let g = 0;
+  let b = 0;
+  let n = 0;
+  for (let y = y0; y < y1; y += 1) {
+    const row = y * image.width;
+    for (let x = x0; x < x1; x += 1) {
+      const base = (row + x) * 4;
+      r += image.data[base];
+      g += image.data[base + 1];
+      b += image.data[base + 2];
+      n += 1;
+    }
+  }
+  if (!n) return null;
+  return { r: r / n, g: g / n, b: b / n };
+}
+
 function getSession() {
   if (!sessionPromise) {
     sessionPromise = ort.InferenceSession.create(MODEL_PATH, {
@@ -229,7 +369,7 @@ function intersectionOverUnion(a, b) {
   return union > 0 ? intersection / union : 0;
 }
 
-function detectorBoxes(outputs) {
+function detectorBoxes(outputs, sourceHeight) {
   const boxes = [];
   for (const stride of [8, 16, 32]) {
     const cls = outputs[`cls_${stride}`].data;
@@ -241,10 +381,12 @@ function detectorBoxes(outputs) {
       if (confidence < DETECTOR_CONFIDENCE_MIN) continue;
       const row = Math.floor(index / columns);
       const column = index % columns;
-      const x = (column + Number(bbox[index * 4])) * stride;
-      const y = (row + Number(bbox[index * 4 + 1])) * stride;
+      // YuNet predicts the box CENTER at cell + offset (per OpenCV's
+      // face_detect.cpp reference decoder), not the top-left corner.
       const width = Math.exp(Number(bbox[index * 4 + 2])) * stride;
       const height = Math.exp(Number(bbox[index * 4 + 3])) * stride;
+      const x = (column + Number(bbox[index * 4])) * stride - width / 2;
+      const y = (row + Number(bbox[index * 4 + 1])) * stride - height / 2;
       if (![x, y, width, height].every(Number.isFinite)) continue;
       const left = Math.max(0, x);
       const top = Math.max(0, y);
@@ -253,8 +395,8 @@ function detectorBoxes(outputs) {
       const clippedWidth = right - left;
       const clippedHeight = bottom - top;
       if (
-        clippedWidth >= MIN_FACE_SOURCE_PX * 2
-        && clippedHeight >= MIN_FACE_SOURCE_PX * (DETECTOR_SIZE / FRAME_HEIGHT)
+        clippedWidth >= MIN_FACE_SOURCE_PX * 2 * (DETECTOR_SIZE / sourceHeight)
+        && clippedHeight >= MIN_FACE_SOURCE_PX * (DETECTOR_SIZE / sourceHeight)
       ) {
         boxes.push({
           x: left,
@@ -272,6 +414,7 @@ function detectorBoxes(outputs) {
 async function serverDetectsClaimedFace(frame) {
   const session = await getDetectorSession();
   const outputs = await session.run({ [session.inputNames[0]]: detectorInput(frame.image) });
+  const sourceHeight = frame.image.height;
   const [x, y, width, height] = frame.face;
   const claimed = {
     x: x * DETECTOR_SIZE,
@@ -279,7 +422,7 @@ async function serverDetectsClaimedFace(frame) {
     width: width * DETECTOR_SIZE,
     height: height * DETECTOR_SIZE,
   };
-  const matches = detectorBoxes(outputs).filter((box) => {
+  const matches = detectorBoxes(outputs, sourceHeight).filter((box) => {
     const claimedCenterX = claimed.x + claimed.width / 2;
     const claimedCenterY = claimed.y + claimed.height / 2;
     const detectedCenterX = box.x + box.width / 2;
@@ -354,9 +497,12 @@ async function analyzePresentationFrames(frames) {
 }
 
 module.exports = {
-  FRAME_WIDTH,
-  FRAME_HEIGHT,
+  MIN_FRAME_DIM,
+  MAX_FRAME_DIM,
   computePresentationDigest,
+  computeFlashDigest,
   validatePresentationFrames,
+  validateFlashFrames,
   analyzePresentationFrames,
+  faceSignals,
 };

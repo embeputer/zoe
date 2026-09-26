@@ -16,23 +16,19 @@ const baseline = document.querySelector('#baseline');
 const flashResults = document.querySelector('#flash-results');
 
 const metrics = window.ZoeDebugMetrics;
-const TASKS_VISION_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/vision_bundle.mjs';
-const TASKS_VISION_WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/wasm';
+// Face-box calibration (fitBoxToKeypoints, calibratedFaceBox, pointToPixel,
+// pulseRoi) is shared with app.js via face_calib.js globals.
+const TASKS_VISION_URL = '/vendor/mediapipe/tasks-vision/vision_bundle.mjs';
+const TASKS_VISION_WASM = '/vendor/mediapipe/tasks-vision/wasm';
 const FACE_MODEL_URL = '/models/blaze_face_short_range.tflite';
-const FACE_BOX_SHIFT_X = -0.75;
-const FACE_BOX_SHIFT_Y = -0.55;
-const FACE_BOX_HEIGHT_SCALE = 1.02;
-const FLASH_CHROMA_COSINE_MIN = 0.6;
-const FLASH_CHROMA_RATIO_MIN = 0.025;
-const FLASH_CHROMA_RATIO_MAX = 2;
 const SAMPLE_INTERVAL_MS = 100;
 const PULSE_WINDOW_MS = 12000;
 const FLASH_COLORS = [
   { name: 'Red', rgb: [255, 64, 64] },
   { name: 'Blue', rgb: [64, 160, 255] },
-  { name: 'Green', rgb: [72, 220, 120] },
+  { name: 'Green', rgb: [60, 220, 60] },
   { name: 'Amber', rgb: [255, 190, 60] },
-  { name: 'Purple', rgb: [190, 110, 255] },
+  { name: 'Purple', rgb: [180, 60, 255] },
   { name: 'Cyan', rgb: [60, 220, 220] },
 ];
 
@@ -47,48 +43,6 @@ let currentFlashSamples = null;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function pointToPixel(point, width, height) {
-  return {
-    x: point.x <= 1 ? point.x * width : point.x,
-    y: point.y <= 1 ? point.y * height : point.y,
-  };
-}
-
-function fitBoxToKeypoints(box, keypoints, frameWidth, frameHeight) {
-  const points = (keypoints || [])
-    .map((point) => pointToPixel(point, frameWidth, frameHeight))
-    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
-  if (points.length < 3) return box;
-
-  const xs = points.map((point) => point.x);
-  const ys = points.map((point) => point.y);
-  const minX = Math.min(...xs);
-  const maxX = Math.max(...xs);
-  const minY = Math.min(...ys);
-  const maxY = Math.max(...ys);
-  const width = Math.min(frameWidth, Math.max(box.width, maxX - minX + box.width * 0.16));
-  const height = Math.min(frameHeight, Math.max(box.height, maxY - minY + box.height * 0.16));
-  const x = Math.min(Math.max(0, (minX + maxX - width) / 2), Math.max(0, frameWidth - width));
-  const y = Math.min(Math.max(0, (minY + maxY - height) / 2), Math.max(0, frameHeight - height));
-  return { ...box, x, y, width, height };
-}
-
-function calibratedFaceBox(box, keypoints) {
-  const frameWidth = video.videoWidth;
-  const frameHeight = video.videoHeight;
-  const width = box.width;
-  const height = box.height * FACE_BOX_HEIGHT_SCALE;
-  const x = box.x + box.width * FACE_BOX_SHIFT_X;
-  const y = box.y + box.height * FACE_BOX_SHIFT_Y;
-  return fitBoxToKeypoints({
-    x: Math.min(Math.max(0, x), Math.max(0, frameWidth - width)),
-    y: Math.min(Math.max(0, y), Math.max(0, frameHeight - height)),
-    width,
-    height,
-    score: box.score,
-  }, keypoints, frameWidth, frameHeight);
 }
 
 async function initDetector() {
@@ -111,14 +65,10 @@ function bestFace() {
     const box = detection.boundingBox;
     const score = Number(detection.categories?.[0]?.score || 0);
     if (!box || score < 0.5) continue;
-    const candidate = {
-      x: box.originX,
-      y: box.originY,
-      width: box.width,
-      height: box.height,
-      score,
-    };
-    if (!best || candidate.score > best.score) best = calibratedFaceBox(candidate, detection.keypoints);
+    const candidate = { x: box.originX, y: box.originY, w: box.width, h: box.height };
+    const calibrated = calibratedFaceBox(candidate, detection.keypoints, video.videoWidth, video.videoHeight);
+    calibrated.score = score;
+    if (!best || calibrated.score > best.score) best = calibrated;
   }
   currentFace = best;
   return best;
@@ -141,7 +91,7 @@ function drawFace(face) {
   overlayContext.setLineDash([]);
   if (face) {
     overlayContext.strokeStyle = '#56e39f';
-    overlayContext.strokeRect(face.x, face.y, face.width, face.height);
+    overlayContext.strokeRect(face.x, face.y, face.w, face.h);
   }
 }
 
@@ -166,14 +116,16 @@ function cameraRegionMeans(face) {
     }
     return totals.map((total) => total / Math.max(1, count));
   };
-  const pulseX = Math.max(0, Math.round(face.x + face.width * 0.3));
-  const pulseY = Math.max(0, Math.round(face.y + face.height * 0.12));
-  const pulseWidth = Math.max(8, Math.min(width - pulseX, Math.round(face.width * 0.4)));
-  const pulseHeight = Math.max(8, Math.min(height - pulseY, Math.round(face.height * 0.18)));
-  const flashWidth = Math.max(8, Math.min(width, Math.round(face.width * 1.2)));
-  const flashHeight = Math.max(8, Math.min(height, Math.round(face.height * 1.2)));
-  const flashX = Math.max(0, Math.min(Math.round(face.x + (face.width - flashWidth) / 2), width - flashWidth));
-  const flashY = Math.max(0, Math.min(Math.round(face.y + (face.height - flashHeight) / 2), height - flashHeight));
+  // Same forehead ROI the app's pulse check samples (face_calib.js).
+  const roi = pulseRoi(face, width, height);
+  const pulseX = Math.max(0, Math.round(roi.x));
+  const pulseY = Math.max(0, Math.round(roi.y));
+  const pulseWidth = Math.max(8, Math.min(width - pulseX, Math.round(roi.w)));
+  const pulseHeight = Math.max(8, Math.min(height - pulseY, Math.round(roi.h)));
+  const flashWidth = Math.max(8, Math.min(width, Math.round(face.w * 1.2)));
+  const flashHeight = Math.max(8, Math.min(height, Math.round(face.h * 1.2)));
+  const flashX = Math.max(0, Math.min(Math.round(face.x + (face.w - flashWidth) / 2), width - flashWidth));
+  const flashY = Math.max(0, Math.min(Math.round(face.y + (face.h - flashHeight) / 2), height - flashHeight));
   return {
     pulse: regionMean(pulseX, pulseY, pulseWidth, pulseHeight),
     flash: regionMean(flashX, flashY, flashWidth, flashHeight),
@@ -187,14 +139,20 @@ function renderPulse(now) {
     g: sample.g,
   }));
   const result = metrics.pulseMetrics(relative);
+  // Annotate with the production gates this lab mirrors (server.js):
+  // spectral peak ≥3× the mean band and lobe fraction within 45–97%.
+  const t = metrics.SERVER_THRESHOLDS;
+  const productionNote = Number.isFinite(result.peakRatio)
+    ? ` · peak ${result.peakRatio.toFixed(1)}× (server ≥${t.pulsePeakRatioMin}×), lobe ${(result.lobeFraction * 100).toFixed(0)}% (server ${Math.round(t.pulseLobeFractionMin * 100)}–${Math.round(t.pulseLobeFractionMax * 100)}%)`
+    : '';
   if (result.detected) {
     pulseStatus.textContent = 'Heartbeat found';
-    pulseDetail.textContent = result.reason;
+    pulseDetail.textContent = result.reason + productionNote;
     bpm.textContent = `${result.bpm} BPM`;
     quality.textContent = `${result.quality}%`;
   } else {
     pulseStatus.textContent = 'Detecting';
-    pulseDetail.textContent = result.reason;
+    pulseDetail.textContent = result.reason + productionNote;
     bpm.textContent = result.bpm ? `${result.bpm} BPM candidate` : '—';
     quality.textContent = Number.isFinite(result.quality) ? `${result.quality}%` : '—';
   }
@@ -288,10 +246,11 @@ async function runFlashTest() {
     name.textContent = `${color.name} (${sampleCount} samples)`;
     const value = document.createElement('strong');
     if (result) {
-      const passes = result.cosine >= FLASH_CHROMA_COSINE_MIN
-        && result.strength >= FLASH_CHROMA_RATIO_MIN
-        && result.strength <= FLASH_CHROMA_RATIO_MAX;
-      value.textContent = `${passes ? 'Pass' : 'Below Zoe threshold'} · ${Math.round(result.cosine * 100)}% direction / ${result.strength.toFixed(2)}× strength`;
+      const t = metrics.SERVER_THRESHOLDS;
+      const passes = result.cosine >= t.flashChromaCosineMin
+        && result.strength >= t.flashChromaRatioMin
+        && result.strength <= t.flashChromaRatioMax;
+      value.textContent = `${passes ? 'Pass' : 'Below Zoe threshold'} · direction ${Math.round(result.cosine * 100)}% (server ≥${Math.round(t.flashChromaCosineMin * 100)}%) · strength ${result.strength.toFixed(2)}× (server ${t.flashChromaRatioMin}–${t.flashChromaRatioMax}×)`;
     } else {
       value.textContent = 'No usable response';
     }

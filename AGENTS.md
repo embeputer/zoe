@@ -11,7 +11,7 @@ This is a plain Node/static app:
 - `index.html` is the single page.
 - `styles.css` is the complete UI styling.
 - `test_server.js` is the regression/security test suite.
-- `attack_server.js` is the adversarial harness: it submits fully fabricated evidence and reports which server checks a scripted client fools.
+- `attack_server.js` is the media-surface adversarial harness: it submits fully fabricated evidence and reports which server checks a scripted client fools. `attack_agent.js` is the API-level harness: protocol abuse plus a fully fabricated liveness body so probes reach the real pipeline. `npm run attack` runs both fail-fast. Both report tri-state — `FOOLED` / `BLOCKED at <stage>` / `NOT-PROBED` — and a probe killed upstream of its target must never count as `BLOCKED`.
 - `face_pad.js` validates bounded challenge-bound JPEG frames, independently detects face regions, and runs server-side presentation-attack analysis.
 - `debug.html`, `debug.js`, and `debug_metrics.js` form a disposable pulse/flash camera lab available only through `npm run debug`.
 
@@ -25,6 +25,7 @@ Use:
 npm start
 npm test
 npm run debug
+npm run attack
 ```
 
 The app must be served over the local server. Do not open `index.html` with `file://`.
@@ -64,7 +65,7 @@ Do not reintroduce a fake phone frame. The design is inspired by the card inside
 
 ### Face Motion
 
-Face motion is the default on mobile. It runs cross-browser using MediaPipe Tasks Vision (`@mediapipe/tasks-vision`), imported dynamically in `app.js`. The WASM runtime loads from `cdn.jsdelivr.net`, and the active compatible short-range FaceDetector model is vendored locally at `models/blaze_face_short_range.tflite` and served from the same origin. The Tasks Vision FaceDetector is the active gate because it exposes confidence scores, a conventional bounding box, and face keypoints; the browser validates confidence, size/aspect, target-oval position, and eye/nose keypoint yaw before counting prompted head turns. The older `@mediapipe/face_detection` Solutions build is intentionally avoided because it evaluates strings as JavaScript and would require loosening the CSP. The browser's non-standard `FaceDetector` API is used only as an opportunistic fallback when the MediaPipe runtime cannot load; it has no keypoints, so only that fallback uses box-motion gates. It is a liveness-style motion check, not identity verification.
+Face motion is the default on mobile. It runs cross-browser using MediaPipe Tasks Vision (`@mediapipe/tasks-vision`), imported dynamically in `app.js`. The runtime and WASM files are vendored under `vendor/mediapipe/tasks-vision/` and served from the same origin, and the active compatible short-range FaceDetector model is vendored locally at `models/blaze_face_short_range.tflite`. The Tasks Vision FaceDetector is the active gate because it exposes confidence scores, a conventional bounding box, and face keypoints; the browser validates confidence, size/aspect, target-oval position, and eye/nose keypoint yaw before counting prompted head turns. The older `@mediapipe/face_detection` Solutions build is intentionally avoided because it evaluates strings as JavaScript and would require loosening the CSP. The browser's non-standard `FaceDetector` API is used only as an opportunistic fallback when the MediaPipe runtime cannot load; it has no keypoints, so only that fallback uses box-motion gates. It is a liveness-style motion check, not identity verification.
 
 The face check is a guided flow (`runGuidedFaceCheck` in `app.js`): it draws a target oval, follows the server-issued left-first or right-first motion plan, collects forehead green-channel samples throughout, then uses a calm front-facing tail to top up pulse evidence and capture up to five 320×240 JPEG frames. The frames include bounded timestamps and normalized client face regions; `mediaDigest` binds their exact JSON representation to `challengeId`. `face_pad.js` enforces count, spacing, span, size, dimensions, uniqueness, and digest bounds, then runs the vendored YuNet-style detector independently on each frame before running MiniFASNetV2-SE presentation analysis on the matched face crop. Acceptance requires three consecutive independently detected faces, three consecutive real PAD results, and a passing median PAD score. An accepted digest/result is cached on the challenge so explicit flash fallback cannot replace the media set. Pulse remains the default media gate; failed pulse may offer flash only after affirmative photosensitivity consent, and flash never auto-starts. These checks raise attack cost but do not prove camera provenance or defeat realistic injected/replayed video.
 
@@ -74,20 +75,20 @@ Known face-detector findings:
 - `models/blaze_face_full_range.tflite` was tested and is incompatible with the Tasks FaceDetector graph in this app (`raw_box_tensor ... 2304 vs 896`). Do not reintroduce it unless the graph/model compatibility is proven first.
 - `models/face_landmarker.task` was removed from the active path because the landmarker-only approach could hallucinate a mesh on shoulder/neck/background skin without a usable per-face confidence score.
 - Keep the face logic boring: detector output → one centralized box calibration (`calibratedFaceBox`) → size/oval gates → eye/nose keypoint yaw → explicit center/left/right state machine. Detector and evidence coordinates stay unmirrored (`displayedFaceX(box) === box.cx`); only the camera pixels drawn by `drawFaceGuide` are mirrored for selfie-style guidance. Do not stack ad hoc keypoint-derived boxes, scattered `1 - box.cx` conversions, or extra draw-only offsets.
-- `calibratedFaceBox` shifts the raw Blaze box left by `0.75` raw box widths and up by `0.55` raw box heights, scales height by `1.02`, then expands/centers the box enough to contain the detector's landmark span. If screenshots show drift, tune only the constants in `calibratedFaceBox` in `app.js`.
+- `calibratedFaceBox` frame-clamps the raw Blaze box, then expands/centers it enough to contain the detector's landmark span. If screenshots show drift, tune only `fitBoxToKeypoints`' proportional margins in `app.js` — do not reintroduce large magic shifts: on this model the raw box already contains the keypoint span, and the old `-0.75w`/`-0.55h` shifts were what displaced the rect.
 - Face-box offsets and gates must scale from the detected raw/calibrated box dimensions. Do not add fixed pixel offsets or fixed frame-percentage offsets for box correction, expansion, center acceptance, or motion thresholds; use multipliers such as `box.w * 0.1` or `box.h * 0.1`.
 - `SHOW_FACE_DEBUG_BOX` in `app.js` controls whether the blue box appears in the real app. Keep it disabled for normal product flow.
 
 ### Hand Gestures
 
-Hand gestures use MediaPipe Hands from `cdn.jsdelivr.net`. The server issues three gesture steps. The browser submits bounded evidence, and the server validates ordering, timing, session binding, and replay state. Step evidence may include optional `motionStats` (hold micro-jitter and forming-motion variance) with loose server bands.
+Hand gestures use MediaPipe Hands vendored under `vendor/mediapipe/hands/` (script tag in `index.html`, runtime assets via `locateFile` in `app.js`). The server issues three gesture steps. The browser submits bounded evidence, and the server validates ordering, timing, session binding, and replay state. Step evidence may include optional `motionStats` (hold micro-jitter and forming-motion variance) with loose server bands.
 
 Important gesture details:
 
 - `three` means index, middle, and ring fingers up; thumb and pinky folded.
 - `Hand Hearts` requires both hands. It is not a pinch.
 - MediaPipe is configured with `maxNumHands: 2` because hand hearts need two hands.
-- Hand step evidence may include bounded `landmarkSamples`; the server applies cheap geometry checks for gestures like `three` and `ily` when samples are present.
+- Hand step evidence must include bounded `landmarkSamples` with at least one detected hand; the server applies cheap geometry checks for every gesture (`ok` uses tip contact, `ily` uses a two-hand heart shape, the rest use finger-extension patterns).
 
 ### Zoe ID
 
