@@ -9,6 +9,36 @@ function pointToPixel(point, frameWidth, frameHeight) {
   };
 }
 
+// Build the face box from the keypoint span alone. Blaze's six keypoints
+// (eyes, nose tip, mouth, ear tragions) sit on the face even when the raw
+// detector box drifts, so anchoring the region to them can never displace it.
+// The span covers roughly ear-to-ear horizontally and brow-to-mouth
+// vertically: the face extends ~one span above the eyes and ~a third below
+// the mouth, hence the proportional expansion and the upward center shift.
+function keypointFaceBox(keypoints, frameWidth, frameHeight) {
+  const points = (keypoints || [])
+    .map((point) => pointToPixel(point, frameWidth, frameHeight))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (points.length < 4) return null;
+
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const spanX = Math.max(...xs) - Math.min(...xs);
+  const spanY = Math.max(...ys) - Math.min(...ys);
+  if (keypointSpanDegenerate(keypoints, frameWidth, frameHeight)) return null;
+
+  const w = Math.min(frameWidth, spanX * 1.18);
+  const h = Math.min(frameHeight, spanY * 2.15);
+  const cx = (Math.min(...xs) + Math.max(...xs)) / 2;
+  const cy = (Math.min(...ys) + Math.max(...ys)) / 2 - spanY * 0.3;
+  return {
+    x: Math.min(Math.max(0, cx - w / 2), Math.max(0, frameWidth - w)),
+    y: Math.min(Math.max(0, cy - h / 2), Math.max(0, frameHeight - h)),
+    w,
+    h,
+  };
+}
+
 // Grow the detector box until it contains the face keypoints: raw detector
 // boxes sit slightly off the skin region, while the keypoints mark the
 // features the pulse/flash sampling regions actually read.
@@ -31,9 +61,26 @@ function fitBoxToKeypoints(box, keypoints, frameWidth, frameHeight) {
   return { ...box, x, y, w, h };
 }
 
+// True when the keypoint span is too small to describe a face — a degenerate
+// read (e.g. a shoulder edge scored as a face) where landmark anchoring would
+// land off any real face.
+function keypointSpanDegenerate(keypoints, frameWidth, frameHeight) {
+  const points = (keypoints || [])
+    .map((point) => pointToPixel(point, frameWidth, frameHeight))
+    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (points.length < 4) return true;
+  const xs = points.map((point) => point.x);
+  const ys = points.map((point) => point.y);
+  const spanX = Math.max(...xs) - Math.min(...xs);
+  const spanY = Math.max(...ys) - Math.min(...ys);
+  return spanX < frameWidth * 0.04 || spanY < frameHeight * 0.04;
+}
+
 function calibratedFaceBox(box, keypoints, frameWidth, frameHeight) {
-  // Blaze's raw box already tracks the face; keep it frame-clamped and let
-  // landmark fitting absorb residual detector offset instead of hard shifts.
+  // Prefer a purely keypoint-anchored box — the raw Blaze rect can sit off the
+  // face, while the landmarks mark the features the gates actually need.
+  const anchored = keypointFaceBox(keypoints, frameWidth, frameHeight);
+  if (anchored) return anchored;
   return fitBoxToKeypoints({
     x: Math.min(Math.max(0, box.x), Math.max(0, frameWidth - box.w)),
     y: Math.min(Math.max(0, box.y), Math.max(0, frameHeight - box.h)),
@@ -99,9 +146,11 @@ function pulseRoi(box, frameWidth, frameHeight) {
 if (typeof module === 'object' && module.exports) {
   module.exports = {
     pointToPixel,
+    keypointFaceBox,
     fitBoxToKeypoints,
     calibratedFaceBox,
     detectorBoxDisplaced,
+    keypointSpanDegenerate,
     keypointSpanOutsideBox,
     pulseRoi,
   };

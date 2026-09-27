@@ -1339,7 +1339,9 @@ async function detectFaceFrame(engine) {
         const rawBox = detectionBox(detection, vw, vh);
         const box = calibratedFaceBox(rawBox, detection.keypoints, vw, vh);
         const pose = poseFromKeypoints(detection.keypoints, vw, vh);
-        if (detectorBoxDisplaced(rawBox, detection.keypoints, vw, vh)) return null;
+        // The usable box is anchored to the keypoint span, not the raw
+        // detector rect — a degenerate span marks an inconsistent read.
+        if (keypointSpanDegenerate(detection.keypoints, vw, vh)) return null;
         return {
           ...box,
           score: detectionScore(detection),
@@ -1598,7 +1600,7 @@ function setFlashOverlay(rgb) {
   if (rgb) {
     flashOverlayEl.hidden = false;
     flashOverlayEl.style.background = `rgb(${rgb[0]},${rgb[1]},${rgb[2]})`;
-    flashOverlayEl.style.opacity = '0.85';
+    flashOverlayEl.style.opacity = '0.95';
   } else {
     flashOverlayEl.style.opacity = '0';
     flashOverlayEl.hidden = true;
@@ -1681,6 +1683,32 @@ function samplePulseGreen(box) {
   return g / n;
 }
 
+// Ambient face luminance (0-255) from the same face crop the flash check
+// samples. Screen flashes move the reflected signal by a roughly fixed amount,
+// so once ambient light is bright the chroma delta can never clear the server
+// bound — flash must not be offered in that lighting.
+const FLASH_AMBIENT_LUMINANCE_MAX = 140;
+function faceSampleLuminance(b64) {
+  const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  let sum = 0;
+  const n = bytes.length / 3;
+  for (let i = 0; i < bytes.length; i += 3) {
+    sum += bytes[i] * 0.2126 + bytes[i + 1] * 0.7152 + bytes[i + 2] * 0.0722;
+  }
+  return n ? sum / n : null;
+}
+
+function measureFaceLuminance(box) {
+  const sample = sampleFlashPixels(box);
+  return sample.f ? faceSampleLuminance(sample.f) : null;
+}
+
+function ambientTooBright(lumSamples) {
+  if (!lumSamples.length) return false;
+  const median = lumSamples.slice().sort((a, b) => a - b)[Math.floor(lumSamples.length / 2)];
+  return median > FLASH_AMBIENT_LUMINANCE_MAX;
+}
+
 function capturePresentationFrame(box, startedAt, flashTag) {
   if (!box || box.stale || !box.pixelBox || videoEl.videoWidth < 1 || videoEl.videoHeight < 1) return null;
   const vw = videoEl.videoWidth;
@@ -1717,9 +1745,10 @@ function faceReadyForStillCapture(box, requirePoseLiveness) {
   return centered && poseReady;
 }
 
-async function runPulseCheck(engine, measureMs, samples, t0, mediaFrames, requirePoseLiveness) {
+async function runPulseCheck(engine, measureMs, samples, t0, mediaFrames, requirePoseLiveness, ambientLumSamples) {
   const measureStart = performance.now();
   let lastMediaFrameT = -Infinity;
+  let lastAmbientT = -Infinity;
   setStatus('Verifying', 'listening');
   promptNameEl.textContent = 'Keep looking at the camera';
   while (faceChecking) {
@@ -1732,6 +1761,13 @@ async function runPulseCheck(engine, measureMs, samples, t0, mediaFrames, requir
     const ready = faceReadyForStillCapture(box, requirePoseLiveness);
     const g = ready ? samplePulseGreen(box) : null;
     if (g !== null) samples.push({ g: Math.round(g * 100) / 100, t: Math.round(performance.now() - t0) });
+    // Track ambient face luminance through the pulse stage so a bright room
+    // can veto the flash fallback before anyone gets flashed at for nothing.
+    if (ready && ambientLumSamples && now - lastAmbientT >= 400) {
+      const lum = measureFaceLuminance(box);
+      if (lum !== null) ambientLumSamples.push(lum);
+      lastAmbientT = now;
+    }
     if (
       ready
       && mediaFrames.length < PRESENTATION_FRAME_COUNT
@@ -1766,6 +1802,8 @@ async function runFlashPixelCheck(engine, flashPlan) {
   const samples = [];
   const flashFrames = [];
   const lastFrameAtByTag = new Map();
+  const baselineLum = [];
+  let ambientVetoed = false;
   setStatus('Hold still', 'listening');
   promptNameEl.textContent = 'Hold still';
   promptHintEl.textContent = 'Keep your face in view while the screen flashes.';
@@ -1773,10 +1811,23 @@ async function runFlashPixelCheck(engine, flashPlan) {
     const now = performance.now() - t0;
     if (now > endMs) break;
     const active = flashPlan.find((f) => now >= f.o && now <= f.o + f.d);
-    setFlashOverlay(active ? active.c : null);
     const box = await detectStableFaceFrame(engine);
     const sample = sampleFlashPixels(box);
     sample.t = Math.round(now);
+    // The pre-flash baseline doubles as an ambient-light probe: if the room is
+    // bright enough that screen flashes cannot move the face chroma, bail out
+    // before the first flash instead of flashing the user for nothing.
+    if (!active && sample.f && baselineLum.length < 8) {
+      baselineLum.push(faceSampleLuminance(sample.f));
+    }
+    if (!ambientVetoed && now >= flashPlan[0].o - 100 && ambientTooBright(baselineLum)) {
+      ambientVetoed = true;
+    }
+    if (ambientVetoed) {
+      setFlashOverlay(null);
+      throw new Error('The room is too bright for the screen-light check. Dim the lights or move away from bright windows, then try again.');
+    }
+    setFlashOverlay(active ? active.c : null);
     samples.push(sample);
     // Face crops tagged to the issued plan let the server verify the camera
     // pixels themselves tracked the flashes — not just claimed pixel rows.
@@ -1826,6 +1877,7 @@ async function runGuidedFaceCheck() {
   const phaseSeries = [];
   const pulseSeries = [];
   const mediaFrames = [];
+  const ambientLumSamples = [];
   const startedAt = performance.now();
   let lastPulseT = -1;
   const collectPulse = (box) => {
@@ -1929,6 +1981,7 @@ async function runGuidedFaceCheck() {
       startedAt,
       mediaFrames,
       requirePoseLiveness,
+      ambientLumSamples,
     );
     if (!faceChecking) return;
     if (mediaFrames.length < PRESENTATION_FRAME_MIN_COUNT) {
@@ -1980,6 +2033,12 @@ async function runGuidedFaceCheck() {
       result = await apiJson('/api/liveness/verify', verificationBody);
     } catch (error) {
       if (!error.data?.flashAvailable || !flashPlan?.length) throw error;
+      // Screen flashes move the reflected chroma by a roughly fixed amount;
+      // in bright ambient light the delta can never clear the server bound, so
+      // offering flash would only flash the user and reject them anyway.
+      if (ambientTooBright(ambientLumSamples)) {
+        throw new Error('The room is too bright for the screen-light check. Dim the lights or move away from bright windows, then try again.');
+      }
       const accepted = await askForFlashFallback();
       if (!accepted) {
         stopCamera();

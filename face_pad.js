@@ -185,7 +185,7 @@ function validateFlashFrames(challengeId, flashFrames, flashDigest, flashPlan) {
     if (!Number.isFinite(t) || t < 0 || t > FLASH_FRAME_MAX_T_MS || t <= previousT) {
       return { error: 'Flash camera frame timing is invalid.' };
     }
-    if (t - previousT < FLASH_FRAME_MIN_GAP_MS) {
+    if (previousT >= 0 && t - previousT < FLASH_FRAME_MIN_GAP_MS) {
       return { error: 'Flash camera frames are too close together.' };
     }
     previousT = t;
@@ -395,7 +395,10 @@ function detectorBoxes(outputs, sourceHeight) {
       const clippedWidth = right - left;
       const clippedHeight = bottom - top;
       if (
-        clippedWidth >= MIN_FACE_SOURCE_PX * 2 * (DETECTOR_SIZE / sourceHeight)
+        // Width uses a looser multiplier than height: the square capture crop
+        // pads a taller-than-wide face box, so honest framings yield ~42-44%
+        // face width and a 2x bound false-rejects them.
+        clippedWidth >= MIN_FACE_SOURCE_PX * 1.5 * (DETECTOR_SIZE / sourceHeight)
         && clippedHeight >= MIN_FACE_SOURCE_PX * (DETECTOR_SIZE / sourceHeight)
       ) {
         boxes.push({

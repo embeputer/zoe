@@ -83,7 +83,7 @@ npm test
 npm run debug
 ```
 
-Open `http://localhost:3001/debug.html`. The disposable camera lab reports face confidence, pulse detection, estimated BPM, signal quality, flash baseline coverage, and per-color response direction/strength. It does not call verification APIs or issue tokens, and its files return 404 unless the server starts with `ZOE_DEBUG=1`.
+Open `http://localhost:3001/debug.html`. The disposable camera lab reports face confidence, pulse detection, estimated BPM, signal quality, flash baseline coverage (including ambient face luminance and whether the room is too bright for the flash check), and per-color response direction/strength. Its overlay draws the detector's face box and landmark dots mirrored to match the selfie view. It does not call verification APIs or issue tokens, and its files return 404 unless the server starts with `ZOE_DEBUG=1`.
 
 ## Bundled Models And Notices
 
@@ -135,7 +135,7 @@ The regression test starts a temporary local HTTP server and checks that:
 4. During the calm front-facing tail, the browser captures three to five bounded 320×240 JPEG frames with normalized face regions and a digest bound to the challenge id.
 5. The server validates frame count, spacing, duration, dimensions, encoded size, uniqueness, and digest binding. It independently detects a face in consecutive frames, compares the detected regions with the submitted regions, then runs the bundled MiniFASNet presentation-attack model over the face crops. That model scores whether the view *looks like* a photo or a screen — it does not prove the frames came from a live camera, and a sufficiently realistic injected/replayed feed still passes.
 6. Face verification also uses rPPG as its default media gate: the client samples green-channel means over a forehead ROI during centering and head turns, then adds a short stillness top-up. The server analyzes the stillness tail for a physiologic-band heartbeat (48–144 BPM, rejecting flat and clean-sine signals).
-7. If pulse is inconclusive, Zoe keeps the challenge open and explicitly offers a flash-reflection fallback. Flash never auto-starts. The accepted frame digest and presentation result stay fixed across that retry, so flash cannot replace rejected media.
+7. If pulse is inconclusive, Zoe keeps the challenge open and explicitly offers a flash-reflection fallback. Flash never auto-starts, and it is only offered when ambient light is low enough for screen flashes to register — bright daylight swamps the chroma delta, so Zoe tells the user to dim the room instead of running a check that cannot pass. The accepted frame digest and presentation result stay fixed across that retry, so flash cannot replace rejected media.
 8. The server validates order, wall-clock timing, replay state, presentation analysis, pulse or explicitly accepted flash evidence, and session binding.
 9. After all steps pass, the server issues a short-lived signed token that the protected action accepts once.
 
