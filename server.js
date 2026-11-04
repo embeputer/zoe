@@ -1446,32 +1446,52 @@ function fidoRoots() {
 }
 
 // Minimal CBOR decoder — sufficient for attestationObject/authData COSE keys.
-function cborRead(buf, pos) {
+// Fails closed: every read is bounds-checked, and container counts/nesting are
+// capped so a tiny header claiming 2^53 entries cannot spin or exhaust memory.
+const CBOR_MAX_CONTAINER_ITEMS = 64;
+const CBOR_MAX_DEPTH = 16;
+
+function cborRead(buf, pos, depth = 0) {
+  if (depth > CBOR_MAX_DEPTH) throw new Error('CBOR nesting too deep');
+  const need = (at, len) => {
+    if (at + len > buf.length) throw new Error('truncated CBOR');
+  };
+  need(pos, 1);
   const ib = buf[pos];
   const major = ib >> 5;
   const ai = ib & 0x1f;
   let p = pos + 1;
   let n = ai;
-  if (ai === 24) { n = buf[p]; p += 1; }
-  else if (ai === 25) { n = buf.readUInt16BE(p); p += 2; }
-  else if (ai === 26) { n = buf.readUInt32BE(p); p += 4; }
-  else if (ai === 27) { n = Number(buf.readBigUInt64BE(p)); p += 8; }
+  if (ai === 24) { need(p, 1); n = buf[p]; p += 1; }
+  else if (ai === 25) { need(p, 2); n = buf.readUInt16BE(p); p += 2; }
+  else if (ai === 26) { need(p, 4); n = buf.readUInt32BE(p); p += 4; }
+  else if (ai === 27) {
+    need(p, 8);
+    const big = buf.readBigUInt64BE(p);
+    if (big > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('CBOR length too large');
+    n = Number(big);
+    p += 8;
+  }
   else if (ai === 31 || ai > 27) throw new Error('unsupported CBOR item');
   switch (major) {
     case 0: return [n, p];
     case 1: return [-1 - n, p];
-    case 2: return [buf.subarray(p, p + n), p + n];
-    case 3: return [buf.subarray(p, p + n).toString('utf8'), p + n];
+    case 2: need(p, n); return [buf.subarray(p, p + n), p + n];
+    case 3: need(p, n); return [buf.subarray(p, p + n).toString('utf8'), p + n];
     case 4: {
+      if (n > CBOR_MAX_CONTAINER_ITEMS) throw new Error('CBOR array too long');
+      need(p, n);
       const arr = [];
-      for (let i = 0; i < n; i++) { const [v, np] = cborRead(buf, p); arr.push(v); p = np; }
+      for (let i = 0; i < n; i++) { const [v, np] = cborRead(buf, p, depth + 1); arr.push(v); p = np; }
       return [arr, p];
     }
     case 5: {
+      if (n > CBOR_MAX_CONTAINER_ITEMS) throw new Error('CBOR map too long');
+      need(p, n * 2);
       const obj = {};
       for (let i = 0; i < n; i++) {
-        const [k, kp] = cborRead(buf, p);
-        const [v, np] = cborRead(buf, kp);
+        const [k, kp] = cborRead(buf, p, depth + 1);
+        const [v, np] = cborRead(buf, kp, depth + 1);
         obj[k] = v;
         p = np;
       }
@@ -2231,6 +2251,7 @@ module.exports = {
   deriveLivenessPhasesFromMotionSeries,
   validateHandLandmarkGeometry,
   verifyAuthenticatorData,
+  cborDecode,
   createFlashPlan,
   validatePixelSeries,
   computePresentationDigest,

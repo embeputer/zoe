@@ -22,6 +22,7 @@ const {
   computeLivenessSeriesDigest,
   validateHandLandmarkGeometry,
   verifyAuthenticatorData,
+  cborDecode,
   createFlashPlan,
   validatePixelSeries,
   computePresentationDigest,
@@ -281,6 +282,25 @@ function livenessBody(challengeId, plan, flashPlan, overrides = {}) {
 }
 
 async function main() {
+  // CBOR decoder fails closed on lying headers instead of spinning past the buffer.
+  for (const hex of [
+    'bb001fffffffffffff', // map claiming ~2^53 entries
+    '9b001fffffffffffff', // array claiming ~2^53 entries
+    'bbffffffffffffffff', // count beyond MAX_SAFE_INTEGER
+    'a2', // map of 2 with no entries
+    '5820', // 32-byte bytestring with no bytes
+    '7a00000010616263', // text string longer than buffer
+    '19', // truncated uint16 header
+    '',
+    '820000'.slice(0, 4), // array of 2 with only one item
+    '9841' + '00'.repeat(65), // 65-item array exceeds cap
+  ]) {
+    assert.throws(() => cborDecode(Buffer.from(hex, 'hex')), `cborDecode should reject ${hex}`);
+  }
+  assert.throws(() => cborDecode(Buffer.concat([Buffer.alloc(32, 0x81), Buffer.from([0x00])])), /nesting/);
+  assert.deepStrictEqual(cborDecode(Buffer.concat([Buffer.alloc(8, 0x81), Buffer.from([0x00])])), [[[[[[[[0]]]]]]]]);
+  assert.deepStrictEqual(cborDecode(Buffer.from('a2636b6579430102030101', 'hex')), { key: Buffer.from([1, 2, 3]), 1: 1 });
+
   const exposurePlan = createFlashPlan();
   assert.strictEqual(validatePixelSeries(samplePixelSeries(exposurePlan, 0.35), exposurePlan), null);
 
@@ -1014,6 +1034,25 @@ async function main() {
       }
     }
 
+
+    // A 9-byte attestationObject (or COSE key) claiming ~2^53 map/array
+    // entries must fail fast with 400 and leave the server responsive.
+    resetRateLimitState();
+    for (const makeAtt of [
+      () => Buffer.from('bb001fffffffffffff', 'hex').toString('base64url'),
+      () => Buffer.from('9b001fffffffffffff', 'hex').toString('base64url'),
+      (cred) => attestationObjectFor('none', cborEncodeLen(0xa0, 0),
+        attAuthData(Buffer.from(cred.rawId, 'base64url'), Buffer.from('bb001fffffffffffff', 'hex'))),
+    ]) {
+      const cred = newCred();
+      const started = Date.now();
+      const { verify } = await registerWith(cred.rawId, cred.spki, () => ({ attestationObject: makeAtt(cred) }));
+      assert.strictEqual(verify.res.status, 400);
+      assert.ok(Date.now() - started < 5000, 'oversized CBOR count must not stall the server');
+      const alive = await request(baseUrl, '/api/challenge', { method: 'POST' }, cookie);
+      assert.strictEqual(alive.res.status, 201);
+    }
+    resetRateLimitState();
 
     const challengeResponse = await request(baseUrl, '/api/challenge', { method: 'POST' }, cookie);
     assert.strictEqual(challengeResponse.res.status, 201);
