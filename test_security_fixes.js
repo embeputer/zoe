@@ -16,6 +16,13 @@ const {
   computeLivenessSeriesDigest,
   computePresentationDigest,
 } = require('./server');
+const {
+  computeFlashDigest,
+  jpegDimensions,
+  decodeFrameJpeg,
+  validatePresentationFrames,
+  validateFlashFrames,
+} = require('./face_pad');
 
 function request(baseUrl, path, options = {}, cookie) {
   const headers = { ...(options.headers || {}) };
@@ -184,7 +191,64 @@ async function mintToken(baseUrl, cookie) {
   return { token: verified.body.verificationToken, cookie: verified.cookie };
 }
 
+function sofSegmentOffset(bytes) {
+  for (let i = 2; i + 1 < bytes.length; i += 1) {
+    if (bytes[i] === 0xff && bytes[i + 1] === 0xc0) return i;
+  }
+  throw new Error('test JPEG has no SOF0');
+}
+
+// Copies the encoder's SOF0 with a 10000x10000 frame size. `append: true`
+// keeps the honest 320x240 SOF0 first, so a first-SOF size check passes while
+// jpeg-js would decode the later, larger one.
+function oversizedSofJpeg(base64, { append }) {
+  const bytes = Buffer.from(base64, 'base64');
+  const start = sofSegmentOffset(bytes);
+  const end = start + 2 + bytes.readUInt16BE(start + 2);
+  const big = Buffer.from(bytes.subarray(start, end));
+  big.writeUInt16BE(10000, 5);
+  big.writeUInt16BE(10000, 7);
+  const parts = append
+    ? [bytes.subarray(0, end), big, bytes.subarray(end)]
+    : [bytes.subarray(0, start), big, bytes.subarray(end)];
+  return Buffer.concat(parts).toString('base64');
+}
+
+function checkOversizedJpegRejection() {
+  const honest = mediaFrameImages[0];
+  const honestBytes = Buffer.from(honest, 'base64');
+  assert.deepStrictEqual(jpegDimensions(honestBytes), { width: 320, height: 240 });
+  assert.ok(decodeFrameJpeg(honestBytes, { width: 320, height: 240 }).image, 'honest frame decodes under limits');
+
+  const doubleSof = oversizedSofJpeg(honest, { append: true });
+  assert.strictEqual(jpegDimensions(Buffer.from(doubleSof, 'base64')), null, 'multiple SOF markers are rejected');
+
+  const singleBigBytes = Buffer.from(oversizedSofJpeg(honest, { append: false }), 'base64');
+  const decodeStarted = Date.now();
+  const capped = decodeFrameJpeg(singleBigBytes, { width: 320, height: 240 });
+  assert.strictEqual(capped.error, 'decode', 'decoder resolution cap rejects a 100 MP SOF');
+  assert.ok(Date.now() - decodeStarted < 200, 'decoder cap rejects before decoding');
+
+  const challengeId = 'oversized-sof-challenge';
+  const mediaFrames = sampleMediaFrames();
+  mediaFrames[1] = { ...mediaFrames[1], image: doubleSof };
+  const started = Date.now();
+  const media = validatePresentationFrames(challengeId, mediaFrames, computePresentationDigest(challengeId, mediaFrames));
+  assert.strictEqual(media.error, 'Camera media frame dimensions are invalid.');
+  assert.ok(Date.now() - started < 1000, 'oversized SOF must be rejected without a large decode');
+
+  const flashPlan = [{ o: 1000, d: 400 }];
+  const flashFrames = [
+    { t: 0, f: -1, face: [0.2, 0.2, 0.5, 0.5], image: honest },
+    { t: 1100, f: 0, face: [0.2, 0.2, 0.5, 0.5], image: doubleSof },
+  ];
+  const flash = validateFlashFrames(challengeId, flashFrames, computeFlashDigest(challengeId, flashFrames), flashPlan);
+  assert.strictEqual(flash.error, 'Flash camera frame dimensions are invalid.');
+  console.log('ok - JPEG frames with an oversized or repeated SOF are rejected before a large decode');
+}
+
 async function main() {
+  checkOversizedJpegRejection();
   const server = createServer({
     analyzePresentationFrames: async () => ({ real: true, medianScore: 1, longestRealRun: 5 }),
   });

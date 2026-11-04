@@ -36,35 +36,70 @@ function computePresentationDigest(challengeId, mediaFrames) {
     .digest('hex');
 }
 
+function isStartOfFrameMarker(marker) {
+  return (marker >= 0xc0 && marker <= 0xc3)
+    || (marker >= 0xc5 && marker <= 0xc7)
+    || (marker >= 0xc9 && marker <= 0xcb)
+    || (marker >= 0xcd && marker <= 0xcf);
+}
+
+// Walks every marker up to EOI, including those after entropy-coded scan
+// data, and rejects files with more than one SOF: jpeg-js decodes the last
+// SOF it sees, so a small first SOF must not vouch for a larger later one.
 function jpegDimensions(buffer) {
   if (buffer.length < 4 || buffer[0] !== 0xff || buffer[1] !== 0xd8) return null;
+  let dimensions = null;
   let offset = 2;
-  while (offset + 3 < buffer.length) {
+  while (offset + 1 < buffer.length) {
     if (buffer[offset] !== 0xff) {
       offset += 1;
       continue;
     }
     const marker = buffer[offset + 1];
+    if (marker === 0xff) {
+      offset += 1;
+      continue;
+    }
     offset += 2;
-    if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+    if (marker === 0xd9) break;
+    if (marker === 0x00 || marker === 0x01 || marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd7)) continue;
     if (offset + 1 >= buffer.length) return null;
     const length = buffer.readUInt16BE(offset);
     if (length < 2 || offset + length > buffer.length) return null;
-    if (
-      (marker >= 0xc0 && marker <= 0xc3)
-      || (marker >= 0xc5 && marker <= 0xc7)
-      || (marker >= 0xc9 && marker <= 0xcb)
-      || (marker >= 0xcd && marker <= 0xcf)
-    ) {
-      if (length < 7) return null;
-      return {
+    if (isStartOfFrameMarker(marker)) {
+      if (dimensions || length < 7) return null;
+      dimensions = {
         height: buffer.readUInt16BE(offset + 3),
         width: buffer.readUInt16BE(offset + 5),
       };
     }
     offset += length;
   }
-  return null;
+  return dimensions;
+}
+
+// Hard decoder caps so no header jpeg-js trusts can make it decode or
+// allocate more than a MAX_FRAME_DIM square frame needs.
+const JPEG_DECODE_LIMITS = {
+  maxResolutionInMP: (MAX_FRAME_DIM * MAX_FRAME_DIM) / 1e6,
+  maxMemoryUsageInMB: 8,
+};
+
+function decodeFrameJpeg(bytes, dimensions) {
+  let image;
+  try {
+    image = jpeg.decode(bytes, { useTArray: true, formatAsRGBA: true, ...JPEG_DECODE_LIMITS });
+  } catch {
+    return { error: 'decode' };
+  }
+  if (
+    image.width !== dimensions.width
+    || image.height !== dimensions.height
+    || image.data.length !== image.width * image.height * 4
+  ) {
+    return { error: 'mismatch' };
+  }
+  return { image };
 }
 
 function validateFaceBox(face) {
@@ -120,19 +155,10 @@ function validatePresentationFrames(challengeId, mediaFrames, mediaDigest) {
       return { error: 'Camera media frame dimensions are invalid.' };
     }
     imageDigests.add(crypto.createHash('sha256').update(bytes).digest('hex'));
-    let image;
-    try {
-      image = jpeg.decode(bytes, { useTArray: true, formatAsRGBA: true });
-    } catch {
-      return { error: 'Camera media frame could not be decoded.' };
-    }
-    if (
-      image.width !== dimensions.width
-      || image.height !== dimensions.height
-      || image.data.length !== image.width * image.height * 4
-    ) {
-      return { error: 'Camera media frame decoded incorrectly.' };
-    }
+    const decodedFrame = decodeFrameJpeg(bytes, dimensions);
+    if (decodedFrame.error === 'decode') return { error: 'Camera media frame could not be decoded.' };
+    if (decodedFrame.error) return { error: 'Camera media frame decoded incorrectly.' };
+    const { image } = decodedFrame;
     if (frame.face[2] * image.width < MIN_FACE_SOURCE_PX || frame.face[3] * image.height < MIN_FACE_SOURCE_PX) {
       return { error: 'Camera media face is too small.' };
     }
@@ -206,15 +232,10 @@ function validateFlashFrames(challengeId, flashFrames, flashDigest, flashPlan) {
       || dimensions.width > MAX_FRAME_DIM || dimensions.height > MAX_FRAME_DIM) {
       return { error: 'Flash camera frame dimensions are invalid.' };
     }
-    let image;
-    try {
-      image = jpeg.decode(bytes, { useTArray: true, formatAsRGBA: true });
-    } catch {
-      return { error: 'Flash camera frame could not be decoded.' };
-    }
-    if (image.data.length !== image.width * image.height * 4) {
-      return { error: 'Flash camera frame decoded incorrectly.' };
-    }
+    const decodedFrame = decodeFrameJpeg(bytes, dimensions);
+    if (decodedFrame.error === 'decode') return { error: 'Flash camera frame could not be decoded.' };
+    if (decodedFrame.error) return { error: 'Flash camera frame decoded incorrectly.' };
+    const { image } = decodedFrame;
     if (frame.face[2] * image.width < MIN_FACE_SOURCE_PX || frame.face[3] * image.height < MIN_FACE_SOURCE_PX) {
       return { error: 'Flash camera face is too small.' };
     }
@@ -504,6 +525,8 @@ module.exports = {
   MAX_FRAME_DIM,
   computePresentationDigest,
   computeFlashDigest,
+  jpegDimensions,
+  decodeFrameJpeg,
   validatePresentationFrames,
   validateFlashFrames,
   analyzePresentationFrames,
